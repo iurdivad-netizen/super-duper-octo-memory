@@ -65,10 +65,17 @@ string tblFontSize =
      size.small
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Helper: format count + percentage
+// Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+// "N  (X.X%)"  — N as share of a total (used for overall rates)
 pctStr(int n, float base) =>
     str.tostring(n) + "  (" + str.tostring(math.round(n / base * 1000) / 10.0, "#.#") + "%)"
+
+// "N / total  (X.X%)"  — N as share of a subset (used for conditional hit rates)
+condPctStr(int hit, int total) =>
+    total > 0 ?
+     str.tostring(hit) + " / " + str.tostring(total) + "  (" +
+     str.tostring(math.round(hit / total * 1000) / 10.0, "#.#") + "%)" : "—"
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Session detection
@@ -120,10 +127,10 @@ if custWinEnd
 var int nDays     = 0
 var int nAgree    = 0
 var int nDisag    = 0
-var int nBullBull = 0
-var int nBearBear = 0
-var int nBullBear = 0
-var int nBearBull = 0
+var int nBullBull = 0   // 15min Bull  + EOD Bull
+var int nBearBear = 0   // 15min Bear  + EOD Bear
+var int nBullBear = 0   // 15min Bull  + EOD Bear
+var int nBearBull = 0   // 15min Bear  + EOD Bull
 
 // Metrics — custom window
 var int nCDays     = 0
@@ -195,14 +202,14 @@ bgcolor(i_hlBar and sessStart ? color.new(color.blue, 87) : na,
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Metrics table
-// 11 rows for 15-min section; +12 rows for custom section when visible
+// 15-min section : rows  0-12  (13 rows)
+// Custom section : rows 13-26  (14 rows, only when i_showCustom)
 // ──────────────────────────────────────────────────────────────────────────────
-var table T = table.new(tblPos, 2, i_showCustom ? 23 : 11,
+var table T = table.new(tblPos, 2, i_showCustom ? 27 : 13,
      bgcolor      = i_tblBg,
      border_width = 1,
      border_color = i_borderClr)
 
-// Shorthand for filling a single cell
 tCell(int col, int row, string txt, color tc) =>
     table.cell(T, col, row, txt, text_color = tc, bgcolor = i_tblBg, text_size = tblFontSize)
 
@@ -216,7 +223,13 @@ if barstate.islast
     float td  = math.max(nDays,  1)
     float tdc = math.max(nCDays, 1)
 
-    // ── 15-min section ────────────────────────────────────────────────────────
+    // Conditional hit-rate denominators
+    int   bullDays  = nBullBull + nBullBear   // days 15min opened Bull
+    int   bearDays  = nBearBear + nBearBull   // days 15min opened Bear
+    int   cBullDays = nCBullBull + nCBullBear
+    int   cBearDays = nCBearBear + nCBearBull
+
+    // ── 15-min section  (rows 0-12) ───────────────────────────────────────────
     // Row 0: header
     tCellHdr(0, 0, "First 15min Window")
     tCellHdr(1, 0, "Count  (Rate)")
@@ -231,91 +244,107 @@ if barstate.islast
     tCellSep(0, 2)
     tCellSep(1, 2)
 
-    // Row 3: total
-    tCell(0, 3, "Total Days Tracked",         i_labelTxt)
-    tCell(1, 3, str.tostring(nDays),           i_valueTxt)
+    // Row 3: total days
+    tCell(0, 3, "Total Days Tracked",        i_labelTxt)
+    tCell(1, 3, str.tostring(nDays),          i_valueTxt)
 
-    // Row 4: agree
-    tCell(0, 4, "✓  Direction Agreed",        i_agreeClr)
-    tCell(1, 4, pctStr(nAgree, td),            i_agreeClr)
+    // Row 4: overall agree
+    tCell(0, 4, "✓  Direction Agreed",       i_agreeClr)
+    tCell(1, 4, pctStr(nAgree, td),           i_agreeClr)
 
-    // Row 5: disagree
-    tCell(0, 5, "✗  Direction Disagreed",     i_disagreeClr)
-    tCell(1, 5, pctStr(nDisag, td),            i_disagreeClr)
+    // Row 5: overall disagree
+    tCell(0, 5, "✗  Direction Disagreed",    i_disagreeClr)
+    tCell(1, 5, pctStr(nDisag, td),           i_disagreeClr)
 
     // Row 6: separator
     tCellSep(0, 6)
     tCellSep(1, 6)
 
-    // Row 7: bull → bull
-    tCell(0, 7, "↑ 15min Bull  →  EOD Bull",  i_agreeClr)
-    tCell(1, 7, pctStr(nBullBull, td),          i_agreeClr)
+    // Row 7: bull → bull  (% of all days)
+    tCell(0, 7, "↑ Bull  →  EOD Bull",       i_agreeClr)
+    tCell(1, 7, pctStr(nBullBull, td),         i_agreeClr)
 
-    // Row 8: bear → bear
-    tCell(0, 8, "↓ 15min Bear  →  EOD Bear",  i_bearBearClr)
-    tCell(1, 8, pctStr(nBearBear, td),          i_bearBearClr)
+    // Row 8: bear → bear  (% of all days)
+    tCell(0, 8, "↓ Bear  →  EOD Bear",       i_bearBearClr)
+    tCell(1, 8, pctStr(nBearBear, td),         i_bearBearClr)
 
-    // Row 9: bull → bear
-    tCell(0, 9, "↑ 15min Bull  →  EOD Bear",  i_disagreeClr)
-    tCell(1, 9, pctStr(nBullBear, td),          i_disagreeClr)
+    // Row 9: bull → bear  (% of all days)
+    tCell(0, 9, "↑ Bull  →  EOD Bear",       i_disagreeClr)
+    tCell(1, 9, pctStr(nBullBear, td),         i_disagreeClr)
 
-    // Row 10: bear → bull
-    tCell(0, 10, "↓ 15min Bear  →  EOD Bull", i_disagreeClr)
-    tCell(1, 10, pctStr(nBearBull, td),         i_disagreeClr)
+    // Row 10: bear → bull  (% of all days)
+    tCell(0, 10, "↓ Bear  →  EOD Bull",      i_disagreeClr)
+    tCell(1, 10, pctStr(nBearBull, td),        i_disagreeClr)
 
-    // ── Custom window section ─────────────────────────────────────────────────
+    // Row 11: conditional hit rate — of Bull days, how many closed Bull
+    tCell(0, 11, "↑ Of Bull days: EOD Bull", i_agreeClr)
+    tCell(1, 11, condPctStr(nBullBull, bullDays), i_agreeClr)
+
+    // Row 12: conditional hit rate — of Bear days, how many closed Bear
+    tCell(0, 12, "↓ Of Bear days: EOD Bear", i_bearBearClr)
+    tCell(1, 12, condPctStr(nBearBear, bearDays), i_bearBearClr)
+
+    // ── Custom window section  (rows 13-26) ───────────────────────────────────
     if i_showCustom
         string customLabel = str.tostring(i_customMins) + "min Window"
 
-        // Row 11: thick divider
-        table.cell(T, 0, 11, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
-        table.cell(T, 1, 11, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+        // Row 13: thick divider
+        table.cell(T, 0, 13, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+        table.cell(T, 1, 13, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
 
-        // Row 12: header
-        tCellHdr(0, 12, "First " + customLabel)
-        tCellHdr(1, 12, "Count  (Rate)")
+        // Row 14: header
+        tCellHdr(0, 14, "First " + customLabel)
+        tCellHdr(1, 14, "Count  (Rate)")
 
-        // Row 13: today's custom direction
-        tCell(0, 13, "Today – First " + customLabel, i_labelTxt)
-        tCell(1, 13, todayCustom,
+        // Row 15: today's custom direction
+        tCell(0, 15, "Today – First " + customLabel, i_labelTxt)
+        tCell(1, 15, todayCustom,
              todayCustom == "Bullish ↑" ? i_agreeClr :
              todayCustom == "Bearish ↓" ? i_disagreeClr : color.gray)
 
-        // Row 14: separator
-        tCellSep(0, 14)
-        tCellSep(1, 14)
+        // Row 16: separator
+        tCellSep(0, 16)
+        tCellSep(1, 16)
 
-        // Row 15: total
-        tCell(0, 15, "Total Days Tracked",           i_labelTxt)
-        tCell(1, 15, str.tostring(nCDays),            i_valueTxt)
+        // Row 17: total days
+        tCell(0, 17, "Total Days Tracked",          i_labelTxt)
+        tCell(1, 17, str.tostring(nCDays),           i_valueTxt)
 
-        // Row 16: agree
-        tCell(0, 16, "✓  Direction Agreed",          i_agreeClr)
-        tCell(1, 16, pctStr(nCAgree, tdc),            i_agreeClr)
+        // Row 18: overall agree
+        tCell(0, 18, "✓  Direction Agreed",         i_agreeClr)
+        tCell(1, 18, pctStr(nCAgree, tdc),           i_agreeClr)
 
-        // Row 17: disagree
-        tCell(0, 17, "✗  Direction Disagreed",       i_disagreeClr)
-        tCell(1, 17, pctStr(nCDisag, tdc),            i_disagreeClr)
+        // Row 19: overall disagree
+        tCell(0, 19, "✗  Direction Disagreed",      i_disagreeClr)
+        tCell(1, 19, pctStr(nCDisag, tdc),           i_disagreeClr)
 
-        // Row 18: separator
-        tCellSep(0, 18)
-        tCellSep(1, 18)
+        // Row 20: separator
+        tCellSep(0, 20)
+        tCellSep(1, 20)
 
-        // Row 19: bull → bull
-        tCell(0, 19, "↑ " + customLabel + " Bull  →  EOD Bull",  i_agreeClr)
-        tCell(1, 19, pctStr(nCBullBull, tdc),                     i_agreeClr)
+        // Row 21: bull → bull  (% of all days)
+        tCell(0, 21, "↑ Bull  →  EOD Bull",         i_agreeClr)
+        tCell(1, 21, pctStr(nCBullBull, tdc),         i_agreeClr)
 
-        // Row 20: bear → bear
-        tCell(0, 20, "↓ " + customLabel + " Bear  →  EOD Bear",  i_bearBearClr)
-        tCell(1, 20, pctStr(nCBearBear, tdc),                     i_bearBearClr)
+        // Row 22: bear → bear  (% of all days)
+        tCell(0, 22, "↓ Bear  →  EOD Bear",         i_bearBearClr)
+        tCell(1, 22, pctStr(nCBearBear, tdc),         i_bearBearClr)
 
-        // Row 21: bull → bear
-        tCell(0, 21, "↑ " + customLabel + " Bull  →  EOD Bear",  i_disagreeClr)
-        tCell(1, 21, pctStr(nCBullBear, tdc),                     i_disagreeClr)
+        // Row 23: bull → bear  (% of all days)
+        tCell(0, 23, "↑ Bull  →  EOD Bear",         i_disagreeClr)
+        tCell(1, 23, pctStr(nCBullBear, tdc),         i_disagreeClr)
 
-        // Row 22: bear → bull
-        tCell(0, 22, "↓ " + customLabel + " Bear  →  EOD Bull",  i_disagreeClr)
-        tCell(1, 22, pctStr(nCBearBull, tdc),                     i_disagreeClr)
+        // Row 24: bear → bull  (% of all days)
+        tCell(0, 24, "↓ Bear  →  EOD Bull",         i_disagreeClr)
+        tCell(1, 24, pctStr(nCBearBull, tdc),         i_disagreeClr)
+
+        // Row 25: conditional hit rate — of Bull days, how many closed Bull
+        tCell(0, 25, "↑ Of Bull days: EOD Bull",    i_agreeClr)
+        tCell(1, 25, condPctStr(nCBullBull, cBullDays), i_agreeClr)
+
+        // Row 26: conditional hit rate — of Bear days, how many closed Bear
+        tCell(0, 26, "↓ Of Bear days: EOD Bear",    i_bearBearClr)
+        tCell(1, 26, condPctStr(nCBearBear, cBearDays), i_bearBearClr)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Timeframe warning
