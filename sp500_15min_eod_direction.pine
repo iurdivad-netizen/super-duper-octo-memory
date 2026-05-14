@@ -10,14 +10,25 @@ indicator("S&P500 First 15min vs EOD Direction",
 string i_session = input.string("0930-1600", "Session (HH:MM-HH:MM)",
      tooltip = "NYSE regular hours. For CME ES futures RTH use 0930-1600 ET or adjust per broker.",
      group = "General")
-string i_days    = input.string("23456",     "Trading Days  (1=Sun … 7=Sat)",
+string i_days    = input.string("23456", "Trading Days  (1=Sun … 7=Sat)",
      tooltip = "23456 = Monday – Friday",
      group = "General")
-bool   i_hlBar   = input.bool(true,  "Highlight first 15-min bar on chart",  group = "General")
-bool   i_labels  = input.bool(true,  "Show EOD agreement labels on last bar of day", group = "General")
+bool   i_hlBar   = input.bool(true, "Highlight first 15-min bar on chart",  group = "General")
+bool   i_labels  = input.bool(true, "Show EOD agreement labels on last bar of day", group = "General")
 string i_tblPos  = input.string("Top Right", "Table position",
      options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
      group = "General")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Custom Window
+// ──────────────────────────────────────────────────────────────────────────────
+int  i_customMins = input.int(30, "Custom window (minutes)", minval = 1, maxval = 480,
+     tooltip = "Minutes from session open for the second measurement window.\n" +
+               "On a 15-min chart the window snaps to the last complete bar " +
+               "that starts within N minutes (e.g. 20 min → uses the 9:45 bar close on a 15-min chart).",
+     group = "Custom Window")
+bool i_showCustom = input.bool(true, "Show custom window section in table",
+     group = "Custom Window")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Inputs — Table Appearance
@@ -25,19 +36,15 @@ string i_tblPos  = input.string("Top Right", "Table position",
 string i_fontSize    = input.string("Small", "Font size",
      options = ["Tiny","Small","Normal","Large","Huge"],
      group = "Table Appearance")
-
-color  i_tblBg       = input.color(color.new(color.black,  72), "Table background",   group = "Table Appearance")
-color  i_borderClr   = input.color(color.new(color.gray,   60), "Border colour",      group = "Table Appearance")
-
-color  i_hdrBg       = input.color(color.new(color.blue,   38), "Header background",  group = "Table Appearance")
-color  i_hdrTxt      = input.color(color.white,                 "Header text",        group = "Table Appearance")
-
-color  i_labelTxt    = input.color(color.silver,                "Row label text",     group = "Table Appearance")
-color  i_valueTxt    = input.color(color.white,                 "Row value text",     group = "Table Appearance")
-
-color  i_agreeClr    = input.color(color.lime,                  "Agree / Bullish",    group = "Table Appearance")
-color  i_bearBearClr = input.color(color.orange,                "Bear → Bear",        group = "Table Appearance")
-color  i_disagreeClr = input.color(color.red,                   "Disagree / Bearish", group = "Table Appearance")
+color  i_tblBg       = input.color(color.new(color.black, 72), "Table background",   group = "Table Appearance")
+color  i_borderClr   = input.color(color.new(color.gray,  60), "Border colour",      group = "Table Appearance")
+color  i_hdrBg       = input.color(color.new(color.blue,  38), "Header background",  group = "Table Appearance")
+color  i_hdrTxt      = input.color(color.white,                "Header text",        group = "Table Appearance")
+color  i_labelTxt    = input.color(color.silver,               "Row label text",     group = "Table Appearance")
+color  i_valueTxt    = input.color(color.white,                "Row value text",     group = "Table Appearance")
+color  i_agreeClr    = input.color(color.lime,                 "Agree / Bullish",    group = "Table Appearance")
+color  i_bearBearClr = input.color(color.orange,               "Bear → Bear",        group = "Table Appearance")
+color  i_disagreeClr = input.color(color.red,                  "Disagree / Bearish", group = "Table Appearance")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Derived style values
@@ -58,49 +65,83 @@ string tblFontSize =
      size.small
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Helper: format count + percentage
+// ──────────────────────────────────────────────────────────────────────────────
+pctStr(int n, float base) =>
+    str.tostring(n) + "  (" + str.tostring(math.round(n / base * 1000) / 10.0, "#.#") + "%)"
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Session detection
-// Apply on a 15-minute chart so that "first bar of session" = first 15-min candle.
 // ──────────────────────────────────────────────────────────────────────────────
 string SESSION  = i_session + ":" + i_days
 bool inSess     = not na(time(timeframe.period, SESSION))
 bool inSessPrev = not na(time(timeframe.period, SESSION)[1])
-bool sessStart  = inSess and not inSessPrev   // first bar of session  (bar closes = 15-min candle closes)
+bool sessStart  = inSess and not inSessPrev   // first bar of session
 bool sessEnd    = not inSess and inSessPrev   // first bar after session; close[1] = EOD close
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Per-session state
+// Per-session state — fixed 15-min window
 // ──────────────────────────────────────────────────────────────────────────────
-var float f15Open  = na       // first 15-min candle open
-var float f15Close = na       // first 15-min candle close
-var float dayOpen  = na       // session open (same as f15Open)
-var bool  hasDay   = false    // true while session data is pending evaluation
-var string today15 = "—"     // direction label shown in table
+var float  f15Open  = na
+var float  f15Close = na
+var float  dayOpen  = na       // session open price (shared reference for both windows)
+var bool   hasDay   = false
+var string today15  = "—"
+
+// Per-session state — custom window
+var int    sessStartMs  = na   // timestamp (ms) when session opened
+var float  custWinClose = na   // close of the last bar inside the custom window
+var bool   custWinSet   = false
+var string todayCustom  = "—"
 
 if sessStart
-    f15Open  := open
-    f15Close := close
-    dayOpen  := open
-    hasDay   := true
-    today15  := close > open ? "Bullish ↑" : close < open ? "Bearish ↓" : "Neutral →"
+    f15Open      := open
+    f15Close     := close
+    dayOpen      := open
+    hasDay       := true
+    today15      := close > open ? "Bullish ↑" : close < open ? "Bearish ↓" : "Neutral →"
+    sessStartMs  := time
+    custWinClose := na
+    custWinSet   := false
+
+// Custom window closes on the first bar whose open time ≥ session open + N minutes.
+// close[1] is then the close of the last bar that started within the window.
+bool custWinEnd = not na(sessStartMs) and not custWinSet and not sessStart and inSess and
+                  (time - sessStartMs) >= i_customMins * 60 * 1000
+
+if custWinEnd
+    custWinClose := close[1]
+    custWinSet   := true
+    todayCustom  := close[1] > dayOpen ? "Bullish ↑" : close[1] < dayOpen ? "Bearish ↓" : "Neutral →"
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Metrics
+// Metrics — fixed 15-min window
 // ──────────────────────────────────────────────────────────────────────────────
-var int nDays     = 0   // completed trading days evaluated
-var int nAgree    = 0   // EOD direction matched first 15-min direction
-var int nDisag    = 0   // EOD direction did NOT match
-var int nBullBull = 0   // 15-min Bullish  →  EOD Bullish   (agree)
-var int nBearBear = 0   // 15-min Bearish  →  EOD Bearish   (agree)
-var int nBullBear = 0   // 15-min Bullish  →  EOD Bearish   (disagree)
-var int nBearBull = 0   // 15-min Bearish  →  EOD Bullish   (disagree)
+var int nDays     = 0
+var int nAgree    = 0
+var int nDisag    = 0
+var int nBullBull = 0
+var int nBearBear = 0
+var int nBullBear = 0
+var int nBearBull = 0
+
+// Metrics — custom window
+var int nCDays     = 0
+var int nCAgree    = 0
+var int nCDisag    = 0
+var int nCBullBull = 0
+var int nCBearBear = 0
+var int nCBullBear = 0
+var int nCBearBull = 0
 
 if sessEnd and hasDay
-    bool f15Bull = f15Close > f15Open          // first 15-min direction
-    bool eodBull = close[1] > dayOpen          // EOD direction (vs session open)
-    bool agree   = f15Bull == eodBull
+    bool f15Bull  = f15Close > f15Open
+    bool eodBull  = close[1] > dayOpen
+    bool agree15  = f15Bull == eodBull
 
+    // 15-min metrics
     nDays += 1
-    if agree
+    if agree15
         nAgree    += 1
         nBullBull += f15Bull ? 1 : 0
         nBearBear += f15Bull ? 0 : 1
@@ -109,19 +150,40 @@ if sessEnd and hasDay
         nBullBear += f15Bull ? 1 : 0
         nBearBull += f15Bull ? 0 : 1
 
-    // Label on the last bar of the session
+    // Custom window metrics (only when window closed before EOD)
+    if custWinSet
+        bool custBull = custWinClose > dayOpen
+        bool agreeC   = custBull == eodBull
+
+        nCDays += 1
+        if agreeC
+            nCAgree    += 1
+            nCBullBull += custBull ? 1 : 0
+            nCBearBear += custBull ? 0 : 1
+        else
+            nCDisag    += 1
+            nCBullBear += custBull ? 1 : 0
+            nCBearBull += custBull ? 0 : 1
+
+    // EOD label — symbol reflects 15-min result; tooltip includes custom window
     if i_labels
+        string custTip = custWinSet ?
+             "\n" + str.tostring(i_customMins) + "min: " +
+             (custWinClose > dayOpen ? "Bull ↑" : "Bear ↓") + "  →  EOD: " +
+             (eodBull ? "Bull ↑" : "Bear ↓") + "  " +
+             ((custWinClose > dayOpen) == eodBull ? "✓" : "✗") : ""
+
         label.new(
              x         = bar_index[1],
              y         = high[1],
-             text      = agree ? "✓" : "✗",
+             text      = agree15 ? "✓" : "✗",
              style     = label.style_label_down,
-             color     = agree ? color.new(color.green, 35) : color.new(color.red, 35),
+             color     = agree15 ? color.new(color.green, 35) : color.new(color.red, 35),
              textcolor = color.white,
              size      = size.normal,
-             tooltip   = (f15Bull ? "First 15min: Bull ↑" : "First 15min: Bear ↓") + "\n" +
-                         (eodBull ? "EOD:         Bull ↑" : "EOD:         Bear ↓") + "\n─────\n" +
-                         (agree   ? "✓ AGREE"              : "✗ DISAGREE"))
+             tooltip   = "15min: " + (f15Bull ? "Bull ↑" : "Bear ↓") +
+                         "  →  EOD: " + (eodBull ? "Bull ↑" : "Bear ↓") +
+                         "  " + (agree15 ? "✓" : "✗") + custTip)
 
     hasDay := false
 
@@ -133,91 +195,130 @@ bgcolor(i_hlBar and sessStart ? color.new(color.blue, 87) : na,
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Metrics table
+// 11 rows for 15-min section; +12 rows for custom section when visible
 // ──────────────────────────────────────────────────────────────────────────────
-var table T = table.new(tblPos, 2, 11,
+var table T = table.new(tblPos, 2, i_showCustom ? 23 : 11,
      bgcolor      = i_tblBg,
      border_width = 1,
      border_color = i_borderClr)
 
+// Shorthand for filling a single cell
+tCell(int col, int row, string txt, color tc) =>
+    table.cell(T, col, row, txt, text_color = tc, bgcolor = i_tblBg, text_size = tblFontSize)
+
+tCellHdr(int col, int row, string txt) =>
+    table.cell(T, col, row, txt, text_color = i_hdrTxt, bgcolor = i_hdrBg, text_size = tblFontSize)
+
+tCellSep(int col, int row) =>
+    table.cell(T, col, row, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+
 if barstate.islast
-    float td = math.max(nDays, 1)   // avoid division by zero
+    float td  = math.max(nDays,  1)
+    float tdc = math.max(nCDays, 1)
 
-    // Format: "N  (XX.X%)"
-    string sTotal = str.tostring(nDays)
-    string sA     = str.tostring(nAgree)    + "  (" + str.tostring(math.round(nAgree    / td * 1000) / 10.0, "#.#") + "%)"
-    string sDis   = str.tostring(nDisag)    + "  (" + str.tostring(math.round(nDisag    / td * 1000) / 10.0, "#.#") + "%)"
-    string sBB    = str.tostring(nBullBull) + "  (" + str.tostring(math.round(nBullBull / td * 1000) / 10.0, "#.#") + "%)"
-    string sBbB   = str.tostring(nBearBear) + "  (" + str.tostring(math.round(nBearBear / td * 1000) / 10.0, "#.#") + "%)"
-    string sBbBr  = str.tostring(nBullBear) + "  (" + str.tostring(math.round(nBullBear / td * 1000) / 10.0, "#.#") + "%)"
-    string sBeB   = str.tostring(nBearBull) + "  (" + str.tostring(math.round(nBearBull / td * 1000) / 10.0, "#.#") + "%)"
+    // ── 15-min section ────────────────────────────────────────────────────────
+    // Row 0: header
+    tCellHdr(0, 0, "First 15min Window")
+    tCellHdr(1, 0, "Count  (Rate)")
 
-    color tc15 = today15 == "Bullish ↑" ? i_agreeClr :
-                 today15 == "Bearish ↓" ? i_disagreeClr : color.gray
+    // Row 1: today's 15-min direction
+    tCell(0, 1, "Today – First 15min", i_labelTxt)
+    tCell(1, 1, today15,
+         today15 == "Bullish ↑" ? i_agreeClr :
+         today15 == "Bearish ↓" ? i_disagreeClr : color.gray)
 
-    // Row 0 – header
-    table.cell(T, 0, 0, "S&P500 · First 15min vs EOD",
-         text_color = i_hdrTxt,  bgcolor = i_hdrBg, text_size = tblFontSize)
-    table.cell(T, 1, 0, "Count  (Rate)",
-         text_color = i_hdrTxt, bgcolor = i_hdrBg, text_size = tblFontSize)
+    // Row 2: separator
+    tCellSep(0, 2)
+    tCellSep(1, 2)
 
-    // Row 1 – today's first 15-min direction
-    table.cell(T, 0, 1, "Today – First 15min",
-         text_color = i_labelTxt, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 1, today15,
-         text_color = tc15, bgcolor = i_tblBg, text_size = tblFontSize)
+    // Row 3: total
+    tCell(0, 3, "Total Days Tracked",         i_labelTxt)
+    tCell(1, 3, str.tostring(nDays),           i_valueTxt)
 
-    // Row 2 – separator
-    table.cell(T, 0, 2, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
-    table.cell(T, 1, 2, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+    // Row 4: agree
+    tCell(0, 4, "✓  Direction Agreed",        i_agreeClr)
+    tCell(1, 4, pctStr(nAgree, td),            i_agreeClr)
 
-    // Row 3 – total days
-    table.cell(T, 0, 3, "Total Days Tracked",
-         text_color = i_labelTxt, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 3, sTotal,
-         text_color = i_valueTxt, bgcolor = i_tblBg, text_size = tblFontSize)
+    // Row 5: disagree
+    tCell(0, 5, "✗  Direction Disagreed",     i_disagreeClr)
+    tCell(1, 5, pctStr(nDisag, td),            i_disagreeClr)
 
-    // Row 4 – agreements
-    table.cell(T, 0, 4, "✓  Direction Agreed",
-         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 4, sA,
-         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
+    // Row 6: separator
+    tCellSep(0, 6)
+    tCellSep(1, 6)
 
-    // Row 5 – disagreements
-    table.cell(T, 0, 5, "✗  Direction Disagreed",
-         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 5, sDis,
-         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
+    // Row 7: bull → bull
+    tCell(0, 7, "↑ 15min Bull  →  EOD Bull",  i_agreeClr)
+    tCell(1, 7, pctStr(nBullBull, td),          i_agreeClr)
 
-    // Row 6 – separator
-    table.cell(T, 0, 6, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
-    table.cell(T, 1, 6, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+    // Row 8: bear → bear
+    tCell(0, 8, "↓ 15min Bear  →  EOD Bear",  i_bearBearClr)
+    tCell(1, 8, pctStr(nBearBear, td),          i_bearBearClr)
 
-    // Row 7 – Bull → Bull  (agreement)
-    table.cell(T, 0, 7, "↑ 15min Bull  →  EOD Bull",
-         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 7, sBB,
-         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
+    // Row 9: bull → bear
+    tCell(0, 9, "↑ 15min Bull  →  EOD Bear",  i_disagreeClr)
+    tCell(1, 9, pctStr(nBullBear, td),          i_disagreeClr)
 
-    // Row 8 – Bear → Bear  (agreement)
-    table.cell(T, 0, 8, "↓ 15min Bear  →  EOD Bear",
-         text_color = i_bearBearClr, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 8, sBbB,
-         text_color = i_bearBearClr, bgcolor = i_tblBg, text_size = tblFontSize)
+    // Row 10: bear → bull
+    tCell(0, 10, "↓ 15min Bear  →  EOD Bull", i_disagreeClr)
+    tCell(1, 10, pctStr(nBearBull, td),         i_disagreeClr)
 
-    // Row 9 – Bull → Bear  (disagreement)
-    table.cell(T, 0, 9, "↑ 15min Bull  →  EOD Bear",
-         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 9, sBbBr,
-         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
+    // ── Custom window section ─────────────────────────────────────────────────
+    if i_showCustom
+        string customLabel = str.tostring(i_customMins) + "min Window"
 
-    // Row 10 – Bear → Bull  (disagreement)
-    table.cell(T, 0, 10, "↓ 15min Bear  →  EOD Bull",
-         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
-    table.cell(T, 1, 10, sBeB,
-         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
+        // Row 11: thick divider
+        table.cell(T, 0, 11, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+        table.cell(T, 1, 11, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+
+        // Row 12: header
+        tCellHdr(0, 12, "First " + customLabel)
+        tCellHdr(1, 12, "Count  (Rate)")
+
+        // Row 13: today's custom direction
+        tCell(0, 13, "Today – First " + customLabel, i_labelTxt)
+        tCell(1, 13, todayCustom,
+             todayCustom == "Bullish ↑" ? i_agreeClr :
+             todayCustom == "Bearish ↓" ? i_disagreeClr : color.gray)
+
+        // Row 14: separator
+        tCellSep(0, 14)
+        tCellSep(1, 14)
+
+        // Row 15: total
+        tCell(0, 15, "Total Days Tracked",           i_labelTxt)
+        tCell(1, 15, str.tostring(nCDays),            i_valueTxt)
+
+        // Row 16: agree
+        tCell(0, 16, "✓  Direction Agreed",          i_agreeClr)
+        tCell(1, 16, pctStr(nCAgree, tdc),            i_agreeClr)
+
+        // Row 17: disagree
+        tCell(0, 17, "✗  Direction Disagreed",       i_disagreeClr)
+        tCell(1, 17, pctStr(nCDisag, tdc),            i_disagreeClr)
+
+        // Row 18: separator
+        tCellSep(0, 18)
+        tCellSep(1, 18)
+
+        // Row 19: bull → bull
+        tCell(0, 19, "↑ " + customLabel + " Bull  →  EOD Bull",  i_agreeClr)
+        tCell(1, 19, pctStr(nCBullBull, tdc),                     i_agreeClr)
+
+        // Row 20: bear → bear
+        tCell(0, 20, "↓ " + customLabel + " Bear  →  EOD Bear",  i_bearBearClr)
+        tCell(1, 20, pctStr(nCBearBear, tdc),                     i_bearBearClr)
+
+        // Row 21: bull → bear
+        tCell(0, 21, "↑ " + customLabel + " Bull  →  EOD Bear",  i_disagreeClr)
+        tCell(1, 21, pctStr(nCBullBear, tdc),                     i_disagreeClr)
+
+        // Row 22: bear → bull
+        tCell(0, 22, "↓ " + customLabel + " Bear  →  EOD Bull",  i_disagreeClr)
+        tCell(1, 22, pctStr(nCBearBull, tdc),                     i_disagreeClr)
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Timeframe warning (visible nudge when chart is not 15-min)
+// Timeframe warning
 // ──────────────────────────────────────────────────────────────────────────────
 if barstate.islast and timeframe.period != "15"
     label.new(bar_index, high,
