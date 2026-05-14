@@ -1,0 +1,199 @@
+//@version=5
+indicator("S&P500 First 15min vs EOD Direction",
+     shorttitle    = "15min/EOD Tracker",
+     overlay       = true,
+     max_bars_back = 5000)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ──────────────────────────────────────────────────────────────────────────────
+string i_session = input.string("0930-1600", "Session (HH:MM-HH:MM)",
+     tooltip = "NYSE regular hours. For CME ES futures RTH use 0930-1600 ET or adjust per broker.")
+string i_days    = input.string("23456",     "Trading Days  (1=Sun … 7=Sat)",
+     tooltip = "23456 = Monday – Friday")
+bool   i_hlBar   = input.bool(true,  "Highlight first 15-min bar on chart")
+bool   i_labels  = input.bool(true,  "Show EOD agreement labels on last bar of day")
+string i_tblPos  = input.string("Top Right", "Table position",
+     options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"])
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Table position mapping
+// ──────────────────────────────────────────────────────────────────────────────
+string tblPos =
+     i_tblPos == "Top Left"     ? position.top_left     :
+     i_tblPos == "Bottom Right" ? position.bottom_right :
+     i_tblPos == "Bottom Left"  ? position.bottom_left  :
+     i_tblPos == "Middle Right" ? position.middle_right :
+     i_tblPos == "Middle Left"  ? position.middle_left  :
+     position.top_right
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Session detection
+// Apply on a 15-minute chart so that "first bar of session" = first 15-min candle.
+// ──────────────────────────────────────────────────────────────────────────────
+string SESSION  = i_session + ":" + i_days
+bool inSess     = not na(time(timeframe.period, SESSION))
+bool inSessPrev = not na(time(timeframe.period, SESSION)[1])
+bool sessStart  = inSess and not inSessPrev   // first bar of session  (bar closes = 15-min candle closes)
+bool sessEnd    = not inSess and inSessPrev   // first bar after session; close[1] = EOD close
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Per-session state
+// ──────────────────────────────────────────────────────────────────────────────
+var float f15Open  = na       // first 15-min candle open
+var float f15Close = na       // first 15-min candle close
+var float dayOpen  = na       // session open (same as f15Open)
+var bool  hasDay   = false    // true while session data is pending evaluation
+var string today15 = "—"     // direction label shown in table
+
+if sessStart
+    f15Open  := open
+    f15Close := close
+    dayOpen  := open
+    hasDay   := true
+    today15  := close > open ? "Bullish ↑" : close < open ? "Bearish ↓" : "Neutral →"
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Metrics
+// ──────────────────────────────────────────────────────────────────────────────
+var int nDays     = 0   // completed trading days evaluated
+var int nAgree    = 0   // EOD direction matched first 15-min direction
+var int nDisag    = 0   // EOD direction did NOT match
+var int nBullBull = 0   // 15-min Bullish  →  EOD Bullish   (agree)
+var int nBearBear = 0   // 15-min Bearish  →  EOD Bearish   (agree)
+var int nBullBear = 0   // 15-min Bullish  →  EOD Bearish   (disagree)
+var int nBearBull = 0   // 15-min Bearish  →  EOD Bullish   (disagree)
+
+if sessEnd and hasDay
+    bool f15Bull = f15Close > f15Open          // first 15-min direction
+    bool eodBull = close[1] > dayOpen          // EOD direction (vs session open)
+    bool agree   = f15Bull == eodBull
+
+    nDays += 1
+    if agree
+        nAgree    += 1
+        nBullBull += f15Bull ? 1 : 0
+        nBearBear += f15Bull ? 0 : 1
+    else
+        nDisag    += 1
+        nBullBear += f15Bull ? 1 : 0
+        nBearBull += f15Bull ? 0 : 1
+
+    // Label on the last bar of the session
+    if i_labels
+        label.new(
+             x         = bar_index[1],
+             y         = high[1],
+             text      = agree ? "✓" : "✗",
+             style     = label.style_label_down,
+             color     = agree ? color.new(color.green, 35) : color.new(color.red, 35),
+             textcolor = color.white,
+             size      = size.normal,
+             tooltip   = (f15Bull ? "First 15min: Bull ↑" : "First 15min: Bear ↓") + "\n" +
+                         (eodBull ? "EOD:         Bull ↑" : "EOD:         Bear ↓") + "\n─────\n" +
+                         (agree   ? "✓ AGREE"              : "✗ DISAGREE"))
+
+    hasDay := false
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Background: highlight the first 15-min bar
+// ──────────────────────────────────────────────────────────────────────────────
+bgcolor(i_hlBar and sessStart ? color.new(color.blue, 87) : na,
+     title = "First 15-min bar highlight")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Metrics table
+// ──────────────────────────────────────────────────────────────────────────────
+var table T = table.new(tblPos, 2, 11,
+     bgcolor      = color.new(color.black, 72),
+     border_width = 1,
+     border_color = color.new(color.gray, 60))
+
+if barstate.islast
+    float td = math.max(nDays, 1)   // avoid division by zero
+
+    // Format: "N  (XX.X%)"
+    string sTotal = str.tostring(nDays)
+    string sA     = str.tostring(nAgree)    + "  (" + str.tostring(math.round(nAgree    / td * 1000) / 10.0, "#.#") + "%)"
+    string sDis   = str.tostring(nDisag)    + "  (" + str.tostring(math.round(nDisag    / td * 1000) / 10.0, "#.#") + "%)"
+    string sBB    = str.tostring(nBullBull) + "  (" + str.tostring(math.round(nBullBull / td * 1000) / 10.0, "#.#") + "%)"
+    string sBbB   = str.tostring(nBearBear) + "  (" + str.tostring(math.round(nBearBear / td * 1000) / 10.0, "#.#") + "%)"
+    string sBbBr  = str.tostring(nBullBear) + "  (" + str.tostring(math.round(nBullBear / td * 1000) / 10.0, "#.#") + "%)"
+    string sBeB   = str.tostring(nBearBull) + "  (" + str.tostring(math.round(nBearBull / td * 1000) / 10.0, "#.#") + "%)"
+
+    color tc15 = today15 == "Bullish ↑" ? color.lime :
+                 today15 == "Bearish ↓" ? color.red  : color.gray
+
+    // Row 0 – header
+    table.cell(T, 0, 0, "S&P500 · First 15min vs EOD",
+         text_color = color.white,  bgcolor = color.new(color.blue, 38), text_size = size.small)
+    table.cell(T, 1, 0, "Count  (Rate)",
+         text_color = color.silver, bgcolor = color.new(color.blue, 38), text_size = size.small)
+
+    // Row 1 – today's first 15-min direction
+    table.cell(T, 0, 1, "Today – First 15min",
+         text_color = color.silver, text_size = size.small)
+    table.cell(T, 1, 1, today15,
+         text_color = tc15, text_size = size.small)
+
+    // Row 2 – separator
+    table.cell(T, 0, 2, "───────────────────", text_color = color.gray, text_size = size.tiny)
+    table.cell(T, 1, 2, "───────────────────", text_color = color.gray, text_size = size.tiny)
+
+    // Row 3 – total days
+    table.cell(T, 0, 3, "Total Days Tracked",
+         text_color = color.silver, text_size = size.small)
+    table.cell(T, 1, 3, sTotal,
+         text_color = color.white, text_size = size.small)
+
+    // Row 4 – agreements
+    table.cell(T, 0, 4, "✓  Direction Agreed",
+         text_color = color.lime, text_size = size.small)
+    table.cell(T, 1, 4, sA,
+         text_color = color.lime, text_size = size.small)
+
+    // Row 5 – disagreements
+    table.cell(T, 0, 5, "✗  Direction Disagreed",
+         text_color = color.red, text_size = size.small)
+    table.cell(T, 1, 5, sDis,
+         text_color = color.red, text_size = size.small)
+
+    // Row 6 – separator
+    table.cell(T, 0, 6, "───────────────────", text_color = color.gray, text_size = size.tiny)
+    table.cell(T, 1, 6, "───────────────────", text_color = color.gray, text_size = size.tiny)
+
+    // Row 7 – Bull → Bull  (agreement)
+    table.cell(T, 0, 7, "↑ 15min Bull  →  EOD Bull",
+         text_color = color.green, text_size = size.small)
+    table.cell(T, 1, 7, sBB,
+         text_color = color.green, text_size = size.small)
+
+    // Row 8 – Bear → Bear  (agreement)
+    table.cell(T, 0, 8, "↓ 15min Bear  →  EOD Bear",
+         text_color = color.orange, text_size = size.small)
+    table.cell(T, 1, 8, sBbB,
+         text_color = color.orange, text_size = size.small)
+
+    // Row 9 – Bull → Bear  (disagreement)
+    table.cell(T, 0, 9, "↑ 15min Bull  →  EOD Bear",
+         text_color = color.new(color.red, 15), text_size = size.small)
+    table.cell(T, 1, 9, sBbBr,
+         text_color = color.new(color.red, 15), text_size = size.small)
+
+    // Row 10 – Bear → Bull  (disagreement)
+    table.cell(T, 0, 10, "↓ 15min Bear  →  EOD Bull",
+         text_color = color.new(color.red, 15), text_size = size.small)
+    table.cell(T, 1, 10, sBeB,
+         text_color = color.new(color.red, 15), text_size = size.small)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Timeframe warning (visible nudge when chart is not 15-min)
+// ──────────────────────────────────────────────────────────────────────────────
+if barstate.islast and timeframe.period != "15"
+    label.new(bar_index, high,
+         "⚠  This indicator is designed for the 15-minute chart.\n" +
+         "Current timeframe: " + timeframe.period + " min",
+         style     = label.style_label_left,
+         color     = color.new(color.red, 20),
+         textcolor = color.white,
+         size      = size.normal)
