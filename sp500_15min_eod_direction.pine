@@ -5,19 +5,42 @@ indicator("S&P500 First 15min vs EOD Direction",
      max_bars_back = 5000)
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Inputs
+// Inputs — General
 // ──────────────────────────────────────────────────────────────────────────────
 string i_session = input.string("0930-1600", "Session (HH:MM-HH:MM)",
-     tooltip = "NYSE regular hours. For CME ES futures RTH use 0930-1600 ET or adjust per broker.")
+     tooltip = "NYSE regular hours. For CME ES futures RTH use 0930-1600 ET or adjust per broker.",
+     group = "General")
 string i_days    = input.string("23456",     "Trading Days  (1=Sun … 7=Sat)",
-     tooltip = "23456 = Monday – Friday")
-bool   i_hlBar   = input.bool(true,  "Highlight first 15-min bar on chart")
-bool   i_labels  = input.bool(true,  "Show EOD agreement labels on last bar of day")
+     tooltip = "23456 = Monday – Friday",
+     group = "General")
+bool   i_hlBar   = input.bool(true,  "Highlight first 15-min bar on chart",  group = "General")
+bool   i_labels  = input.bool(true,  "Show EOD agreement labels on last bar of day", group = "General")
 string i_tblPos  = input.string("Top Right", "Table position",
-     options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"])
+     options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
+     group = "General")
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Table position mapping
+// Inputs — Table Appearance
+// ──────────────────────────────────────────────────────────────────────────────
+string i_fontSize    = input.string("Small", "Font size",
+     options = ["Tiny","Small","Normal","Large","Huge"],
+     group = "Table Appearance")
+
+color  i_tblBg       = input.color(color.new(color.black,  72), "Table background",   group = "Table Appearance")
+color  i_borderClr   = input.color(color.new(color.gray,   60), "Border colour",      group = "Table Appearance")
+
+color  i_hdrBg       = input.color(color.new(color.blue,   38), "Header background",  group = "Table Appearance")
+color  i_hdrTxt      = input.color(color.white,                 "Header text",        group = "Table Appearance")
+
+color  i_labelTxt    = input.color(color.silver,                "Row label text",     group = "Table Appearance")
+color  i_valueTxt    = input.color(color.white,                 "Row value text",     group = "Table Appearance")
+
+color  i_agreeClr    = input.color(color.lime,                  "Agree / Bullish",    group = "Table Appearance")
+color  i_bearBearClr = input.color(color.orange,                "Bear → Bear",        group = "Table Appearance")
+color  i_disagreeClr = input.color(color.red,                   "Disagree / Bearish", group = "Table Appearance")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Derived style values
 // ──────────────────────────────────────────────────────────────────────────────
 string tblPos =
      i_tblPos == "Top Left"     ? position.top_left     :
@@ -26,6 +49,13 @@ string tblPos =
      i_tblPos == "Middle Right" ? position.middle_right :
      i_tblPos == "Middle Left"  ? position.middle_left  :
      position.top_right
+
+string tblFontSize =
+     i_fontSize == "Tiny"   ? size.tiny   :
+     i_fontSize == "Normal" ? size.normal :
+     i_fontSize == "Large"  ? size.large  :
+     i_fontSize == "Huge"   ? size.huge   :
+     size.small
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Session detection
@@ -105,9 +135,9 @@ bgcolor(i_hlBar and sessStart ? color.new(color.blue, 87) : na,
 // Metrics table
 // ──────────────────────────────────────────────────────────────────────────────
 var table T = table.new(tblPos, 2, 11,
-     bgcolor      = color.new(color.black, 72),
+     bgcolor      = i_tblBg,
      border_width = 1,
-     border_color = color.new(color.gray, 60))
+     border_color = i_borderClr)
 
 if barstate.islast
     float td = math.max(nDays, 1)   // avoid division by zero
@@ -121,70 +151,70 @@ if barstate.islast
     string sBbBr  = str.tostring(nBullBear) + "  (" + str.tostring(math.round(nBullBear / td * 1000) / 10.0, "#.#") + "%)"
     string sBeB   = str.tostring(nBearBull) + "  (" + str.tostring(math.round(nBearBull / td * 1000) / 10.0, "#.#") + "%)"
 
-    color tc15 = today15 == "Bullish ↑" ? color.lime :
-                 today15 == "Bearish ↓" ? color.red  : color.gray
+    color tc15 = today15 == "Bullish ↑" ? i_agreeClr :
+                 today15 == "Bearish ↓" ? i_disagreeClr : color.gray
 
     // Row 0 – header
     table.cell(T, 0, 0, "S&P500 · First 15min vs EOD",
-         text_color = color.white,  bgcolor = color.new(color.blue, 38), text_size = size.small)
+         text_color = i_hdrTxt,  bgcolor = i_hdrBg, text_size = tblFontSize)
     table.cell(T, 1, 0, "Count  (Rate)",
-         text_color = color.silver, bgcolor = color.new(color.blue, 38), text_size = size.small)
+         text_color = i_hdrTxt, bgcolor = i_hdrBg, text_size = tblFontSize)
 
     // Row 1 – today's first 15-min direction
     table.cell(T, 0, 1, "Today – First 15min",
-         text_color = color.silver, text_size = size.small)
+         text_color = i_labelTxt, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 1, today15,
-         text_color = tc15, text_size = size.small)
+         text_color = tc15, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 2 – separator
-    table.cell(T, 0, 2, "───────────────────", text_color = color.gray, text_size = size.tiny)
-    table.cell(T, 1, 2, "───────────────────", text_color = color.gray, text_size = size.tiny)
+    table.cell(T, 0, 2, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+    table.cell(T, 1, 2, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
 
     // Row 3 – total days
     table.cell(T, 0, 3, "Total Days Tracked",
-         text_color = color.silver, text_size = size.small)
+         text_color = i_labelTxt, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 3, sTotal,
-         text_color = color.white, text_size = size.small)
+         text_color = i_valueTxt, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 4 – agreements
     table.cell(T, 0, 4, "✓  Direction Agreed",
-         text_color = color.lime, text_size = size.small)
+         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 4, sA,
-         text_color = color.lime, text_size = size.small)
+         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 5 – disagreements
     table.cell(T, 0, 5, "✗  Direction Disagreed",
-         text_color = color.red, text_size = size.small)
+         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 5, sDis,
-         text_color = color.red, text_size = size.small)
+         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 6 – separator
-    table.cell(T, 0, 6, "───────────────────", text_color = color.gray, text_size = size.tiny)
-    table.cell(T, 1, 6, "───────────────────", text_color = color.gray, text_size = size.tiny)
+    table.cell(T, 0, 6, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+    table.cell(T, 1, 6, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
 
     // Row 7 – Bull → Bull  (agreement)
     table.cell(T, 0, 7, "↑ 15min Bull  →  EOD Bull",
-         text_color = color.green, text_size = size.small)
+         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 7, sBB,
-         text_color = color.green, text_size = size.small)
+         text_color = i_agreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 8 – Bear → Bear  (agreement)
     table.cell(T, 0, 8, "↓ 15min Bear  →  EOD Bear",
-         text_color = color.orange, text_size = size.small)
+         text_color = i_bearBearClr, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 8, sBbB,
-         text_color = color.orange, text_size = size.small)
+         text_color = i_bearBearClr, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 9 – Bull → Bear  (disagreement)
     table.cell(T, 0, 9, "↑ 15min Bull  →  EOD Bear",
-         text_color = color.new(color.red, 15), text_size = size.small)
+         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 9, sBbBr,
-         text_color = color.new(color.red, 15), text_size = size.small)
+         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
 
     // Row 10 – Bear → Bull  (disagreement)
     table.cell(T, 0, 10, "↓ 15min Bear  →  EOD Bull",
-         text_color = color.new(color.red, 15), text_size = size.small)
+         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
     table.cell(T, 1, 10, sBeB,
-         text_color = color.new(color.red, 15), text_size = size.small)
+         text_color = i_disagreeClr, bgcolor = i_tblBg, text_size = tblFontSize)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Timeframe warning (visible nudge when chart is not 15-min)
