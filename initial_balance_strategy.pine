@@ -210,19 +210,21 @@ slBuffer   = ibComplete ? ibRange * (slBufferPct / 100.0) : na
 // For a retest long the broken level is already acting as support, so IB Mid or
 // swing low are the logical reference points.
 calcLongSL(entryPrice, isBreakout) =>
-    base = isBreakout ? ibHigh : switch slMode
+    modeBase = switch slMode
         "IB Mid"         => ibMid
         "Swing High/Low" => math.min(swingLow_, ibMid)
         "Full IB Range"  => ibLow
         => ibMid
+    base = isBreakout ? ibHigh : modeBase
     math.min(base, entryPrice) - slBuffer
 
 calcShortSL(entryPrice, isBreakout) =>
-    base = isBreakout ? ibLow : switch slMode
+    modeBase = switch slMode
         "IB Mid"         => ibMid
         "Swing High/Low" => math.max(swingHigh_, ibMid)
         "Full IB Range"  => ibHigh
         => ibMid
+    base = isBreakout ? ibLow : modeBase
     math.max(base, entryPrice) + slBuffer
 
 // ─── Take Profit calculation ──────────────────────────────────────────────────
