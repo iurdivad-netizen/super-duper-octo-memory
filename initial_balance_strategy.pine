@@ -1,0 +1,328 @@
+//@version=5
+strategy("Initial Balance Break & Retest [SP500/NQ]",
+         overlay=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10,
+         commission_type=strategy.commission.percent,
+         commission_value=0.01,
+         slippage=2,
+         calc_on_every_tick=false)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+grpIB       = "Initial Balance"
+grpEntry    = "Entry / Filter"
+grpSL       = "Stop Loss"
+grpTP       = "Take Profit"
+grpDisplay  = "Display"
+
+// IB window — fixed 9:30–10:30 EST for SP500/NQ
+ibSession   = input.session("0930-1030", "IB Window (Exchange TZ)", group=grpIB,
+                 tooltip="Keep default for NYSE/NASDAQ (EST). Adjust for futures sessions.")
+
+// Entry
+retestPct   = input.float(0.15, "Retest Tolerance (% of IB Range)", minval=0.0, maxval=5.0, step=0.05, group=grpEntry,
+                 tooltip="How close price must return to IB High/Low to qualify as a retest.")
+confirmBars = input.int(1,  "Confirmation Candles (close beyond level)", minval=1, maxval=3, group=grpEntry)
+tradeDir    = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"], group=grpEntry)
+maxTradesDay= input.int(1, "Max Trades per Day", minval=1, maxval=4, group=grpEntry)
+
+// Stop Loss
+slMode      = input.string("IB Mid", "Stop Loss Mode", options=["IB Mid", "Swing High/Low", "Full IB Range"], group=grpSL,
+                 tooltip="IB Mid: stop at midpoint of range.\nSwing High/Low: nearest pivot within lookback.\nFull IB Range: stop at opposite boundary.")
+swingLookback = input.int(10, "Swing Lookback (bars)", minval=3, maxval=30, group=grpSL)
+slBufferPct = input.float(0.05, "SL Buffer (% of IB Range)", minval=0.0, maxval=1.0, step=0.01, group=grpSL)
+
+// Take Profit
+tpMode      = input.string("1:2 RR", "Take Profit Mode", options=["1:2 RR", "1:3 RR", "+1R Ext", "+1.5R Ext", "+2R Ext", "+3R Ext"], group=grpTP)
+useTrailStop= input.bool(false, "Use Trailing Stop after 1R", group=grpTP)
+
+// Display
+showIB      = input.bool(true,  "Show IB Range",          group=grpDisplay)
+showMid     = input.bool(true,  "Show IB Midpoint",       group=grpDisplay)
+showExts    = input.bool(true,  "Show IB Extensions",     group=grpDisplay)
+showBG      = input.bool(true,  "Highlight IB Window",    group=grpDisplay)
+showLabels  = input.bool(true,  "Show Level Labels",      group=grpDisplay)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+isIBBar     = not na(time("", ibSession))
+isNewDay    = ta.change(time("D")) != 0
+isRTH       = not na(time("", "0930-1600"))   // regular trading hours gate
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INITIAL BALANCE CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float ibHigh     = na
+var float ibLow      = na
+var float ibMid      = na
+var float ibRange    = na
+var bool  ibComplete = false
+var bool  ibActive   = false    // currently inside IB window
+
+if isNewDay
+    ibHigh     := na
+    ibLow      := na
+    ibMid      := na
+    ibRange    := na
+    ibComplete := false
+    ibActive   := false
+
+if isIBBar
+    ibActive := true
+    ibHigh   := na(ibHigh) ? high : math.max(ibHigh, high)
+    ibLow    := na(ibLow)  ? low  : math.min(ibLow,  low)
+
+// Seal the IB on first bar after the window closes
+if ibActive and not isIBBar and not ibComplete
+    ibComplete := true
+    ibMid      := (ibHigh + ibLow) / 2.0
+    ibRange    := ibHigh - ibLow
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXTENSIONS  (multiples of the IB range above High / below Low)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+ext(mult, dir) =>
+    ibComplete ? (dir > 0 ? ibHigh + ibRange * mult : ibLow - ibRange * mult) : na
+
+ibExt1Up  = ext(1.0, 1)
+ibExt15Up = ext(1.5, 1)
+ibExt2Up  = ext(2.0, 1)
+ibExt3Up  = ext(3.0, 1)
+ibExt1Dn  = ext(1.0, -1)
+ibExt15Dn = ext(1.5, -1)
+ibExt2Dn  = ext(2.0, -1)
+ibExt3Dn  = ext(3.0, -1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var bool  longBroken    = false   // price has closed above IB High
+var bool  shortBroken   = false   // price has closed below IB Low
+var int   tradesToday   = 0
+var bool  longFired     = false
+var bool  shortFired    = false
+
+if isNewDay
+    longBroken  := false
+    shortBroken := false
+    tradesToday := 0
+    longFired   := false
+    shortFired  := false
+
+// ─── Breakout detection (needs confirmBars closes beyond the boundary) ─────────
+// We use a simple approach: track consecutive closes beyond IB level
+var int longCloseCount  = 0
+var int shortCloseCount = 0
+
+if isNewDay
+    longCloseCount  := 0
+    shortCloseCount := 0
+
+if ibComplete and not isIBBar
+    if close > ibHigh
+        longCloseCount  += 1
+        shortCloseCount := 0
+    else if close < ibLow
+        shortCloseCount += 1
+        longCloseCount  := 0
+    else
+        longCloseCount  := 0
+        shortCloseCount := 0
+
+    if longCloseCount  >= confirmBars
+        longBroken  := true
+    if shortCloseCount >= confirmBars
+        shortBroken := true
+
+// ─── Retest detection ─────────────────────────────────────────────────────────
+// Long retest: after breaking above IB High, price returns to within tolerance
+//              of IB High and then closes back above it (support holds).
+// Short retest: symmetric.
+
+tolerance = ibComplete ? ibRange * (retestPct / 100.0) : na
+
+longRetestBar  = ibComplete and longBroken  and not longFired  and
+                 low <= ibHigh + tolerance  and close >= ibHigh - tolerance and
+                 close > ibHigh - ibRange * 0.1   // ensure close is not deep inside range
+
+shortRetestBar = ibComplete and shortBroken and not shortFired and
+                 high >= ibLow  - tolerance and close <= ibLow  + tolerance and
+                 close < ibLow  + ibRange * 0.1
+
+// ─── Stop Loss calculation ────────────────────────────────────────────────────
+
+swingLow_  = ta.lowest(low,  swingLookback)
+swingHigh_ = ta.highest(high, swingLookback)
+slBuffer   = ibComplete ? ibRange * (slBufferPct / 100.0) : na
+
+calcLongSL(entryPrice) =>
+    base = switch slMode
+        "IB Mid"          => ibMid
+        "Swing High/Low"  => math.min(swingLow_,  ibMid)   // whichever is lower (tighter)
+        "Full IB Range"   => ibLow
+        => ibMid
+    math.min(base, entryPrice) - slBuffer   // never above entry
+
+calcShortSL(entryPrice) =>
+    base = switch slMode
+        "IB Mid"          => ibMid
+        "Swing High/Low"  => math.max(swingHigh_, ibMid)
+        "Full IB Range"   => ibHigh
+        => ibMid
+    math.max(base, entryPrice) + slBuffer
+
+// ─── Take Profit calculation ──────────────────────────────────────────────────
+
+calcTP(entryPrice, sl, isLong) =>
+    risk = math.abs(entryPrice - sl)
+    dir  = isLong ? 1.0 : -1.0
+    switch tpMode
+        "1:2 RR"    => entryPrice + dir * risk * 2.0
+        "1:3 RR"    => entryPrice + dir * risk * 3.0
+        "+1R Ext"   => isLong ? ibExt1Up  : ibExt1Dn
+        "+1.5R Ext" => isLong ? ibExt15Up : ibExt15Dn
+        "+2R Ext"   => isLong ? ibExt2Up  : ibExt2Dn
+        "+3R Ext"   => isLong ? ibExt3Up  : ibExt3Dn
+        => entryPrice + dir * risk * 2.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY ORDERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+canLong  = tradeDir != "Short Only"
+canShort = tradeDir != "Long Only"
+slotOpen = strategy.position_size == 0 and tradesToday < maxTradesDay and isRTH
+
+if longRetestBar and canLong and slotOpen
+    entryP = close
+    sl     = calcLongSL(entryP)
+    tp     = calcTP(entryP, sl, true)
+    if tp > entryP and sl < entryP        // sanity check
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long TP/SL", "Long",
+             stop   = sl,
+             limit  = tp,
+             trail_price  = useTrailStop ? entryP + math.abs(entryP - sl) : na,
+             trail_offset = useTrailStop ? math.abs(entryP - sl) * syminfo.mintick * 10 : na)
+        longFired   := true
+        tradesToday += 1
+
+if shortRetestBar and canShort and slotOpen
+    entryP = close
+    sl     = calcShortSL(entryP)
+    tp     = calcTP(entryP, sl, false)
+    if tp < entryP and sl > entryP
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short TP/SL", "Short",
+             stop   = sl,
+             limit  = tp,
+             trail_price  = useTrailStop ? entryP - math.abs(entryP - sl) : na,
+             trail_offset = useTrailStop ? math.abs(entryP - sl) * syminfo.mintick * 10 : na)
+        shortFired  := true
+        tradesToday += 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// IB background highlight
+bgcolor(showBG and isIBBar ? color.new(color.orange, 88) : na, title="IB Window")
+
+// Core IB levels
+plotIBH = (showIB and (ibActive or ibComplete)) ? ibHigh : na
+plotIBL = (showIB and (ibActive or ibComplete)) ? ibLow  : na
+plotIBM = (showMid and ibComplete) ? ibMid : na
+
+pIBH = plot(plotIBH, "IB High", color=color.new(color.orange, 0),  linewidth=2, style=plot.style_linebr)
+pIBL = plot(plotIBL, "IB Low",  color=color.new(color.orange, 0),  linewidth=2, style=plot.style_linebr)
+plot(plotIBM,        "IB Mid",  color=color.new(color.yellow, 20), linewidth=1, style=plot.style_linebr)
+
+// Fill between IB High and Low
+fill(pIBH, pIBL, color=color.new(color.orange, 92), title="IB Range Fill")
+
+// Extensions
+cGreen = color.new(color.lime,  0)
+cRed   = color.new(color.red,   0)
+
+plot(showExts ? ibExt1Up  : na, "+1R",   color=color.new(cGreen, 40), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt15Up : na, "+1.5R", color=color.new(cGreen, 55), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt2Up  : na, "+2R",   color=color.new(cGreen, 30), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt3Up  : na, "+3R",   color=color.new(cGreen, 20), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt1Dn  : na, "-1R",   color=color.new(cRed,   40), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt15Dn : na, "-1.5R", color=color.new(cRed,   55), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt2Dn  : na, "-2R",   color=color.new(cRed,   30), linewidth=1, style=plot.style_linebr)
+plot(showExts ? ibExt3Dn  : na, "-3R",   color=color.new(cRed,   20), linewidth=1, style=plot.style_linebr)
+
+// Entry signals
+plotshape(longRetestBar  and canLong  and slotOpen, "Long Retest",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.small)
+plotshape(shortRetestBar and canShort and slotOpen, "Short Retest", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.small)
+
+// Breakout markers (first close beyond the boundary)
+plotshape(ibComplete and longCloseCount  == confirmBars and not longFired,  "Long Break",  shape.circle, location.abovebar, color.new(color.green, 40), size=size.tiny)
+plotshape(ibComplete and shortCloseCount == confirmBars and not shortFired, "Short Break", shape.circle, location.belowbar, color.new(color.red,   40), size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEVEL LABELS  (drawn on the last bar of each day to avoid clutter)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if showLabels and ibComplete and barstate.islast
+    lx = bar_index + 2
+    labelStyle = label.style_label_left
+    sz         = size.small
+
+    label.new(lx, ibHigh,     "IB High  " + str.tostring(ibHigh, "#.##"),     color=color.new(color.orange,80), textcolor=color.orange, style=labelStyle, size=sz)
+    label.new(lx, ibLow,      "IB Low   " + str.tostring(ibLow,  "#.##"),     color=color.new(color.orange,80), textcolor=color.orange, style=labelStyle, size=sz)
+    label.new(lx, ibMid,      "IB Mid   " + str.tostring(ibMid,  "#.##"),     color=color.new(color.yellow,80), textcolor=color.yellow, style=labelStyle, size=sz)
+    if showExts
+        label.new(lx, ibExt1Up,  "+1R   "  + str.tostring(ibExt1Up,  "#.##"), color=color.new(color.green, 80), textcolor=color.lime,   style=labelStyle, size=sz)
+        label.new(lx, ibExt2Up,  "+2R   "  + str.tostring(ibExt2Up,  "#.##"), color=color.new(color.green, 80), textcolor=color.lime,   style=labelStyle, size=sz)
+        label.new(lx, ibExt3Up,  "+3R   "  + str.tostring(ibExt3Up,  "#.##"), color=color.new(color.green, 80), textcolor=color.lime,   style=labelStyle, size=sz)
+        label.new(lx, ibExt1Dn,  "-1R   "  + str.tostring(ibExt1Dn,  "#.##"), color=color.new(color.red,   80), textcolor=color.red,    style=labelStyle, size=sz)
+        label.new(lx, ibExt2Dn,  "-2R   "  + str.tostring(ibExt2Dn,  "#.##"), color=color.new(color.red,   80), textcolor=color.red,    style=labelStyle, size=sz)
+        label.new(lx, ibExt3Dn,  "-3R   "  + str.tostring(ibExt3Dn,  "#.##"), color=color.new(color.red,   80), textcolor=color.red,    style=labelStyle, size=sz)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table t = table.new(position.top_right, 2, 7,
+     bgcolor=color.new(color.black, 60), border_width=1, border_color=color.new(color.gray, 50))
+
+tCol0 = color.new(color.silver, 0)
+tCol1 = color.new(color.orange, 0)
+
+if barstate.islast
+    table.cell(t, 0, 0, "IB Range",  text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 0, ibComplete ? str.tostring(math.round(ibRange * 100) / 100) : "building…",
+               text_color=tCol1, text_size=size.small, bgcolor=color.new(color.black,70))
+
+    table.cell(t, 0, 1, "IB High",   text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 1, ibComplete ? str.tostring(math.round(ibHigh * 100) / 100) : "—",
+               text_color=tCol1, text_size=size.small, bgcolor=color.new(color.black,70))
+
+    table.cell(t, 0, 2, "IB Low",    text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 2, ibComplete ? str.tostring(math.round(ibLow  * 100) / 100) : "—",
+               text_color=tCol1, text_size=size.small, bgcolor=color.new(color.black,70))
+
+    table.cell(t, 0, 3, "IB Mid",    text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 3, ibComplete ? str.tostring(math.round(ibMid  * 100) / 100) : "—",
+               text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black,70))
+
+    table.cell(t, 0, 4, "Direction", text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 4, tradeDir,    text_color=color.aqua, text_size=size.small, bgcolor=color.new(color.black,70))
+
+    table.cell(t, 0, 5, "TP Mode",   text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 5, tpMode,      text_color=color.aqua, text_size=size.small, bgcolor=color.new(color.black,70))
+
+    statusText  = longFired ? "Long ✓" : shortFired ? "Short ✓" : ibComplete ? "Watching…" : isIBBar ? "Building IB…" : "Pre-IB"
+    statusColor = longFired ? color.lime : shortFired ? color.red : color.gray
+    table.cell(t, 0, 6, "Status",    text_color=tCol0,      text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 1, 6, statusText,  text_color=statusColor, text_size=size.small, bgcolor=color.new(color.black,70))
