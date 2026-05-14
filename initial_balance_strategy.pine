@@ -1,5 +1,5 @@
 //@version=5
-strategy("Initial Balance Break & Retest [SP500/NQ]",
+strategy("Initial Balance – Breakout & Retest [SP500/NQ]",
          overlay=true,
          default_qty_type=strategy.percent_of_equity,
          default_qty_value=10,
@@ -23,9 +23,13 @@ ibSession   = input.session("0930-1030", "IB Window (Exchange TZ)", group=grpIB,
                  tooltip="Keep default for NYSE/NASDAQ (EST). Adjust for futures sessions.")
 
 // Entry
-retestPct   = input.float(0.15, "Retest Tolerance (% of IB Range)", minval=0.0, maxval=5.0, step=0.05, group=grpEntry,
-                 tooltip="How close price must return to IB High/Low to qualify as a retest.")
-confirmBars = input.int(1,  "Confirmation Candles (close beyond level)", minval=1, maxval=3, group=grpEntry)
+entryMode   = input.string("Break & Retest", "Entry Mode",
+                 options=["Breakout", "Break & Retest", "Both"], group=grpEntry,
+                 tooltip="Breakout: enter on the first confirmed close beyond the IB level.\nBreak & Retest: wait for price to pull away then return and hold the level.\nBoth: take whichever signal comes first each day.")
+retestPct   = input.float(2.0,  "Retest Tolerance (% of IB Range)", minval=0.1, maxval=10.0, step=0.1, group=grpEntry,
+                 tooltip="How close price must return to IB High/Low to arm the retest. 2% of a 100-pt range = 2 pts.")
+confirmBars = input.int(1,  "Breakout Confirmation Candles", minval=1, maxval=3, group=grpEntry,
+                 tooltip="Number of consecutive closes beyond the IB level required to confirm a breakout.")
 tradeDir    = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"], group=grpEntry)
 maxTradesDay= input.int(1, "Max Trades per Day", minval=1, maxval=4, group=grpEntry)
 
@@ -101,61 +105,100 @@ ibExt2Dn  = ext(2.0, -1)
 ibExt3Dn  = ext(3.0, -1)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TRADE STATE
+// TRADE STATE  —  separate state machines for LONG and SHORT sides
 // ═══════════════════════════════════════════════════════════════════════════════
 
-var bool  longBroken    = false   // price has closed above IB High
-var bool  shortBroken   = false   // price has closed below IB Low
-var int   tradesToday   = 0
-var bool  longFired     = false
-var bool  shortFired    = false
+// Each side progresses through phases:
+//   0 → Breakout confirmed  (longBroke / shortBroke)
+//   1 → Pulled away from level  (longPulledAway / shortPulledAway)
+//       price makes at least one close > ibHigh + tolerance  (or < ibLow - tolerance)
+//   2 → Retest armed  (longRetestArmed / shortRetestArmed)
+//       price returns: low ≤ ibHigh + tolerance  (or high ≥ ibLow - tolerance)
+//   3 → Retest confirmed on next close back beyond the level  → entry signal
+
+var int   longCount        = 0      // consecutive closes above IB High
+var int   shortCount       = 0      // consecutive closes below IB Low
+var bool  longBroke        = false  // breakout confirmed
+var bool  shortBroke       = false
+var bool  longPulledAway   = false  // at least one close well above IB High after break
+var bool  shortPulledAway  = false
+var bool  longRetestArmed  = false  // price has returned to IB High ± tolerance
+var bool  shortRetestArmed = false
+var bool  longFired        = false  // a trade has been taken this day (long side)
+var bool  shortFired       = false
+var int   tradesToday      = 0
 
 if isNewDay
-    longBroken  := false
-    shortBroken := false
-    tradesToday := 0
-    longFired   := false
-    shortFired  := false
-
-// ─── Breakout detection (needs confirmBars closes beyond the boundary) ─────────
-// We use a simple approach: track consecutive closes beyond IB level
-var int longCloseCount  = 0
-var int shortCloseCount = 0
-
-if isNewDay
-    longCloseCount  := 0
-    shortCloseCount := 0
-
-if ibComplete and not isIBBar
-    if close > ibHigh
-        longCloseCount  += 1
-        shortCloseCount := 0
-    else if close < ibLow
-        shortCloseCount += 1
-        longCloseCount  := 0
-    else
-        longCloseCount  := 0
-        shortCloseCount := 0
-
-    if longCloseCount  >= confirmBars
-        longBroken  := true
-    if shortCloseCount >= confirmBars
-        shortBroken := true
-
-// ─── Retest detection ─────────────────────────────────────────────────────────
-// Long retest: after breaking above IB High, price returns to within tolerance
-//              of IB High and then closes back above it (support holds).
-// Short retest: symmetric.
+    longCount        := 0
+    shortCount       := 0
+    longBroke        := false
+    shortBroke       := false
+    longPulledAway   := false
+    shortPulledAway  := false
+    longRetestArmed  := false
+    shortRetestArmed := false
+    longFired        := false
+    shortFired       := false
+    tradesToday      := 0
 
 tolerance = ibComplete ? ibRange * (retestPct / 100.0) : na
 
-longRetestBar  = ibComplete and longBroken  and not longFired  and
-                 low <= ibHigh + tolerance  and close >= ibHigh - tolerance and
-                 close > ibHigh - ibRange * 0.1   // ensure close is not deep inside range
+if ibComplete and not isIBBar and not na(tolerance)
 
-shortRetestBar = ibComplete and shortBroken and not shortFired and
-                 high >= ibLow  - tolerance and close <= ibLow  + tolerance and
-                 close < ibLow  + ibRange * 0.1
+    // ── Breakout detection ───────────────────────────────────────────────────
+    if not longBroke
+        longCount := close > ibHigh ? longCount + 1 : 0
+        if longCount >= confirmBars
+            longBroke := true
+
+    if not shortBroke
+        shortCount := close < ibLow ? shortCount + 1 : 0
+        if shortCount >= confirmBars
+            shortBroke := true
+
+    // ── Retest state machine  (runs only after breakout confirmed) ───────────
+
+    // LONG: track pull-away then retest
+    if longBroke and not longFired
+        if not longPulledAway
+            // require at least one close meaningfully above IB High
+            if close > ibHigh + tolerance
+                longPulledAway := true
+        else if not longRetestArmed
+            // armed when price drops back to touch the IB High zone
+            if low <= ibHigh + tolerance
+                longRetestArmed := true
+
+    // SHORT: symmetric
+    if shortBroke and not shortFired
+        if not shortPulledAway
+            if close < ibLow - tolerance
+                shortPulledAway := true
+        else if not shortRetestArmed
+            if high >= ibLow - tolerance
+                shortRetestArmed := true
+
+// ─── One-bar entry signals ────────────────────────────────────────────────────
+
+// Breakout signal: fires on the exact bar where breakout is first confirmed
+longBreakoutBar  = ibComplete and not isIBBar and longBroke  and not longBroke[1]  and not longFired
+shortBreakoutBar = ibComplete and not isIBBar and shortBroke and not shortBroke[1] and not shortFired
+
+// Retest signal: armed AND this bar's close holds back above (long) / below (short) IB level
+longRetestBar  = ibComplete and not isIBBar and longRetestArmed  and not longFired  and
+                 close > ibHigh - tolerance * 0.25
+
+shortRetestBar = ibComplete and not isIBBar and shortRetestArmed and not shortFired and
+                 close < ibLow  + tolerance * 0.25
+
+// Gate each signal by the selected entry mode
+useBreakout = entryMode == "Breakout"      or entryMode == "Both"
+useRetest   = entryMode == "Break & Retest" or entryMode == "Both"
+
+longBreakoutSignal  = longBreakoutBar  and useBreakout
+shortBreakoutSignal = shortBreakoutBar and useBreakout
+longRetestSignal    = longRetestBar    and useRetest
+shortRetestSignal   = shortRetestBar   and useRetest
 
 // ─── Stop Loss calculation ────────────────────────────────────────────────────
 
@@ -163,19 +206,22 @@ swingLow_  = ta.lowest(low,  swingLookback)
 swingHigh_ = ta.highest(high, swingLookback)
 slBuffer   = ibComplete ? ibRange * (slBufferPct / 100.0) : na
 
-calcLongSL(entryPrice) =>
-    base = switch slMode
-        "IB Mid"          => ibMid
-        "Swing High/Low"  => math.min(swingLow_,  ibMid)   // whichever is lower (tighter)
-        "Full IB Range"   => ibLow
+// For a breakout long the natural SL is just below the broken level (IB High).
+// For a retest long the broken level is already acting as support, so IB Mid or
+// swing low are the logical reference points.
+calcLongSL(entryPrice, isBreakout) =>
+    base = isBreakout ? ibHigh : switch slMode
+        "IB Mid"         => ibMid
+        "Swing High/Low" => math.min(swingLow_, ibMid)
+        "Full IB Range"  => ibLow
         => ibMid
-    math.min(base, entryPrice) - slBuffer   // never above entry
+    math.min(base, entryPrice) - slBuffer
 
-calcShortSL(entryPrice) =>
-    base = switch slMode
-        "IB Mid"          => ibMid
-        "Swing High/Low"  => math.max(swingHigh_, ibMid)
-        "Full IB Range"   => ibHigh
+calcShortSL(entryPrice, isBreakout) =>
+    base = isBreakout ? ibLow : switch slMode
+        "IB Mid"         => ibMid
+        "Swing High/Low" => math.max(swingHigh_, ibMid)
+        "Full IB Range"  => ibHigh
         => ibMid
     math.max(base, entryPrice) + slBuffer
 
@@ -201,29 +247,61 @@ canLong  = tradeDir != "Short Only"
 canShort = tradeDir != "Long Only"
 slotOpen = strategy.position_size == 0 and tradesToday < maxTradesDay and isRTH
 
-if longRetestBar and canLong and slotOpen
+// ── Long breakout entry ───────────────────────────────────────────────────────
+if longBreakoutSignal and canLong and slotOpen
     entryP = close
-    sl     = calcLongSL(entryP)
+    sl     = calcLongSL(entryP, true)
     tp     = calcTP(entryP, sl, true)
-    if tp > entryP and sl < entryP        // sanity check
-        strategy.entry("Long", strategy.long)
-        strategy.exit("Long TP/SL", "Long",
-             stop   = sl,
-             limit  = tp,
+    if tp > entryP and sl < entryP
+        strategy.entry("Long BO", strategy.long)
+        strategy.exit("Long BO Exit", "Long BO",
+             stop         = sl,
+             limit        = tp,
              trail_price  = useTrailStop ? entryP + math.abs(entryP - sl) : na,
              trail_offset = useTrailStop ? math.abs(entryP - sl) * syminfo.mintick * 10 : na)
         longFired   := true
         tradesToday += 1
 
-if shortRetestBar and canShort and slotOpen
+// ── Long retest entry ─────────────────────────────────────────────────────────
+if longRetestSignal and canLong and slotOpen
     entryP = close
-    sl     = calcShortSL(entryP)
+    sl     = calcLongSL(entryP, false)
+    tp     = calcTP(entryP, sl, true)
+    if tp > entryP and sl < entryP
+        strategy.entry("Long RT", strategy.long)
+        strategy.exit("Long RT Exit", "Long RT",
+             stop         = sl,
+             limit        = tp,
+             trail_price  = useTrailStop ? entryP + math.abs(entryP - sl) : na,
+             trail_offset = useTrailStop ? math.abs(entryP - sl) * syminfo.mintick * 10 : na)
+        longFired   := true
+        tradesToday += 1
+
+// ── Short breakout entry ──────────────────────────────────────────────────────
+if shortBreakoutSignal and canShort and slotOpen
+    entryP = close
+    sl     = calcShortSL(entryP, true)
     tp     = calcTP(entryP, sl, false)
     if tp < entryP and sl > entryP
-        strategy.entry("Short", strategy.short)
-        strategy.exit("Short TP/SL", "Short",
-             stop   = sl,
-             limit  = tp,
+        strategy.entry("Short BO", strategy.short)
+        strategy.exit("Short BO Exit", "Short BO",
+             stop         = sl,
+             limit        = tp,
+             trail_price  = useTrailStop ? entryP - math.abs(entryP - sl) : na,
+             trail_offset = useTrailStop ? math.abs(entryP - sl) * syminfo.mintick * 10 : na)
+        shortFired  := true
+        tradesToday += 1
+
+// ── Short retest entry ────────────────────────────────────────────────────────
+if shortRetestSignal and canShort and slotOpen
+    entryP = close
+    sl     = calcShortSL(entryP, false)
+    tp     = calcTP(entryP, sl, false)
+    if tp < entryP and sl > entryP
+        strategy.entry("Short RT", strategy.short)
+        strategy.exit("Short RT Exit", "Short RT",
+             stop         = sl,
+             limit        = tp,
              trail_price  = useTrailStop ? entryP - math.abs(entryP - sl) : na,
              trail_offset = useTrailStop ? math.abs(entryP - sl) * syminfo.mintick * 10 : na)
         shortFired  := true
@@ -261,13 +339,19 @@ plot(showExts ? ibExt15Dn : na, "-1.5R", color=color.new(cRed,   55), linewidth=
 plot(showExts ? ibExt2Dn  : na, "-2R",   color=color.new(cRed,   30), linewidth=1, style=plot.style_linebr)
 plot(showExts ? ibExt3Dn  : na, "-3R",   color=color.new(cRed,   20), linewidth=1, style=plot.style_linebr)
 
-// Entry signals
-plotshape(longRetestBar  and canLong  and slotOpen, "Long Retest",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.small)
-plotshape(shortRetestBar and canShort and slotOpen, "Short Retest", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.small)
+// ── Breakout entry signals (filled triangle = trade fires here)
+plotshape(longBreakoutSignal  and canLong  and slotOpen, "Long Breakout",  shape.triangleup,   location.belowbar, color.new(color.lime,  0), size=size.small, title="Long Breakout Entry")
+plotshape(shortBreakoutSignal and canShort and slotOpen, "Short Breakout", shape.triangledown, location.abovebar, color.new(color.red,   0), size=size.small, title="Short Breakout Entry")
 
-// Breakout markers (first close beyond the boundary)
-plotshape(ibComplete and longCloseCount  == confirmBars and not longFired,  "Long Break",  shape.circle, location.abovebar, color.new(color.green, 40), size=size.tiny)
-plotshape(ibComplete and shortCloseCount == confirmBars and not shortFired, "Short Break", shape.circle, location.belowbar, color.new(color.red,   40), size=size.tiny)
+// ── Retest entry signals (circle = trade fires here)
+plotshape(longRetestSignal  and canLong  and slotOpen, "Long Retest",  shape.circle, location.belowbar, color.new(color.aqua, 0), size=size.small, title="Long Retest Entry")
+plotshape(shortRetestSignal and canShort and slotOpen, "Short Retest", shape.circle, location.abovebar, color.new(color.fuchsia, 0), size=size.small, title="Short Retest Entry")
+
+// ── State markers (no fill = informational only, no trade)
+plotshape(ibComplete and longBroke  and not longBroke[1]  and not longFired,  "Long Break Confirmed",  shape.diamond, location.abovebar, color.new(color.lime, 60), size=size.tiny, title="Long Break Confirmed")
+plotshape(ibComplete and shortBroke and not shortBroke[1] and not shortFired, "Short Break Confirmed", shape.diamond, location.belowbar, color.new(color.red,  60), size=size.tiny, title="Short Break Confirmed")
+plotshape(ibComplete and longRetestArmed  and not longRetestArmed[1]  and not longFired,  "Long Retest Armed",  shape.xcross, location.belowbar, color.new(color.aqua,    50), size=size.tiny, title="Long Retest Armed")
+plotshape(ibComplete and shortRetestArmed and not shortRetestArmed[1] and not shortFired, "Short Retest Armed", shape.xcross, location.abovebar, color.new(color.fuchsia, 50), size=size.tiny, title="Short Retest Armed")
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LEVEL LABELS  (drawn on the last bar of each day to avoid clutter)
@@ -293,36 +377,45 @@ if showLabels and ibComplete and barstate.islast
 // INFO TABLE
 // ═══════════════════════════════════════════════════════════════════════════════
 
-var table t = table.new(position.top_right, 2, 7,
+var table t = table.new(position.top_right, 2, 9,
      bgcolor=color.new(color.black, 60), border_width=1, border_color=color.new(color.gray, 50))
 
 tCol0 = color.new(color.silver, 0)
 tCol1 = color.new(color.orange, 0)
+bg    = color.new(color.black, 70)
 
 if barstate.islast
-    table.cell(t, 0, 0, "IB Range",  text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 0, "IB Range",   text_color=tCol0, text_size=size.small, bgcolor=bg)
     table.cell(t, 1, 0, ibComplete ? str.tostring(math.round(ibRange * 100) / 100) : "building…",
-               text_color=tCol1, text_size=size.small, bgcolor=color.new(color.black,70))
+               text_color=tCol1, text_size=size.small, bgcolor=bg)
 
-    table.cell(t, 0, 1, "IB High",   text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 1, "IB High",    text_color=tCol0, text_size=size.small, bgcolor=bg)
     table.cell(t, 1, 1, ibComplete ? str.tostring(math.round(ibHigh * 100) / 100) : "—",
-               text_color=tCol1, text_size=size.small, bgcolor=color.new(color.black,70))
+               text_color=tCol1, text_size=size.small, bgcolor=bg)
 
-    table.cell(t, 0, 2, "IB Low",    text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 2, "IB Low",     text_color=tCol0, text_size=size.small, bgcolor=bg)
     table.cell(t, 1, 2, ibComplete ? str.tostring(math.round(ibLow  * 100) / 100) : "—",
-               text_color=tCol1, text_size=size.small, bgcolor=color.new(color.black,70))
+               text_color=tCol1, text_size=size.small, bgcolor=bg)
 
-    table.cell(t, 0, 3, "IB Mid",    text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 3, "IB Mid",     text_color=tCol0, text_size=size.small, bgcolor=bg)
     table.cell(t, 1, 3, ibComplete ? str.tostring(math.round(ibMid  * 100) / 100) : "—",
-               text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.black,70))
+               text_color=color.yellow, text_size=size.small, bgcolor=bg)
 
-    table.cell(t, 0, 4, "Direction", text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
-    table.cell(t, 1, 4, tradeDir,    text_color=color.aqua, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 4, "Entry Mode", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 4, entryMode,    text_color=color.aqua, text_size=size.small, bgcolor=bg)
 
-    table.cell(t, 0, 5, "TP Mode",   text_color=tCol0, text_size=size.small, bgcolor=color.new(color.black,70))
-    table.cell(t, 1, 5, tpMode,      text_color=color.aqua, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 5, "Direction",  text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 5, tradeDir,     text_color=color.aqua, text_size=size.small, bgcolor=bg)
 
-    statusText  = longFired ? "Long ✓" : shortFired ? "Short ✓" : ibComplete ? "Watching…" : isIBBar ? "Building IB…" : "Pre-IB"
-    statusColor = longFired ? color.lime : shortFired ? color.red : color.gray
-    table.cell(t, 0, 6, "Status",    text_color=tCol0,      text_size=size.small, bgcolor=color.new(color.black,70))
-    table.cell(t, 1, 6, statusText,  text_color=statusColor, text_size=size.small, bgcolor=color.new(color.black,70))
+    table.cell(t, 0, 6, "TP Mode",    text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 6, tpMode,       text_color=color.aqua, text_size=size.small, bgcolor=bg)
+
+    // Long phase
+    longPhase = not ibComplete ? "pre-IB" : not longBroke ? "watching" : not longPulledAway ? "broke – pull away" : not longRetestArmed ? "pulled – retest?" : longFired ? "fired" : "retest armed"
+    table.cell(t, 0, 7, "Long Phase", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 7, longPhase,    text_color=longFired ? color.lime : longRetestArmed ? color.aqua : longBroke ? color.yellow : color.gray, text_size=size.small, bgcolor=bg)
+
+    // Short phase
+    shortPhase = not ibComplete ? "pre-IB" : not shortBroke ? "watching" : not shortPulledAway ? "broke – pull away" : not shortRetestArmed ? "pulled – retest?" : shortFired ? "fired" : "retest armed"
+    table.cell(t, 0, 8, "Short Phase", text_color=tCol0,  text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 8, shortPhase,    text_color=shortFired ? color.red : shortRetestArmed ? color.fuchsia : shortBroke ? color.yellow : color.gray, text_size=size.small, bgcolor=bg)
