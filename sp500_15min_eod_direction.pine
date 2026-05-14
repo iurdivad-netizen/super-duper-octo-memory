@@ -15,7 +15,7 @@ string i_days    = input.string("23456", "Trading Days  (1=Sun … 7=Sat)",
      group = "General")
 bool   i_hlBar   = input.bool(true, "Highlight first 15-min bar on chart",  group = "General")
 bool   i_labels  = input.bool(true, "Show EOD agreement labels on last bar of day", group = "General")
-string i_tblPos  = input.string("Top Right", "Table position",
+string i_tblPos  = input.string("Top Right", "Direction table position",
      options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
      group = "General")
 
@@ -27,8 +27,17 @@ int  i_customMins = input.int(30, "Custom window (minutes)", minval = 1, maxval 
                "On a 15-min chart the window snaps to the last complete bar " +
                "that starts within N minutes (e.g. 20 min → uses the 9:45 bar close on a 15-min chart).",
      group = "Custom Window")
-bool i_showCustom = input.bool(true, "Show custom window section in table",
+bool i_showCustom = input.bool(true, "Show custom window in both tables",
      group = "Custom Window")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs — Range & HOD/LOD
+// ──────────────────────────────────────────────────────────────────────────────
+bool   i_showRange = input.bool(true, "Show Range & HOD/LOD table",
+     group = "Range & HOD/LOD")
+string i_tbl2Pos  = input.string("Top Left", "Range & HOD/LOD table position",
+     options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
+     group = "Range & HOD/LOD")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Inputs — Table Appearance
@@ -49,12 +58,12 @@ color  i_disagreeClr = input.color(color.red,                  "Disagree / Beari
 // ──────────────────────────────────────────────────────────────────────────────
 // Derived style values
 // ──────────────────────────────────────────────────────────────────────────────
-string tblPos =
-     i_tblPos == "Top Left"     ? position.top_left     :
-     i_tblPos == "Bottom Right" ? position.bottom_right :
-     i_tblPos == "Bottom Left"  ? position.bottom_left  :
-     i_tblPos == "Middle Right" ? position.middle_right :
-     i_tblPos == "Middle Left"  ? position.middle_left  :
+posMap(string p) =>
+    p == "Top Left"     ? position.top_left     :
+     p == "Bottom Right" ? position.bottom_right :
+     p == "Bottom Left"  ? position.bottom_left  :
+     p == "Middle Right" ? position.middle_right :
+     p == "Middle Left"  ? position.middle_left  :
      position.top_right
 
 string tblFontSize =
@@ -67,15 +76,19 @@ string tblFontSize =
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
-// "N  (X.X%)"  — N as share of a total (used for overall rates)
+// "N  (X.X%)"  — N as share of a total (overall rates)
 pctStr(int n, float base) =>
     str.tostring(n) + "  (" + str.tostring(math.round(n / base * 1000) / 10.0, "#.#") + "%)"
 
-// "N / total  (X.X%)"  — N as share of a subset (used for conditional hit rates)
+// "N / total  (X.X%)"  — N as share of a subset (conditional hit rates)
 condPctStr(int hit, int total) =>
     total > 0 ?
-     str.tostring(hit) + " / " + str.tostring(total) + "  (" +
-     str.tostring(math.round(hit / total * 1000) / 10.0, "#.#") + "%)" : "—"
+     str.tostring(hit) + " / " + str.tostring(total) +
+     "  (" + str.tostring(math.round(hit / total * 1000) / 10.0, "#.#") + "%)" : "—"
+
+// "X.X%"  — average of accumulated ratio sums
+avgStr(float sum, int cnt) =>
+    cnt > 0 ? str.tostring(math.round(sum / cnt * 10) / 10.0, "#.#") + "%" : "—"
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Session detection
@@ -91,28 +104,47 @@ bool sessEnd    = not inSess and inSessPrev   // first bar after session; close[
 // ──────────────────────────────────────────────────────────────────────────────
 var float  f15Open  = na
 var float  f15Close = na
-var float  dayOpen  = na       // session open price (shared reference for both windows)
+var float  f15High  = na        // high of first 15-min bar (opening range top)
+var float  f15Low   = na        // low  of first 15-min bar (opening range bottom)
+var float  dayOpen  = na        // session open (shared reference for all windows)
 var bool   hasDay   = false
 var string today15  = "—"
 
 // Per-session state — custom window
-var int    sessStartMs  = na   // timestamp (ms) when session opened
-var float  custWinClose = na   // close of the last bar inside the custom window
+var int    sessStartMs  = na    // timestamp (ms) of session open
+var float  custWinClose = na
+var float  custWinH     = na    // running high during custom window
+var float  custWinL     = na    // running low  during custom window
 var bool   custWinSet   = false
 var string todayCustom  = "—"
+
+// Per-session state — session extremes (for daily range and HOD/LOD order)
+var float  sessHigh = na
+var float  sessLow  = na
+var int    hodIdx   = na        // bar_index where session HOD was last set
+var int    lodIdx   = na        // bar_index where session LOD was last set
 
 if sessStart
     f15Open      := open
     f15Close     := close
+    f15High      := high
+    f15Low       := low
     dayOpen      := open
     hasDay       := true
     today15      := close > open ? "Bullish ↑" : close < open ? "Bearish ↓" : "Neutral →"
     sessStartMs  := time
     custWinClose := na
+    custWinH     := high
+    custWinL     := low
     custWinSet   := false
+    sessHigh     := high
+    sessLow      := low
+    hodIdx       := bar_index
+    lodIdx       := bar_index
 
-// Custom window closes on the first bar whose open time ≥ session open + N minutes.
-// close[1] is then the close of the last bar that started within the window.
+// ── Custom window close detection ─────────────────────────────────────────────
+// Must run BEFORE the custom-window H/L update so that the bar that triggers
+// the close is not included in the opening range.
 bool custWinEnd = not na(sessStartMs) and not custWinSet and not sessStart and inSess and
                   (time - sessStartMs) >= i_customMins * 60 * 1000
 
@@ -121,18 +153,32 @@ if custWinEnd
     custWinSet   := true
     todayCustom  := close[1] > dayOpen ? "Bullish ↑" : close[1] < dayOpen ? "Bearish ↓" : "Neutral →"
 
+// ── Session extremes: update on every non-opening session bar ─────────────────
+if inSess and not sessStart
+    if high > sessHigh
+        sessHigh := high
+        hodIdx   := bar_index
+    if low < sessLow
+        sessLow  := low
+        lodIdx   := bar_index
+
+// ── Custom window H/L: update while window is open (custWinEnd sets custWinSet) ─
+if inSess and not sessStart and not custWinSet
+    custWinH := math.max(custWinH, high)
+    custWinL := math.min(custWinL, low)
+
 // ──────────────────────────────────────────────────────────────────────────────
-// Metrics — fixed 15-min window
+// Metrics — direction (15-min window)
 // ──────────────────────────────────────────────────────────────────────────────
 var int nDays     = 0
 var int nAgree    = 0
 var int nDisag    = 0
-var int nBullBull = 0   // 15min Bull  + EOD Bull
-var int nBearBear = 0   // 15min Bear  + EOD Bear
-var int nBullBear = 0   // 15min Bull  + EOD Bear
-var int nBearBull = 0   // 15min Bear  + EOD Bull
+var int nBullBull = 0
+var int nBearBear = 0
+var int nBullBear = 0
+var int nBearBull = 0
 
-// Metrics — custom window
+// Metrics — direction (custom window)
 var int nCDays     = 0
 var int nCAgree    = 0
 var int nCDisag    = 0
@@ -141,12 +187,44 @@ var int nCBearBear = 0
 var int nCBullBear = 0
 var int nCBearBull = 0
 
+// Metrics — opening range vs daily range (15-min window)
+var float sumRange15     = 0.0  // sum of (f15Range / dailyRange * 100)
+var int   cntRange15     = 0
+var float sumRange15A    = 0.0  // same, agree days only
+var int   cntRange15A    = 0
+var float sumRange15D    = 0.0  // same, disagree days only
+var int   cntRange15D    = 0
+
+// Metrics — opening range vs daily range (custom window)
+var float sumRangeC      = 0.0
+var int   cntRangeC      = 0
+var float sumRangeCА     = 0.0
+var int   cntRangeCA     = 0
+var float sumRangeCD     = 0.0
+var int   cntRangeCD     = 0
+
+// Metrics — HOD/LOD order (15-min window)
+// Counts days where the signal direction and HOD/LOD order are tracked
+var int nBullHODFirst = 0   // 15min Bull day: HOD made before LOD
+var int nBullLODFirst = 0   // 15min Bull day: LOD made before HOD
+var int nBearLODFirst = 0   // 15min Bear day: LOD made before HOD
+var int nBearHODFirst = 0   // 15min Bear day: HOD made before LOD
+
+// Metrics — HOD/LOD order (custom window)
+var int nCBullHODFirst = 0
+var int nCBullLODFirst = 0
+var int nCBearLODFirst = 0
+var int nCBearHODFirst = 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Session-end evaluation
+// ──────────────────────────────────────────────────────────────────────────────
 if sessEnd and hasDay
     bool f15Bull  = f15Close > f15Open
     bool eodBull  = close[1] > dayOpen
     bool agree15  = f15Bull == eodBull
 
-    // 15-min metrics
+    // Direction metrics (15-min)
     nDays += 1
     if agree15
         nAgree    += 1
@@ -157,11 +235,34 @@ if sessEnd and hasDay
         nBullBear += f15Bull ? 1 : 0
         nBearBull += f15Bull ? 0 : 1
 
-    // Custom window metrics (only when window closed before EOD)
+    // Opening range vs daily range (15-min)
+    float dailyRange = sessHigh - sessLow
+    if dailyRange > 0
+        float r15 = (f15High - f15Low) / dailyRange * 100
+        sumRange15  += r15
+        cntRange15  += 1
+        if agree15
+            sumRange15A += r15
+            cntRange15A += 1
+        else
+            sumRange15D += r15
+            cntRange15D += 1
+
+    // HOD/LOD order (15-min): skip days where HOD and LOD are on the same bar
+    if hodIdx != lodIdx
+        if f15Bull
+            nBullHODFirst += hodIdx < lodIdx ? 1 : 0
+            nBullLODFirst += lodIdx < hodIdx ? 1 : 0
+        else
+            nBearLODFirst += lodIdx < hodIdx ? 1 : 0
+            nBearHODFirst += hodIdx < lodIdx ? 1 : 0
+
+    // ── Custom window ──────────────────────────────────────────────────────────
     if custWinSet
         bool custBull = custWinClose > dayOpen
         bool agreeC   = custBull == eodBull
 
+        // Direction metrics (custom)
         nCDays += 1
         if agreeC
             nCAgree    += 1
@@ -172,7 +273,28 @@ if sessEnd and hasDay
             nCBullBear += custBull ? 1 : 0
             nCBearBull += custBull ? 0 : 1
 
-    // EOD label — symbol reflects 15-min result; tooltip includes custom window
+        // Opening range vs daily range (custom)
+        if dailyRange > 0
+            float rC = (custWinH - custWinL) / dailyRange * 100
+            sumRangeC  += rC
+            cntRangeC  += 1
+            if agreeC
+                sumRangeCА += rC
+                cntRangeCA += 1
+            else
+                sumRangeCD += rC
+                cntRangeCD += 1
+
+        // HOD/LOD order (custom): uses same session hodIdx/lodIdx
+        if hodIdx != lodIdx
+            if custBull
+                nCBullHODFirst += hodIdx < lodIdx ? 1 : 0
+                nCBullLODFirst += lodIdx < hodIdx ? 1 : 0
+            else
+                nCBearLODFirst += lodIdx < hodIdx ? 1 : 0
+                nCBearHODFirst += hodIdx < lodIdx ? 1 : 0
+
+    // EOD label
     if i_labels
         string custTip = custWinSet ?
              "\n" + str.tostring(i_customMins) + "min: " +
@@ -201,150 +323,241 @@ bgcolor(i_hlBar and sessStart ? color.new(color.blue, 87) : na,
      title = "First 15-min bar highlight")
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Metrics table
-// 15-min section : rows  0-12  (13 rows)
-// Custom section : rows 13-26  (14 rows, only when i_showCustom)
+// Table 1 — Direction metrics
+// 15-min section: rows  0-12  (13 rows)
+// Custom section: rows 13-26  (14 rows, only when i_showCustom)
 // ──────────────────────────────────────────────────────────────────────────────
-var table T = table.new(tblPos, 2, i_showCustom ? 27 : 13,
+var table T1 = table.new(posMap(i_tblPos), 2, i_showCustom ? 27 : 13,
      bgcolor      = i_tblBg,
      border_width = 1,
      border_color = i_borderClr)
 
-tCell(int col, int row, string txt, color tc) =>
-    table.cell(T, col, row, txt, text_color = tc, bgcolor = i_tblBg, text_size = tblFontSize)
+t1Cell(int col, int row, string txt, color tc) =>
+    table.cell(T1, col, row, txt, text_color = tc, bgcolor = i_tblBg, text_size = tblFontSize)
 
-tCellHdr(int col, int row, string txt) =>
-    table.cell(T, col, row, txt, text_color = i_hdrTxt, bgcolor = i_hdrBg, text_size = tblFontSize)
+t1Hdr(int col, int row, string txt) =>
+    table.cell(T1, col, row, txt, text_color = i_hdrTxt, bgcolor = i_hdrBg, text_size = tblFontSize)
 
-tCellSep(int col, int row) =>
-    table.cell(T, col, row, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+t1Sep(int col, int row) =>
+    table.cell(T1, col, row, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+
+t1ThickSep(int col, int row) =>
+    table.cell(T1, col, row, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
 
 if barstate.islast
     float td  = math.max(nDays,  1)
     float tdc = math.max(nCDays, 1)
-
-    // Conditional hit-rate denominators
-    int   bullDays  = nBullBull + nBullBear   // days 15min opened Bull
-    int   bearDays  = nBearBear + nBearBull   // days 15min opened Bear
+    int   bullDays  = nBullBull  + nBullBear
+    int   bearDays  = nBearBear  + nBearBull
     int   cBullDays = nCBullBull + nCBullBear
     int   cBearDays = nCBearBear + nCBearBull
 
-    // ── 15-min section  (rows 0-12) ───────────────────────────────────────────
-    // Row 0: header
-    tCellHdr(0, 0, "First 15min Window")
-    tCellHdr(1, 0, "Count  (Rate)")
+    // ── 15-min section (rows 0-12) ────────────────────────────────────────────
+    t1Hdr(0, 0, "First 15min Window")
+    t1Hdr(1, 0, "Count  (Rate)")
 
-    // Row 1: today's 15-min direction
-    tCell(0, 1, "Today – First 15min", i_labelTxt)
-    tCell(1, 1, today15,
+    t1Cell(0, 1, "Today – First 15min", i_labelTxt)
+    t1Cell(1, 1, today15,
          today15 == "Bullish ↑" ? i_agreeClr :
          today15 == "Bearish ↓" ? i_disagreeClr : color.gray)
 
-    // Row 2: separator
-    tCellSep(0, 2)
-    tCellSep(1, 2)
+    t1Sep(0, 2)
+    t1Sep(1, 2)
 
-    // Row 3: total days
-    tCell(0, 3, "Total Days Tracked",        i_labelTxt)
-    tCell(1, 3, str.tostring(nDays),          i_valueTxt)
+    t1Cell(0, 3, "Total Days Tracked",       i_labelTxt)
+    t1Cell(1, 3, str.tostring(nDays),         i_valueTxt)
 
-    // Row 4: overall agree
-    tCell(0, 4, "✓  Direction Agreed",       i_agreeClr)
-    tCell(1, 4, pctStr(nAgree, td),           i_agreeClr)
+    t1Cell(0, 4, "✓  Direction Agreed",      i_agreeClr)
+    t1Cell(1, 4, pctStr(nAgree, td),          i_agreeClr)
 
-    // Row 5: overall disagree
-    tCell(0, 5, "✗  Direction Disagreed",    i_disagreeClr)
-    tCell(1, 5, pctStr(nDisag, td),           i_disagreeClr)
+    t1Cell(0, 5, "✗  Direction Disagreed",   i_disagreeClr)
+    t1Cell(1, 5, pctStr(nDisag, td),          i_disagreeClr)
 
-    // Row 6: separator
-    tCellSep(0, 6)
-    tCellSep(1, 6)
+    t1Sep(0, 6)
+    t1Sep(1, 6)
 
-    // Row 7: bull → bull  (% of all days)
-    tCell(0, 7, "↑ Bull  →  EOD Bull",       i_agreeClr)
-    tCell(1, 7, pctStr(nBullBull, td),         i_agreeClr)
+    t1Cell(0, 7, "↑ Bull  →  EOD Bull",      i_agreeClr)
+    t1Cell(1, 7, pctStr(nBullBull, td),        i_agreeClr)
 
-    // Row 8: bear → bear  (% of all days)
-    tCell(0, 8, "↓ Bear  →  EOD Bear",       i_bearBearClr)
-    tCell(1, 8, pctStr(nBearBear, td),         i_bearBearClr)
+    t1Cell(0, 8, "↓ Bear  →  EOD Bear",      i_bearBearClr)
+    t1Cell(1, 8, pctStr(nBearBear, td),        i_bearBearClr)
 
-    // Row 9: bull → bear  (% of all days)
-    tCell(0, 9, "↑ Bull  →  EOD Bear",       i_disagreeClr)
-    tCell(1, 9, pctStr(nBullBear, td),         i_disagreeClr)
+    t1Cell(0, 9, "↑ Bull  →  EOD Bear",      i_disagreeClr)
+    t1Cell(1, 9, pctStr(nBullBear, td),        i_disagreeClr)
 
-    // Row 10: bear → bull  (% of all days)
-    tCell(0, 10, "↓ Bear  →  EOD Bull",      i_disagreeClr)
-    tCell(1, 10, pctStr(nBearBull, td),        i_disagreeClr)
+    t1Cell(0, 10, "↓ Bear  →  EOD Bull",     i_disagreeClr)
+    t1Cell(1, 10, pctStr(nBearBull, td),       i_disagreeClr)
 
-    // Row 11: conditional hit rate — of Bull days, how many closed Bull
-    tCell(0, 11, "↑ Of Bull days: EOD Bull", i_agreeClr)
-    tCell(1, 11, condPctStr(nBullBull, bullDays), i_agreeClr)
+    t1Cell(0, 11, "↑ Of Bull days: EOD Bull", i_agreeClr)
+    t1Cell(1, 11, condPctStr(nBullBull, bullDays), i_agreeClr)
 
-    // Row 12: conditional hit rate — of Bear days, how many closed Bear
-    tCell(0, 12, "↓ Of Bear days: EOD Bear", i_bearBearClr)
-    tCell(1, 12, condPctStr(nBearBear, bearDays), i_bearBearClr)
+    t1Cell(0, 12, "↓ Of Bear days: EOD Bear", i_bearBearClr)
+    t1Cell(1, 12, condPctStr(nBearBear, bearDays), i_bearBearClr)
 
-    // ── Custom window section  (rows 13-26) ───────────────────────────────────
+    // ── Custom section (rows 13-26) ───────────────────────────────────────────
     if i_showCustom
-        string customLabel = str.tostring(i_customMins) + "min Window"
+        string cL = str.tostring(i_customMins) + "min Window"
 
-        // Row 13: thick divider
-        table.cell(T, 0, 13, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
-        table.cell(T, 1, 13, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+        t1ThickSep(0, 13)
+        t1ThickSep(1, 13)
 
-        // Row 14: header
-        tCellHdr(0, 14, "First " + customLabel)
-        tCellHdr(1, 14, "Count  (Rate)")
+        t1Hdr(0, 14, "First " + cL)
+        t1Hdr(1, 14, "Count  (Rate)")
 
-        // Row 15: today's custom direction
-        tCell(0, 15, "Today – First " + customLabel, i_labelTxt)
-        tCell(1, 15, todayCustom,
+        t1Cell(0, 15, "Today – First " + cL, i_labelTxt)
+        t1Cell(1, 15, todayCustom,
              todayCustom == "Bullish ↑" ? i_agreeClr :
              todayCustom == "Bearish ↓" ? i_disagreeClr : color.gray)
 
-        // Row 16: separator
-        tCellSep(0, 16)
-        tCellSep(1, 16)
+        t1Sep(0, 16)
+        t1Sep(1, 16)
 
-        // Row 17: total days
-        tCell(0, 17, "Total Days Tracked",          i_labelTxt)
-        tCell(1, 17, str.tostring(nCDays),           i_valueTxt)
+        t1Cell(0, 17, "Total Days Tracked",         i_labelTxt)
+        t1Cell(1, 17, str.tostring(nCDays),           i_valueTxt)
 
-        // Row 18: overall agree
-        tCell(0, 18, "✓  Direction Agreed",         i_agreeClr)
-        tCell(1, 18, pctStr(nCAgree, tdc),           i_agreeClr)
+        t1Cell(0, 18, "✓  Direction Agreed",         i_agreeClr)
+        t1Cell(1, 18, pctStr(nCAgree, tdc),           i_agreeClr)
 
-        // Row 19: overall disagree
-        tCell(0, 19, "✗  Direction Disagreed",      i_disagreeClr)
-        tCell(1, 19, pctStr(nCDisag, tdc),           i_disagreeClr)
+        t1Cell(0, 19, "✗  Direction Disagreed",      i_disagreeClr)
+        t1Cell(1, 19, pctStr(nCDisag, tdc),           i_disagreeClr)
 
-        // Row 20: separator
-        tCellSep(0, 20)
-        tCellSep(1, 20)
+        t1Sep(0, 20)
+        t1Sep(1, 20)
 
-        // Row 21: bull → bull  (% of all days)
-        tCell(0, 21, "↑ Bull  →  EOD Bull",         i_agreeClr)
-        tCell(1, 21, pctStr(nCBullBull, tdc),         i_agreeClr)
+        t1Cell(0, 21, "↑ Bull  →  EOD Bull",         i_agreeClr)
+        t1Cell(1, 21, pctStr(nCBullBull, tdc),         i_agreeClr)
 
-        // Row 22: bear → bear  (% of all days)
-        tCell(0, 22, "↓ Bear  →  EOD Bear",         i_bearBearClr)
-        tCell(1, 22, pctStr(nCBearBear, tdc),         i_bearBearClr)
+        t1Cell(0, 22, "↓ Bear  →  EOD Bear",         i_bearBearClr)
+        t1Cell(1, 22, pctStr(nCBearBear, tdc),         i_bearBearClr)
 
-        // Row 23: bull → bear  (% of all days)
-        tCell(0, 23, "↑ Bull  →  EOD Bear",         i_disagreeClr)
-        tCell(1, 23, pctStr(nCBullBear, tdc),         i_disagreeClr)
+        t1Cell(0, 23, "↑ Bull  →  EOD Bear",         i_disagreeClr)
+        t1Cell(1, 23, pctStr(nCBullBear, tdc),         i_disagreeClr)
 
-        // Row 24: bear → bull  (% of all days)
-        tCell(0, 24, "↓ Bear  →  EOD Bull",         i_disagreeClr)
-        tCell(1, 24, pctStr(nCBearBull, tdc),         i_disagreeClr)
+        t1Cell(0, 24, "↓ Bear  →  EOD Bull",         i_disagreeClr)
+        t1Cell(1, 24, pctStr(nCBearBull, tdc),         i_disagreeClr)
 
-        // Row 25: conditional hit rate — of Bull days, how many closed Bull
-        tCell(0, 25, "↑ Of Bull days: EOD Bull",    i_agreeClr)
-        tCell(1, 25, condPctStr(nCBullBull, cBullDays), i_agreeClr)
+        t1Cell(0, 25, "↑ Of Bull days: EOD Bull",    i_agreeClr)
+        t1Cell(1, 25, condPctStr(nCBullBull, cBullDays), i_agreeClr)
 
-        // Row 26: conditional hit rate — of Bear days, how many closed Bear
-        tCell(0, 26, "↓ Of Bear days: EOD Bear",    i_bearBearClr)
-        tCell(1, 26, condPctStr(nCBearBear, cBearDays), i_bearBearClr)
+        t1Cell(0, 26, "↓ Of Bear days: EOD Bear",    i_bearBearClr)
+        t1Cell(1, 26, condPctStr(nCBearBear, cBearDays), i_bearBearClr)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Table 2 — Range & HOD/LOD analysis
+// 15-min section: rows  0-10  (11 rows)
+// Custom section: rows 11-21  (11 rows, only when i_showCustom)
+// ──────────────────────────────────────────────────────────────────────────────
+var table T2 = table.new(posMap(i_tbl2Pos), 2, i_showCustom ? 23 : 11,
+     bgcolor      = i_tblBg,
+     border_width = 1,
+     border_color = i_borderClr)
+
+t2Cell(int col, int row, string txt, color tc) =>
+    table.cell(T2, col, row, txt, text_color = tc, bgcolor = i_tblBg, text_size = tblFontSize)
+
+t2Hdr(int col, int row, string txt) =>
+    table.cell(T2, col, row, txt, text_color = i_hdrTxt, bgcolor = i_hdrBg, text_size = tblFontSize)
+
+t2SubHdr(int col, int row, string txt) =>
+    color subBg = color.new(i_hdrBg, 65)
+    table.cell(T2, col, row, txt, text_color = i_labelTxt, bgcolor = subBg, text_size = tblFontSize)
+
+t2Sep(int col, int row) =>
+    table.cell(T2, col, row, "───────────────────", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+
+t2ThickSep(int col, int row) =>
+    table.cell(T2, col, row, "═══════════════════", text_color = i_borderClr, bgcolor = i_tblBg, text_size = size.tiny)
+
+if barstate.islast and i_showRange
+    // ── 15-min section (rows 0-10) ────────────────────────────────────────────
+
+    // Row 0: header
+    t2Hdr(0, 0, "First 15min — Range & Structure")
+    t2Hdr(1, 0, "Value")
+
+    // Rows 1-3: opening range vs daily range
+    t2SubHdr(0, 1, "Opening Range / Daily Range")
+    t2SubHdr(1, 1, "Avg %")
+
+    t2Cell(0, 2, "All days",          i_labelTxt)
+    t2Cell(1, 2, avgStr(sumRange15,  cntRange15),  i_valueTxt)
+
+    t2Cell(0, 3, "Agree days",        i_agreeClr)
+    t2Cell(1, 3, avgStr(sumRange15A, cntRange15A), i_agreeClr)
+
+    t2Cell(0, 4, "Disagree days",     i_disagreeClr)
+    t2Cell(1, 4, avgStr(sumRange15D, cntRange15D), i_disagreeClr)
+
+    // Row 5: separator
+    t2Sep(0, 5)
+    t2Sep(1, 5)
+
+    // Rows 6-10: HOD/LOD order
+    t2SubHdr(0, 6, "HOD / LOD made first")
+    t2SubHdr(1, 6, "Hit / Total  (Rate)")
+
+    int bullDays15 = nBullHODFirst + nBullLODFirst
+    int bearDays15 = nBearLODFirst + nBearHODFirst
+
+    t2Cell(0, 7,  "↑ Bull day: HOD first", i_agreeClr)
+    t2Cell(1, 7,  condPctStr(nBullHODFirst, bullDays15), i_agreeClr)
+
+    t2Cell(0, 8,  "↑ Bull day: LOD first", i_disagreeClr)
+    t2Cell(1, 8,  condPctStr(nBullLODFirst, bullDays15), i_disagreeClr)
+
+    t2Cell(0, 9,  "↓ Bear day: LOD first", i_bearBearClr)
+    t2Cell(1, 9,  condPctStr(nBearLODFirst, bearDays15), i_bearBearClr)
+
+    t2Cell(0, 10, "↓ Bear day: HOD first", i_disagreeClr)
+    t2Cell(1, 10, condPctStr(nBearHODFirst, bearDays15), i_disagreeClr)
+
+    // ── Custom section (rows 11-21) ───────────────────────────────────────────
+    if i_showCustom
+        string cL = str.tostring(i_customMins) + "min"
+
+        // Row 11: thick separator
+        t2ThickSep(0, 11)
+        t2ThickSep(1, 11)
+
+        // Row 12: header
+        t2Hdr(0, 12, "First " + cL + " — Range & Structure")
+        t2Hdr(1, 12, "Value")
+
+        // Rows 13-15: opening range vs daily range
+        t2SubHdr(0, 13, "Opening Range / Daily Range")
+        t2SubHdr(1, 13, "Avg %")
+
+        t2Cell(0, 14, "All days",     i_labelTxt)
+        t2Cell(1, 14, avgStr(sumRangeC,  cntRangeC),  i_valueTxt)
+
+        t2Cell(0, 15, "Agree days",   i_agreeClr)
+        t2Cell(1, 15, avgStr(sumRangeCА, cntRangeCA), i_agreeClr)
+
+        t2Cell(0, 16, "Disagree days",i_disagreeClr)
+        t2Cell(1, 16, avgStr(sumRangeCD, cntRangeCD), i_disagreeClr)
+
+        // Row 17: separator
+        t2Sep(0, 17)
+        t2Sep(1, 17)
+
+        // Rows 18-21: HOD/LOD order
+        t2SubHdr(0, 18, "HOD / LOD made first")
+        t2SubHdr(1, 18, "Hit / Total  (Rate)")
+
+        int cBullDays15 = nCBullHODFirst + nCBullLODFirst
+        int cBearDays15 = nCBearLODFirst + nCBearHODFirst
+
+        t2Cell(0, 19, "↑ Bull day: HOD first", i_agreeClr)
+        t2Cell(1, 19, condPctStr(nCBullHODFirst, cBullDays15), i_agreeClr)
+
+        t2Cell(0, 20, "↑ Bull day: LOD first", i_disagreeClr)
+        t2Cell(1, 20, condPctStr(nCBullLODFirst, cBullDays15), i_disagreeClr)
+
+        t2Cell(0, 21, "↓ Bear day: LOD first", i_bearBearClr)
+        t2Cell(1, 21, condPctStr(nCBearLODFirst, cBearDays15), i_bearBearClr)
+
+        t2Cell(0, 22, "↓ Bear day: HOD first", i_disagreeClr)  // note: row 22, needs 23 rows
+        t2Cell(1, 22, condPctStr(nCBearHODFirst, cBearDays15), i_disagreeClr)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Timeframe warning
