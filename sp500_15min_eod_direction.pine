@@ -198,7 +198,7 @@ var int   cntRange15D    = 0
 // Metrics — opening range vs daily range (custom window)
 var float sumRangeC      = 0.0
 var int   cntRangeC      = 0
-var float sumRangeCА     = 0.0
+var float sumRangeCAg    = 0.0
 var int   cntRangeCA     = 0
 var float sumRangeCD     = 0.0
 var int   cntRangeCD     = 0
@@ -279,7 +279,7 @@ if sessEnd and hasDay
             sumRangeC  += rC
             cntRangeC  += 1
             if agreeC
-                sumRangeCА += rC
+                sumRangeCAg += rC
                 cntRangeCA += 1
             else
                 sumRangeCD += rC
@@ -531,7 +531,7 @@ if barstate.islast and i_showRange
         t2Cell(1, 14, avgStr(sumRangeC,  cntRangeC),  i_valueTxt)
 
         t2Cell(0, 15, "Agree days",   i_agreeClr)
-        t2Cell(1, 15, avgStr(sumRangeCА, cntRangeCA), i_agreeClr)
+        t2Cell(1, 15, avgStr(sumRangeCAg, cntRangeCA), i_agreeClr)
 
         t2Cell(0, 16, "Disagree days",i_disagreeClr)
         t2Cell(1, 16, avgStr(sumRangeCD, cntRangeCD), i_disagreeClr)
