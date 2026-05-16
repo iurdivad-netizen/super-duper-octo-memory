@@ -49,6 +49,9 @@ int    i_drift       = input.int(1, "Hold / resolution drift (bars)",
      minval = 1, maxval = 20,
      tooltip = "How many periods the spread is held before it is resolved on close. 1 = next bar (loosest, highest win rate). Increase to stress-test: the strike is set N bars ago and price has had N periods to drift below it, which lowers the win rate toward something more realistic.",
      group = "Put Credit Spread")
+bool   i_projectFwd  = input.bool(true, "Project range/strike to its resolution bar",
+     tooltip = "Shifts the band and short-put strike forward by the drift so the level drawn over a bar is exactly the one that bar's close is tested against. Makes trade resolutions visually verifiable.",
+     group = "Put Credit Spread")
 bool   i_showCounter = input.bool(true,  "Show win/loss counter table",           group = "Counter")
 string i_tblPos      = input.string("Top Right", "Counter table position",
      options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
@@ -91,8 +94,10 @@ probPercMove = vixData / scaleFreq
 changeUpper = close + (close * (probPercMove / 100))
 changeLower = close - (close * (probPercMove / 100))
 
-p1 = plot(changeUpper, 'Probable Upper Level', i_bandColor)
-p2 = plot(changeLower, 'Probable Lower Level', i_bandColor)
+int projOff = i_projectFwd ? i_drift : 0
+
+p1 = plot(changeUpper, 'Probable Upper Level', i_bandColor, offset = projOff)
+p2 = plot(changeLower, 'Probable Lower Level', i_bandColor, offset = projOff)
 fill(p1, p2, color = color.new(i_bandColor, 90))
 
 // Put-credit-spread short strike: lower band pushed further out of the money
@@ -100,7 +105,7 @@ offsetDist = i_offsetMode == "Points"   ? i_offsetPts :
              i_offsetMode == "% of price" ? close * (i_offsetPct / 100) : 0.0
 shortPutStrike = changeLower - offsetDist
 plot(i_showStrike ? shortPutStrike : na, 'Short Put Strike', color.new(color.red, 0),
-     style = plot.style_linebr)
+     style = plot.style_linebr, offset = projOff)
 
 // Resolve the spread against the strike set i_drift periods ago.
 strikeAtEntry = shortPutStrike[i_drift]
