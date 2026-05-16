@@ -30,11 +30,21 @@ indicator(title="Expected SPX Movement by timeframe", shorttitle="SPX Exp Move (
 // ──────────────────────────────────────────────────────────────────────────────
 // Inputs
 // ──────────────────────────────────────────────────────────────────────────────
-float  i_offsetPct   = input.float(0.0, "Short-put offset below lower band (% of price)",
+string i_offsetMode  = input.string("% of price", "Distance to lower band",
+     options = ["% of price", "Points", "At lower band"],
+     tooltip = "How far BELOW the lower expected-move band to place the short put. 'At lower band' ignores the values below.",
+     group = "Put Credit Spread")
+float  i_offsetPct   = input.float(0.0, "  ↳ distance (% of price)",
      minval = 0.0, step = 0.05,
-     tooltip = "Extra distance, as a percent of price, that the short-put strike sits BELOW the lower edge of the expected-move band. 0 = exactly at the lower band.",
+     tooltip = "Used when distance mode = '% of price'.",
+     group = "Put Credit Spread")
+float  i_offsetPts   = input.float(10.0, "  ↳ distance (points)",
+     minval = 0.0, step = 1.0,
+     tooltip = "Used when distance mode = 'Points'.",
      group = "Put Credit Spread")
 bool   i_showStrike  = input.bool(true,  "Plot short-put strike line", group = "Put Credit Spread")
+bool   i_showTrades  = input.bool(true,  "Plot resolved trades (win/loss markers)",
+     group = "Put Credit Spread")
 bool   i_showCounter = input.bool(true,  "Show win/loss counter table",           group = "Counter")
 string i_tblPos      = input.string("Top Right", "Counter table position",
      options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
@@ -82,7 +92,9 @@ p2 = plot(changeLower, 'Probable Lower Level', i_bandColor)
 fill(p1, p2, color = color.new(i_bandColor, 90))
 
 // Put-credit-spread short strike: lower band pushed further out of the money
-shortPutStrike = changeLower - (close * (i_offsetPct / 100))
+offsetDist = i_offsetMode == "Points"   ? i_offsetPts :
+             i_offsetMode == "% of price" ? close * (i_offsetPct / 100) : 0.0
+shortPutStrike = changeLower - offsetDist
 plot(i_showStrike ? shortPutStrike : na, 'Short Put Strike', color.new(color.red, 0),
      style = plot.style_linebr)
 
@@ -90,8 +102,12 @@ plot(i_showStrike ? shortPutStrike : na, 'Short Put Strike', color.new(color.red
 pcsWin  = close >  shortPutStrike[1]
 pcsLoss = close <= shortPutStrike[1]
 
-plotshape(pcsLoss, title = "PCS loss flag", style = shape.flag,
-     location = location.belowbar, color = color.rgb(188, 76, 76), size = size.small)
+plotshape(i_showTrades and pcsWin  and barstate.isconfirmed, title = "PCS win",
+     style = shape.triangleup,   location = location.belowbar,
+     color = color.new(color.green, 0), size = size.tiny)
+plotshape(i_showTrades and pcsLoss and barstate.isconfirmed, title = "PCS loss",
+     style = shape.flag,         location = location.belowbar,
+     color = color.rgb(188, 76, 76), size = size.small)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Put-credit-spread win/loss counter
