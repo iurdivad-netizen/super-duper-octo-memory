@@ -1,0 +1,127 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © rhvarelav  (original)  — extended with a trade/hit counter
+
+// THIS INDICATOR ONLY WORKS FOR THE SPX CHART
+//
+// It measures the expected move of SPX for the selected chart timeframe based on
+// the current value of the VIX index, plots that expected move as an upper/lower
+// band, and flags any period that closes OUTSIDE the previous period's band.
+//
+// Expected move = currentVIX / sqrt(periods-per-year):
+//   Daily   -> sqrt(252)  (trading sessions/year)
+//   Weekly  -> sqrt(52)   (weeks/year)
+//   Monthly -> sqrt(12)   (months/year)
+//   Intraday-> sqrt(ticks/year) for the chart's tf
+//
+// Options-trading idea: the band is the implied 1-period expected move. The
+// counter tabulates how often price actually stayed inside the band (an option
+// seller's "win") versus broke out of it (a "loss"), so you can sanity-check
+// how well VIX-implied ranges have contained price on this symbol/timeframe.
+
+//@version=5
+
+indicator(title="Expected SPX Movement by timeframe", shorttitle="SPX Exp Move (VIX)", overlay=true)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ──────────────────────────────────────────────────────────────────────────────
+bool   i_showCounter = input.bool(true,  "Show in-band counter table",            group = "Counter")
+string i_tblPos      = input.string("Top Right", "Counter table position",
+     options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
+     group = "Counter")
+int    i_lookback    = input.int(0, "Counter lookback (bars, 0 = all history)",
+     minval = 0,
+     tooltip = "0 counts every confirmed bar on the chart. A positive value only counts the most recent N bars.",
+     group = "Counter")
+color  i_bandColor   = input.color(#ffffff, "Band color", group = "Style")
+
+print(txt) =>
+    var lbl = label.new(bar_index, na, txt, xloc.bar_index, yloc.price, color(na), label.style_none, color.gray, size.large, text.align_left)
+    label.set_xy(lbl, bar_index, ta.highest(10)[1])
+    label.set_text(lbl, txt)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Expected move from VIX
+// ──────────────────────────────────────────────────────────────────────────────
+vixData = request.security("CBOE:VIX", timeframe.period, close)
+
+scaleFreq = if timeframe.period == "D"
+    math.sqrt(252)
+else if timeframe.period == "W"
+    math.sqrt(52)
+else if timeframe.period == "M"
+    math.sqrt(12)
+else if timeframe.period == "15"
+    math.sqrt(6552)
+else if timeframe.period == "60"
+    math.sqrt(1638)
+else if timeframe.period == "120"
+    math.sqrt(819)
+else if timeframe.period == "240"
+    math.sqrt(409)
+else
+    math.sqrt(252)
+
+probPercMove = vixData / scaleFreq
+
+changeUpper = close + (close * (probPercMove / 100))
+changeLower = close - (close * (probPercMove / 100))
+
+p1 = plot(changeUpper, 'Probable Upper Level', i_bandColor)
+p2 = plot(changeLower, 'Probable Lower Level', i_bandColor)
+fill(p1, p2, color = color.new(i_bandColor, 90))
+
+// true when this period closed inside the prior period's expected-move band
+insideBand = close <= changeUpper[1] and close >= changeLower[1]
+
+plotshape(not insideBand, title = "Out-of-band flag", style = shape.flag,
+     location = location.belowbar, color = color.rgb(188, 76, 76), size = size.small)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Trade / hit counter
+// A "trade" = one resolved period that had a valid prior-bar band to test against.
+// inside  -> price stayed within the implied move (option-seller win)
+// outside -> price broke out of the implied move (option-seller loss)
+// ──────────────────────────────────────────────────────────────────────────────
+var int cTotal  = 0
+var int cInside = 0
+
+withinLookback = i_lookback == 0 or (bar_index >= (last_bar_index - i_lookback + 1))
+testable       = barstate.isconfirmed and not na(changeUpper[1]) and not na(changeLower[1]) and withinLookback
+
+if testable
+    cTotal  += 1
+    if insideBand
+        cInside += 1
+
+cOutside = cTotal - cInside
+hitRate  = cTotal > 0 ? (cInside / cTotal) * 100 : 0.0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Counter table
+// ──────────────────────────────────────────────────────────────────────────────
+tblPosition(p) =>
+    p == "Top Right"     ? position.top_right    :
+     p == "Top Left"     ? position.top_left     :
+     p == "Bottom Right" ? position.bottom_right :
+     p == "Bottom Left"  ? position.bottom_left  :
+     p == "Middle Right" ? position.middle_right : position.middle_left
+
+var table t = table.new(tblPosition(i_tblPos), 2, 5,
+     border_width = 1, frame_color = color.gray, frame_width = 1)
+
+if i_showCounter and barstate.islast
+    table.cell(t, 0, 0, "SPX Expected Move", text_color = color.white, bgcolor = color.new(color.blue, 30), text_size = size.normal)
+    table.cell(t, 1, 0, str.tostring(timeframe.period), text_color = color.white, bgcolor = color.new(color.blue, 30), text_size = size.normal)
+
+    table.cell(t, 0, 1, "Periods tested", text_color = color.white, bgcolor = color.new(color.gray, 60))
+    table.cell(t, 1, 1, str.tostring(cTotal), text_color = color.white, bgcolor = color.new(color.gray, 60))
+
+    table.cell(t, 0, 2, "Closed inside band", text_color = color.white, bgcolor = color.new(color.green, 50))
+    table.cell(t, 1, 2, str.tostring(cInside), text_color = color.white, bgcolor = color.new(color.green, 50))
+
+    table.cell(t, 0, 3, "Broke out of band", text_color = color.white, bgcolor = color.new(color.red, 50))
+    table.cell(t, 1, 3, str.tostring(cOutside), text_color = color.white, bgcolor = color.new(color.red, 50))
+
+    table.cell(t, 0, 4, "In-band hit rate", text_color = color.white, bgcolor = color.new(color.gray, 30))
+    table.cell(t, 1, 4, str.tostring(hitRate, "#.##") + " %", text_color = color.white, bgcolor = color.new(color.gray, 30))
