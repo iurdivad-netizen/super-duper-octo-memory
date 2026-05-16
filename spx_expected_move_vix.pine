@@ -45,6 +45,10 @@ float  i_offsetPts   = input.float(10.0, "  ↳ distance (points)",
 bool   i_showStrike  = input.bool(true,  "Plot short-put strike line", group = "Put Credit Spread")
 bool   i_showTrades  = input.bool(true,  "Plot resolved trades (win/loss markers)",
      group = "Put Credit Spread")
+int    i_drift       = input.int(1, "Hold / resolution drift (bars)",
+     minval = 1, maxval = 20,
+     tooltip = "How many periods the spread is held before it is resolved on close. 1 = next bar (loosest, highest win rate). Increase to stress-test: the strike is set N bars ago and price has had N periods to drift below it, which lowers the win rate toward something more realistic.",
+     group = "Put Credit Spread")
 bool   i_showCounter = input.bool(true,  "Show win/loss counter table",           group = "Counter")
 string i_tblPos      = input.string("Top Right", "Counter table position",
      options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
@@ -98,9 +102,10 @@ shortPutStrike = changeLower - offsetDist
 plot(i_showStrike ? shortPutStrike : na, 'Short Put Strike', color.new(color.red, 0),
      style = plot.style_linebr)
 
-// Resolve the spread placed at the prior period's strike on this period's close.
-pcsWin  = close >  shortPutStrike[1]
-pcsLoss = close <= shortPutStrike[1]
+// Resolve the spread against the strike set i_drift periods ago.
+strikeAtEntry = shortPutStrike[i_drift]
+pcsWin  = close >  strikeAtEntry
+pcsLoss = close <= strikeAtEntry
 
 plotshape(i_showTrades and pcsWin  and barstate.isconfirmed, title = "PCS win",
      style = shape.triangleup,   location = location.belowbar,
@@ -119,7 +124,7 @@ var int cTotal = 0
 var int cWin   = 0
 
 withinLookback = i_lookback == 0 or (bar_index >= (last_bar_index - i_lookback + 1))
-testable       = barstate.isconfirmed and not na(shortPutStrike[1]) and withinLookback
+testable       = barstate.isconfirmed and not na(strikeAtEntry) and withinLookback
 
 if testable
     cTotal += 1
