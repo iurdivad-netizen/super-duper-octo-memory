@@ -18,8 +18,11 @@
 // close. The expected move is scaled to the holding horizon
 // (per-period VIX move x sqrt(holding bars)). The short put sits that move
 // (plus optional offset) BELOW the entry close; the short call that move ABOVE.
-// Trades are NON-OVERLAPPING: the position is held i_drift bars, resolved at
-// expiry against its fixed strike, then a fresh trade is rolled.
+// "Open a trade every bar" ON  -> a new trade is entered each bar and held the
+//   tenor (overlapping; e.g. DAILY chart + tenor 5 = a ~1-week trade every day).
+// "Open a trade every bar" OFF -> non-overlapping, one trade rolled at expiry.
+// Either way the position is held i_drift bars and resolved at expiry against
+// its fixed entry strike.
 //   PCS WIN  -> exit close ABOVE the fixed short-put strike  (keeps credit)
 //   PCS LOSS -> exit close AT/BELOW the fixed short-put strike
 //   CCS WIN  -> exit close BELOW the fixed short-call strike
@@ -53,6 +56,9 @@ bool   i_showTrades  = input.bool(true,  "Plot resolved trades (win/loss markers
 int    i_drift       = input.int(1, "Option tenor / holding period (bars)",
      minval = 1, maxval = 20,
      tooltip = "How many bars the spread is held before it expires and is resolved on close. On a WEEKLY chart, 1 = a 7DTE trade opened every weekly bar and rolled at expiry. The expected move is scaled to this horizon (per-bar VIX move x sqrt(tenor)).",
+     group = "Put Credit Spread")
+bool   i_everyBar    = input.bool(true, "Open a trade every bar (overlapping)",
+     tooltip = "ON: a new trade is opened on every bar and held for the tenor, so trades overlap (e.g. DAILY chart + tenor 5 = a fresh ~1-week trade entered every day). OFF: non-overlapping, one trade at a time rolled at expiry (independent samples, fewer trades).",
      group = "Put Credit Spread")
 bool   i_projectFwd  = input.bool(true, "Project range/strike to its resolution bar",
      tooltip = "Shifts the band and short-put strike forward by the drift so the level drawn over a bar is exactly the one that bar's close is tested against. Makes trade resolutions visually verifiable.",
@@ -146,10 +152,11 @@ fill(p1, p2, color = color.new(i_bandColor, i_fillTransp))
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Trade engine
-// A trade is opened at a bar's close with a FIXED strike anchored to that
-// close. The expected move is scaled to the holding horizon (per-period move ×
-// sqrt(holding bars)). Trades are non-overlapping: the position is resolved at
-// expiry (i_drift bars later) against its fixed strike, then a new one is rolled.
+// Strike is FIXED at entry, anchored to the entry close; the expected move is
+// scaled to the holding horizon (per-bar VIX move × sqrt(tenor bars)).
+//   Overlapping  (i_everyBar): a trade is opened EVERY bar and resolved tenor
+//                 bars later against its own fixed strike (trades overlap).
+//   Non-overlap  : one trade at a time, rolled at expiry (independent samples).
 // PCS win -> exit close ABOVE the fixed short-put strike
 // CCS win -> exit close BELOW the fixed short-call strike
 // ──────────────────────────────────────────────────────────────────────────────
@@ -158,45 +165,65 @@ withinLookback = i_lookback == 0 or (bar_index >= (last_bar_index - i_lookback +
 // expected % move over the whole holding window
 emHold = probPercMove * math.sqrt(i_drift)
 
+// strike a trade opened on THIS bar would carry (fixed, anchored to this close)
+pOffNow = i_offsetMode  == "Points" ? i_offsetPts  : i_offsetMode  == "% of price" ? close * (i_offsetPct  / 100) : 0.0
+cOffNow = i_cOffsetMode == "Points" ? i_cOffsetPts : i_cOffsetMode == "% of price" ? close * (i_cOffsetPct / 100) : 0.0
+pStrikeNow = close * (1 - emHold / 100) - pOffNow
+cStrikeNow = close * (1 + emHold / 100) + cOffNow
+
 var int   cTotal   = 0
-var int   cWin     = 0
+var int   cWin      = 0
 var int   cTotalC  = 0
-var int   cWinC    = 0
-var float pStrike  = na      // active short-put strike  (held flat for the trade)
-var float cStrike  = na      // active short-call strike (held flat for the trade)
-var int   holdLeft = 0       // bars remaining until expiry
+var int   cWinC     = 0
+var float pHold    = na      // non-overlap: strike held flat for the trade
+var float cHold    = na
+var int   holdLeft = 0       // non-overlap: bars remaining until expiry
 
 bool pcsWin  = false
 bool pcsLoss = false
 bool ccsWin  = false
 bool ccsLoss = false
 
-if barstate.isconfirmed and withinLookback
+// Overlapping: resolve the trade that was opened i_drift bars ago.
+ovResolvable = i_everyBar and barstate.isconfirmed and withinLookback and bar_index >= i_drift and not na(pStrikeNow[i_drift])
+if ovResolvable
+    pcsWin  := close >  pStrikeNow[i_drift]
+    pcsLoss := close <= pStrikeNow[i_drift]
+    cTotal  += 1
+    cWin    += pcsWin ? 1 : 0
+    if i_ccsEnable
+        ccsWin  := close <  cStrikeNow[i_drift]
+        ccsLoss := close >= cStrikeNow[i_drift]
+        cTotalC += 1
+        cWinC   += ccsWin ? 1 : 0
+
+// Non-overlapping: one trade at a time, rolled at expiry.
+if (not i_everyBar) and barstate.isconfirmed and withinLookback
     if holdLeft > 0
         holdLeft -= 1
         if holdLeft == 0
-            // expiry — resolve against the fixed strikes locked in at entry
-            pcsWin  := close >  pStrike
-            pcsLoss := close <= pStrike
+            pcsWin  := close >  pHold
+            pcsLoss := close <= pHold
             cTotal  += 1
             cWin    += pcsWin ? 1 : 0
             if i_ccsEnable
-                ccsWin  := close <  cStrike
-                ccsLoss := close >= cStrike
+                ccsWin  := close <  cHold
+                ccsLoss := close >= cHold
                 cTotalC += 1
                 cWinC   += ccsWin ? 1 : 0
     if holdLeft == 0
-        // (re)open a non-overlapping trade at this close with a fixed strike
-        pOff = i_offsetMode  == "Points" ? i_offsetPts  : i_offsetMode  == "% of price" ? close * (i_offsetPct  / 100) : 0.0
-        cOff = i_cOffsetMode == "Points" ? i_cOffsetPts : i_cOffsetMode == "% of price" ? close * (i_cOffsetPct / 100) : 0.0
-        pStrike  := close * (1 - emHold / 100) - pOff
-        cStrike  := close * (1 + emHold / 100) + cOff
+        pHold    := pStrikeNow
+        cHold    := cStrikeNow
         holdLeft := i_drift
 
-plot(i_showStrike ? pStrike : na, 'Short Put Strike', i_strikeColor,
-     linewidth = i_strikeWidth, style = plot.style_linebr)
-plot(i_ccsEnable and i_cShowStrike ? cStrike : na, 'Short Call Strike', i_cStrikeColor,
-     linewidth = i_strikeWidth, style = plot.style_linebr)
+int   plotOff     = i_everyBar ? i_drift : 0
+float pStrikePlot = i_everyBar ? pStrikeNow : pHold
+float cStrikePlot = i_everyBar ? cStrikeNow : cHold
+
+plot(i_showStrike ? pStrikePlot : na, 'Short Put Strike', i_strikeColor,
+     linewidth = i_strikeWidth, style = plot.style_linebr, offset = plotOff)
+plot(i_ccsEnable and i_cShowStrike ? cStrikePlot : na, 'Short Call Strike', i_cStrikeColor,
+     linewidth = i_strikeWidth, style = plot.style_linebr, offset = plotOff)
 
 plotshape(i_showTrades and pcsWin,  title = "PCS win",
      style = shape.triangleup,   location = location.belowbar, color = i_winColor,  size = size.tiny)
