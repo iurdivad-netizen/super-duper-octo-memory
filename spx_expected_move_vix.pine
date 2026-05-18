@@ -50,9 +50,9 @@ float  i_offsetPts   = input.float(10.0, "  ↳ distance (points)",
 bool   i_showStrike  = input.bool(true,  "Plot short-put strike line", group = "Put Credit Spread")
 bool   i_showTrades  = input.bool(true,  "Plot resolved trades (win/loss markers)",
      group = "Put Credit Spread")
-int    i_drift       = input.int(1, "Hold / resolution drift (bars)",
+int    i_drift       = input.int(1, "Option tenor / holding period (bars)",
      minval = 1, maxval = 20,
-     tooltip = "How many periods the spread is held before it is resolved on close. 1 = next bar (loosest, highest win rate). Increase to stress-test: the strike is set N bars ago and price has had N periods to drift below it, which lowers the win rate toward something more realistic.",
+     tooltip = "How many bars the spread is held before it expires and is resolved on close. On a WEEKLY chart, 1 = a 7DTE trade opened every weekly bar and rolled at expiry. The expected move is scaled to this horizon (per-bar VIX move x sqrt(tenor)).",
      group = "Put Credit Spread")
 bool   i_projectFwd  = input.bool(true, "Project range/strike to its resolution bar",
      tooltip = "Shifts the band and short-put strike forward by the drift so the level drawn over a bar is exactly the one that bar's close is tested against. Makes trade resolutions visually verifiable.",
