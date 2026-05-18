@@ -60,7 +60,28 @@ int    i_lookback    = input.int(0, "Counter lookback (bars, 0 = all history)",
      minval = 0,
      tooltip = "0 counts every confirmed bar on the chart. A positive value only counts the most recent N bars.",
      group = "Counter")
-color  i_bandColor   = input.color(#ffffff, "Band color", group = "Style")
+color  i_bandColor   = input.color(#ffffff, "Band color",            group = "Style · Lines & Ranges")
+int    i_bandWidth   = input.int(1, "Band line width", minval = 1, maxval = 5,
+     group = "Style · Lines & Ranges")
+int    i_fillTransp  = input.int(90, "Range fill transparency", minval = 0, maxval = 100,
+     group = "Style · Lines & Ranges")
+color  i_strikeColor = input.color(color.red, "Short-put strike color",
+     group = "Style · Lines & Ranges")
+int    i_strikeWidth = input.int(1, "Strike line width", minval = 1, maxval = 5,
+     group = "Style · Lines & Ranges")
+color  i_winColor    = input.color(color.green, "Win marker color",
+     group = "Style · Lines & Ranges")
+color  i_lossColor   = input.color(color.rgb(188, 76, 76), "Loss marker color",
+     group = "Style · Lines & Ranges")
+
+color  i_tblText     = input.color(color.white, "Table text color",   group = "Style · Table")
+color  i_tblHeaderBg = input.color(color.new(color.blue, 30), "Header background",  group = "Style · Table")
+color  i_tblWinBg    = input.color(color.new(color.green, 50), "Win row background", group = "Style · Table")
+color  i_tblLossBg   = input.color(color.new(color.red, 50), "Loss row background", group = "Style · Table")
+color  i_tblNeutBg   = input.color(color.new(color.gray, 60), "Neutral row background", group = "Style · Table")
+color  i_tblFrame    = input.color(color.gray, "Table frame/border color", group = "Style · Table")
+string i_tblSize     = input.string("Normal", "Table text size",
+     options = ["Tiny", "Small", "Normal", "Large"], group = "Style · Table")
 
 print(txt) =>
     var lbl = label.new(bar_index, na, txt, xloc.bar_index, yloc.price, color(na), label.style_none, color.gray, size.large, text.align_left)
@@ -96,16 +117,16 @@ changeLower = close - (close * (probPercMove / 100))
 
 int projOff = i_projectFwd ? i_drift : 0
 
-p1 = plot(changeUpper, 'Probable Upper Level', i_bandColor, offset = projOff)
-p2 = plot(changeLower, 'Probable Lower Level', i_bandColor, offset = projOff)
-fill(p1, p2, color = color.new(i_bandColor, 90))
+p1 = plot(changeUpper, 'Probable Upper Level', i_bandColor, linewidth = i_bandWidth, offset = projOff)
+p2 = plot(changeLower, 'Probable Lower Level', i_bandColor, linewidth = i_bandWidth, offset = projOff)
+fill(p1, p2, color = color.new(i_bandColor, i_fillTransp))
 
 // Put-credit-spread short strike: lower band pushed further out of the money
 offsetDist = i_offsetMode == "Points"   ? i_offsetPts :
              i_offsetMode == "% of price" ? close * (i_offsetPct / 100) : 0.0
 shortPutStrike = changeLower - offsetDist
-plot(i_showStrike ? shortPutStrike : na, 'Short Put Strike', color.new(color.red, 0),
-     style = plot.style_linebr, offset = projOff)
+plot(i_showStrike ? shortPutStrike : na, 'Short Put Strike', i_strikeColor,
+     linewidth = i_strikeWidth, style = plot.style_linebr, offset = projOff)
 
 // Resolve the spread against the strike set i_drift periods ago.
 strikeAtEntry = shortPutStrike[i_drift]
@@ -114,10 +135,10 @@ pcsLoss = close <= strikeAtEntry
 
 plotshape(i_showTrades and pcsWin  and barstate.isconfirmed, title = "PCS win",
      style = shape.triangleup,   location = location.belowbar,
-     color = color.new(color.green, 0), size = size.tiny)
+     color = i_winColor, size = size.tiny)
 plotshape(i_showTrades and pcsLoss and barstate.isconfirmed, title = "PCS loss",
      style = shape.flag,         location = location.belowbar,
-     color = color.rgb(188, 76, 76), size = size.small)
+     color = i_lossColor, size = size.small)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Put-credit-spread win/loss counter
@@ -149,21 +170,25 @@ tblPosition(p) =>
      p == "Bottom Left"  ? position.bottom_left  :
      p == "Middle Right" ? position.middle_right : position.middle_left
 
+tblTextSize = i_tblSize == "Tiny"  ? size.tiny  :
+              i_tblSize == "Small" ? size.small :
+              i_tblSize == "Large" ? size.large : size.normal
+
 var table t = table.new(tblPosition(i_tblPos), 2, 5,
-     border_width = 1, frame_color = color.gray, frame_width = 1)
+     border_width = 1, frame_color = i_tblFrame, frame_width = 1)
 
 if i_showCounter and barstate.islast
-    table.cell(t, 0, 0, "Put Credit Spread", text_color = color.white, bgcolor = color.new(color.blue, 30), text_size = size.normal)
-    table.cell(t, 1, 0, str.tostring(timeframe.period), text_color = color.white, bgcolor = color.new(color.blue, 30), text_size = size.normal)
+    table.cell(t, 0, 0, "Put Credit Spread", text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
+    table.cell(t, 1, 0, str.tostring(timeframe.period), text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
 
-    table.cell(t, 0, 1, "Trades tested", text_color = color.white, bgcolor = color.new(color.gray, 60))
-    table.cell(t, 1, 1, str.tostring(cTotal), text_color = color.white, bgcolor = color.new(color.gray, 60))
+    table.cell(t, 0, 1, "Trades tested", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 1, str.tostring(cTotal), text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
 
-    table.cell(t, 0, 2, "Wins (close > strike)", text_color = color.white, bgcolor = color.new(color.green, 50))
-    table.cell(t, 1, 2, str.tostring(cWin), text_color = color.white, bgcolor = color.new(color.green, 50))
+    table.cell(t, 0, 2, "Wins (close > strike)", text_color = i_tblText, bgcolor = i_tblWinBg, text_size = tblTextSize)
+    table.cell(t, 1, 2, str.tostring(cWin), text_color = i_tblText, bgcolor = i_tblWinBg, text_size = tblTextSize)
 
-    table.cell(t, 0, 3, "Losses (close <= strike)", text_color = color.white, bgcolor = color.new(color.red, 50))
-    table.cell(t, 1, 3, str.tostring(cLoss), text_color = color.white, bgcolor = color.new(color.red, 50))
+    table.cell(t, 0, 3, "Losses (close <= strike)", text_color = i_tblText, bgcolor = i_tblLossBg, text_size = tblTextSize)
+    table.cell(t, 1, 3, str.tostring(cLoss), text_color = i_tblText, bgcolor = i_tblLossBg, text_size = tblTextSize)
 
-    table.cell(t, 0, 4, "Win rate", text_color = color.white, bgcolor = color.new(color.gray, 30))
-    table.cell(t, 1, 4, str.tostring(hitRate, "#.##") + " %", text_color = color.white, bgcolor = color.new(color.gray, 30))
+    table.cell(t, 0, 4, "Win rate", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 4, str.tostring(hitRate, "#.##") + " %", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
