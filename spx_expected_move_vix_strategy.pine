@@ -119,6 +119,10 @@ bool   i_nativeOrders = input.bool(false, "Book capped trades into Strategy Test
 string i_emTFInput   = input.timeframe("", "Expected-move timeframe (blank = chart)",
      tooltip = "Size the VIX expected move to THIS timeframe instead of the chart's. Leave blank for the original behavior. Example: chart = Daily, set this to 'W' to anchor strikes to a WEEKLY expected move while opening a trade every day. When set, the move is the single-period move of this timeframe and is NOT re-scaled by the tenor — set the tenor (holding bars) to match (~5 daily bars ≈ 1 week).",
      group = "Expected Move")
+string i_bandAnchor  = input.string("Per-bar close", "Band anchor",
+     options = ["Per-bar close", "EM timeframe close"],
+     tooltip = "Where the DISPLAYED expected-move band is centered (does not affect trade strikes, which always anchor to each entry bar's close). 'Per-bar close': band re-centers on every bar's close (e.g. a jagged daily channel). 'EM timeframe close': flat channel anchored to the prior EM-timeframe close (e.g. a weekly channel that stays level Mon–Fri and steps each new week).",
+     group = "Expected Move")
 
 bool   i_showCounter = input.bool(true,  "Show stats table",           group = "Counter")
 string i_tblPos      = input.string("Top Right", "Counter table position",
@@ -179,8 +183,14 @@ scaleFreq = scaleFreqFor(emTFeff)
 
 probPercMove = vixData / scaleFreq
 
-changeUpper = close + (close * (probPercMove / 100))
-changeLower = close - (close * (probPercMove / 100))
+// Band anchor: the displayed band only. 'EM timeframe close' uses the prior
+// completed EM-period close (held flat across the period → stair-step channel).
+// Trade strikes below are unaffected and always anchor to each entry bar's close.
+emAnchorClose = request.security(syminfo.tickerid, emTFeff, close[1], lookahead = barmerge.lookahead_off)
+bandAnchor    = i_bandAnchor == "EM timeframe close" ? emAnchorClose : close
+
+changeUpper = bandAnchor + (bandAnchor * (probPercMove / 100))
+changeLower = bandAnchor - (bandAnchor * (probPercMove / 100))
 
 int projOff = i_projectFwd ? i_drift : 0
 
