@@ -12,16 +12,15 @@
 //   1) "Capped spread P&L"  (binary option model — always computed)
 //        A win keeps the full credit; a loss pays max loss (width − credit).
 //        Net P&L, profit factor and max drawdown are tracked per side in the
-//        table, AND each resolved spread is booked into the native Strategy
-//        Tester as a 1-contract long with a tick-based bracket: a take-profit
-//        'credit' points away on a win, or a stop '(width − credit)' points
-//        away on a loss. Limit/stop fills land on those exact levels, so every
-//        trade realizes precisely the capped option P&L regardless of the
-//        underlying's real direction. This surfaces the results in the native
-//        Strategy Tester panel (Net Profit, Win Rate, Profit Factor, Max DD).
-//        Caveat: a win's take-profit must eventually be touched to book the
-//        credit, and stop fills can slip on gap bars; for clean native stats
-//        prefer the non-overlapping sampling ("Open a trade every bar" OFF).
+//        on-chart table (always works). OPTIONALLY enable "Book capped trades
+//        into Strategy Tester" to also send each resolved spread to the native
+//        Strategy Tester as a 1-contract long with a tick-based bracket: a
+//        take-profit 'credit' points away on a win, or a stop '(width − credit)'
+//        points away on a loss, so every trade realizes precisely the capped
+//        option P&L. Keep that toggle OFF when "Open a trade every bar" is ON —
+//        the thousands of overlapping orders can stall the tester (and stop the
+//        table drawing). Use it with non-overlapping sampling for clean native
+//        stats. Caveat: stop fills can slip on gap bars.
 //
 //   2) "Directional underlying"
 //        Trades SPX itself as a proxy so the native Strategy Tester populates:
@@ -114,6 +113,12 @@ string i_dirSide     = input.string("Put spread (long SPX)", "Directional side",
      options = ["Put spread (long SPX)", "Call spread (short SPX)"],
      tooltip = "Which spread's directional bias to trade in the 'Directional underlying' model. Put credit spread = bullish = long; call credit spread = bearish = short.",
      group = "Strategy / P&L")
+bool   i_nativeOrders = input.bool(false, "Book capped trades into Strategy Tester",
+     tooltip = "Capped mode only. ON: each resolved spread is sent to the native Strategy Tester as a bracketed 1-contract trade. Leave OFF when 'Open a trade every bar' is ON — thousands of overlapping trades can stall the tester and stop the on-chart table from drawing. The table always works regardless of this setting.",
+     group = "Strategy / P&L")
+string i_emTFInput   = input.timeframe("", "Expected-move timeframe (blank = chart)",
+     tooltip = "Size the VIX expected move to THIS timeframe instead of the chart's. Leave blank for the original behavior. Example: chart = Daily, set this to 'W' to anchor strikes to a WEEKLY expected move while opening a trade every day. When set, the move is the single-period move of this timeframe and is NOT re-scaled by the tenor — set the tenor (holding bars) to match (~5 daily bars ≈ 1 week).",
+     group = "Expected Move")
 
 bool   i_showCounter = input.bool(true,  "Show stats table",           group = "Counter")
 string i_tblPos      = input.string("Top Right", "Counter table position",
@@ -150,25 +155,27 @@ string i_tblSize     = input.string("Normal", "Table text size",
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Expected move from VIX
+//   The expected move can be sized to a DIFFERENT timeframe than the chart's
+//   (i_emTFInput). e.g. chart = Daily, EM timeframe = Weekly → strikes reflect a
+//   one-WEEK expected move while a trade is still opened every day. When a fixed
+//   EM timeframe is set, the move is that timeframe's single-period move and is
+//   NOT re-scaled by the tenor (set the tenor to match, ~5 daily bars ≈ 1 week).
 // ──────────────────────────────────────────────────────────────────────────────
-vixData = request.security("CBOE:VIX", timeframe.period, close)
+emTFeff = i_emTFInput == "" ? timeframe.period : i_emTFInput
+useFixedHorizon = i_emTFInput != "" and i_emTFInput != timeframe.period
 
-scaleFreq = if timeframe.period == "D"
-    math.sqrt(252)
-else if timeframe.period == "W"
-    math.sqrt(52)
-else if timeframe.period == "M"
-    math.sqrt(12)
-else if timeframe.period == "15"
-    math.sqrt(6552)
-else if timeframe.period == "60"
-    math.sqrt(1638)
-else if timeframe.period == "120"
-    math.sqrt(819)
-else if timeframe.period == "240"
-    math.sqrt(409)
-else
-    math.sqrt(252)
+vixData = request.security("CBOE:VIX", emTFeff, close)
+
+scaleFreqFor(tf) =>
+    tf == "D"   ? math.sqrt(252)  :
+     tf == "W"   ? math.sqrt(52)   :
+     tf == "M"   ? math.sqrt(12)   :
+     tf == "15"  ? math.sqrt(6552) :
+     tf == "60"  ? math.sqrt(1638) :
+     tf == "120" ? math.sqrt(819)  :
+     tf == "240" ? math.sqrt(409)  : math.sqrt(252)
+
+scaleFreq = scaleFreqFor(emTFeff)
 
 probPercMove = vixData / scaleFreq
 
@@ -186,8 +193,10 @@ fill(p1, p2, color = color.new(i_bandColor, i_fillTransp))
 // ──────────────────────────────────────────────────────────────────────────────
 withinLookback = i_lookback == 0 or (bar_index >= (last_bar_index - i_lookback + 1))
 
-// expected % move over the whole holding window
-emHold = probPercMove * math.sqrt(i_drift)
+// expected % move over the whole holding window.
+// Fixed-horizon EM timeframe: probPercMove is already the full-period move, so
+// do NOT re-scale by the tenor. Otherwise scale the per-chart-bar move by sqrt(tenor).
+emHold = useFixedHorizon ? probPercMove : probPercMove * math.sqrt(i_drift)
 
 // strike a trade opened on THIS bar would carry (fixed, anchored to this close)
 pOffNow = i_offsetMode  == "Points" ? i_offsetPts  : i_offsetMode  == "% of price" ? close * (i_offsetPct  / 100) : 0.0
@@ -206,8 +215,8 @@ var int   holdLeft = 0       // non-overlap: bars remaining until expiry
 // Capped P&L accounting (always computed; binary option model)
 float maxLossPts = i_widthPts - i_creditPts
 isCapped        = i_pnlModel == "Capped spread P&L"
-int   creditTicks = math.max(1, int(math.round(i_creditPts / syminfo.mintick)))
-int   lossTicks   = math.max(1, int(math.round(maxLossPts  / syminfo.mintick)))
+int   creditTicks = int(math.max(1, math.round(i_creditPts / syminfo.mintick)))
+int   lossTicks   = int(math.max(1, math.round(maxLossPts  / syminfo.mintick)))
 var float netP   = 0.0       // PCS net P&L in points
 var float netC   = 0.0       // CCS net P&L in points
 var float gwP    = 0.0       // PCS gross winning points
@@ -236,7 +245,7 @@ if ovResolvable
     glP     += pcsWin ? 0.0 : maxLossPts
     peakP   := math.max(peakP, netP)
     ddP     := math.max(ddP, peakP - netP)
-    if isCapped
+    if isCapped and i_nativeOrders
         pid = "P" + str.tostring(bar_index)
         strategy.entry(pid, strategy.long)
         strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? creditTicks : na, loss = pcsWin ? na : lossTicks)
@@ -250,7 +259,7 @@ if ovResolvable
         glC     += ccsWin ? 0.0 : maxLossPts
         peakC   := math.max(peakC, netC)
         ddC     := math.max(ddC, peakC - netC)
-        if isCapped
+        if isCapped and i_nativeOrders
             cid = "C" + str.tostring(bar_index)
             strategy.entry(cid, strategy.long)
             strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
@@ -269,7 +278,7 @@ if (not i_everyBar) and barstate.isconfirmed and withinLookback
             glP     += pcsWin ? 0.0 : maxLossPts
             peakP   := math.max(peakP, netP)
             ddP     := math.max(ddP, peakP - netP)
-            if isCapped
+            if isCapped and i_nativeOrders
                 pid = "P" + str.tostring(bar_index)
                 strategy.entry(pid, strategy.long)
                 strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? creditTicks : na, loss = pcsWin ? na : lossTicks)
@@ -283,7 +292,7 @@ if (not i_everyBar) and barstate.isconfirmed and withinLookback
                 glC     += ccsWin ? 0.0 : maxLossPts
                 peakC   := math.max(peakC, netC)
                 ddC     := math.max(ddC, peakC - netC)
-                if isCapped
+                if isCapped and i_nativeOrders
                     cid = "C" + str.tostring(bar_index)
                     strategy.entry(cid, strategy.long)
                     strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
@@ -360,7 +369,7 @@ var table t = table.new(tblPosition(i_tblPos), 3, 8,
      border_width = 1, frame_color = i_tblFrame, frame_width = 1)
 
 if i_showCounter and barstate.islast
-    table.cell(t, 0, 0, str.tostring(timeframe.period), text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
+    table.cell(t, 0, 0, useFixedHorizon ? timeframe.period + " · EM " + emTFeff : timeframe.period, text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
     table.cell(t, 1, 0, "Put Credit",  text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
     table.cell(t, 2, 0, "Call Credit", text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
 
