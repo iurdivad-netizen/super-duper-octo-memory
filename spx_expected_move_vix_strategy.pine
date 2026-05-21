@@ -11,11 +11,17 @@
 //
 //   1) "Capped spread P&L"  (binary option model — always computed)
 //        A win keeps the full credit; a loss pays max loss (width − credit).
-//        Net P&L, profit factor and max drawdown are tracked per side and shown
-//        in the table. This faithfully reflects the source's binary outcome.
-//        NOTE: TradingView's native Strategy Tester trades the chart symbol, so
-//        it cannot book arbitrary capped option P&L. In this mode the table is
-//        the source of truth; no native orders are placed.
+//        Net P&L, profit factor and max drawdown are tracked per side in the
+//        table, AND each resolved spread is booked into the native Strategy
+//        Tester as a 1-contract long with a tick-based bracket: a take-profit
+//        'credit' points away on a win, or a stop '(width − credit)' points
+//        away on a loss. Limit/stop fills land on those exact levels, so every
+//        trade realizes precisely the capped option P&L regardless of the
+//        underlying's real direction. This surfaces the results in the native
+//        Strategy Tester panel (Net Profit, Win Rate, Profit Factor, Max DD).
+//        Caveat: a win's take-profit must eventually be touched to book the
+//        credit, and stop fills can slip on gap bars; for clean native stats
+//        prefer the non-overlapping sampling ("Open a trade every bar" OFF).
 //
 //   2) "Directional underlying"
 //        Trades SPX itself as a proxy so the native Strategy Tester populates:
@@ -37,11 +43,12 @@
 strategy(title             = "Expected SPX Movement by timeframe (VIX) — Strategy",
          shorttitle        = "SPX Exp Move (VIX) Strat",
          overlay           = true,
-         default_qty_type  = strategy.percent_of_equity,
-         default_qty_value = 10,
-         pyramiding        = 0,
+         default_qty_type  = strategy.fixed,
+         default_qty_value = 1,
+         pyramiding        = 1000,
          commission_type   = strategy.commission.percent,
-         commission_value  = 0.01,
+         commission_value  = 0.0,
+         slippage          = 0,
          calc_on_every_tick= false,
          process_orders_on_close = true)
 
@@ -198,6 +205,9 @@ var int   holdLeft = 0       // non-overlap: bars remaining until expiry
 
 // Capped P&L accounting (always computed; binary option model)
 float maxLossPts = i_widthPts - i_creditPts
+isCapped        = i_pnlModel == "Capped spread P&L"
+int   creditTicks = math.max(1, int(math.round(i_creditPts / syminfo.mintick)))
+int   lossTicks   = math.max(1, int(math.round(maxLossPts  / syminfo.mintick)))
 var float netP   = 0.0       // PCS net P&L in points
 var float netC   = 0.0       // CCS net P&L in points
 var float gwP    = 0.0       // PCS gross winning points
@@ -226,6 +236,10 @@ if ovResolvable
     glP     += pcsWin ? 0.0 : maxLossPts
     peakP   := math.max(peakP, netP)
     ddP     := math.max(ddP, peakP - netP)
+    if isCapped
+        pid = "P" + str.tostring(bar_index)
+        strategy.entry(pid, strategy.long)
+        strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? creditTicks : na, loss = pcsWin ? na : lossTicks)
     if i_ccsEnable
         ccsWin  := close <  cStrikeNow[i_drift]
         ccsLoss := close >= cStrikeNow[i_drift]
@@ -236,6 +250,10 @@ if ovResolvable
         glC     += ccsWin ? 0.0 : maxLossPts
         peakC   := math.max(peakC, netC)
         ddC     := math.max(ddC, peakC - netC)
+        if isCapped
+            cid = "C" + str.tostring(bar_index)
+            strategy.entry(cid, strategy.long)
+            strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
 
 // Non-overlapping: one trade at a time, rolled at expiry.
 if (not i_everyBar) and barstate.isconfirmed and withinLookback
@@ -251,6 +269,10 @@ if (not i_everyBar) and barstate.isconfirmed and withinLookback
             glP     += pcsWin ? 0.0 : maxLossPts
             peakP   := math.max(peakP, netP)
             ddP     := math.max(ddP, peakP - netP)
+            if isCapped
+                pid = "P" + str.tostring(bar_index)
+                strategy.entry(pid, strategy.long)
+                strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? creditTicks : na, loss = pcsWin ? na : lossTicks)
             if i_ccsEnable
                 ccsWin  := close <  cHold
                 ccsLoss := close >= cHold
@@ -261,6 +283,10 @@ if (not i_everyBar) and barstate.isconfirmed and withinLookback
                 glC     += ccsWin ? 0.0 : maxLossPts
                 peakC   := math.max(peakC, netC)
                 ddC     := math.max(ddC, peakC - netC)
+                if isCapped
+                    cid = "C" + str.tostring(bar_index)
+                    strategy.entry(cid, strategy.long)
+                    strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
     if holdLeft == 0
         pHold    := pStrikeNow
         cHold    := cStrikeNow
