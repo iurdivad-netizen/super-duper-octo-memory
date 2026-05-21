@@ -1,0 +1,367 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © rhvarelav (original indicator) — converted to a backtestable strategy()
+//
+// THIS STRATEGY ONLY WORKS FOR THE SPX CHART
+//
+// It is the strategy() port of "Expected SPX Movement by timeframe (VIX)". It
+// measures SPX's expected move for the chart timeframe from the current VIX and
+// places fixed-strike PUT CREDIT SPREADS (and mirror CALL CREDIT SPREADS),
+// resolving each at expiry against its locked entry strike — identical signal
+// logic to the indicator. What's new is P&L accounting in two selectable models:
+//
+//   1) "Capped spread P&L"  (binary option model — always computed)
+//        A win keeps the full credit; a loss pays max loss (width − credit).
+//        Net P&L, profit factor and max drawdown are tracked per side and shown
+//        in the table. This faithfully reflects the source's binary outcome.
+//        NOTE: TradingView's native Strategy Tester trades the chart symbol, so
+//        it cannot book arbitrary capped option P&L. In this mode the table is
+//        the source of truth; no native orders are placed.
+//
+//   2) "Directional underlying"
+//        Trades SPX itself as a proxy so the native Strategy Tester populates:
+//        a put credit spread is bullish (go LONG), a call credit spread is
+//        bearish (go SHORT). Pick the side with "Directional side". One
+//        position at a time, entered on a signal bar and exited i_drift bars
+//        later (non-overlapping, to keep the native tester realistic). The
+//        capped table is still computed alongside for reference.
+//
+// Expected move = currentVIX / sqrt(periods-per-year), scaled to the holding
+// horizon by sqrt(tenor bars). Strikes are locked at entry and drawn flat.
+//   PCS WIN  -> exit close ABOVE the fixed short-put strike  (keeps credit)
+//   PCS LOSS -> exit close AT/BELOW the fixed short-put strike
+//   CCS WIN  -> exit close BELOW the fixed short-call strike
+//   CCS LOSS -> exit close AT/ABOVE the fixed short-call strike
+
+//@version=5
+
+strategy(title             = "Expected SPX Movement by timeframe (VIX) — Strategy",
+         shorttitle        = "SPX Exp Move (VIX) Strat",
+         overlay           = true,
+         default_qty_type  = strategy.percent_of_equity,
+         default_qty_value = 10,
+         pyramiding        = 0,
+         commission_type   = strategy.commission.percent,
+         commission_value  = 0.01,
+         calc_on_every_tick= false,
+         process_orders_on_close = true)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ──────────────────────────────────────────────────────────────────────────────
+string i_offsetMode  = input.string("% of price", "Distance to lower band",
+     options = ["% of price", "Points", "At lower band"],
+     tooltip = "How far BELOW the lower expected-move band to place the short put. 'At lower band' ignores the values below.",
+     group = "Put Credit Spread")
+float  i_offsetPct   = input.float(0.0, "  ↳ distance (% of price)",
+     minval = 0.0, step = 0.05,
+     tooltip = "Used when distance mode = '% of price'.",
+     group = "Put Credit Spread")
+float  i_offsetPts   = input.float(10.0, "  ↳ distance (points)",
+     minval = 0.0, step = 1.0,
+     tooltip = "Used when distance mode = 'Points'.",
+     group = "Put Credit Spread")
+bool   i_showStrike  = input.bool(true,  "Plot short-put strike line", group = "Put Credit Spread")
+bool   i_showTrades  = input.bool(true,  "Plot resolved trades (win/loss markers)",
+     group = "Put Credit Spread")
+int    i_drift       = input.int(1, "Option tenor / holding period (bars)",
+     minval = 1, maxval = 20,
+     tooltip = "How many bars the spread is held before it expires and is resolved on close. On a WEEKLY chart, 1 = a 7DTE trade opened every weekly bar and rolled at expiry. The expected move is scaled to this horizon (per-bar VIX move x sqrt(tenor)).",
+     group = "Put Credit Spread")
+bool   i_everyBar    = input.bool(true, "Open a trade every bar (overlapping)",
+     tooltip = "ON: a new trade is opened on every bar and held for the tenor, so trades overlap (e.g. DAILY chart + tenor 5 = a fresh ~1-week trade entered every day). OFF: non-overlapping, one trade at a time rolled at expiry (independent samples, fewer trades). Affects the capped-table sampling; the native directional model is always non-overlapping.",
+     group = "Put Credit Spread")
+bool   i_projectFwd  = input.bool(true, "Project range/strike to its resolution bar",
+     tooltip = "Shifts the band and short-put strike forward by the drift so the level drawn over a bar is exactly the one that bar's close is tested against. Makes trade resolutions visually verifiable.",
+     group = "Put Credit Spread")
+bool   i_ccsEnable   = input.bool(true, "Enable Call Credit Spread",
+     tooltip = "Short call placed ABOVE the upper expected-move band. Win = period closes BELOW the short-call strike.",
+     group = "Call Credit Spread")
+string i_cOffsetMode = input.string("% of price", "Distance to upper band",
+     options = ["% of price", "Points", "At upper band"],
+     tooltip = "How far ABOVE the upper expected-move band to place the short call. 'At upper band' ignores the values below.",
+     group = "Call Credit Spread")
+float  i_cOffsetPct  = input.float(0.0, "  ↳ distance (% of price)",
+     minval = 0.0, step = 0.05, tooltip = "Used when distance mode = '% of price'.",
+     group = "Call Credit Spread")
+float  i_cOffsetPts  = input.float(10.0, "  ↳ distance (points)",
+     minval = 0.0, step = 1.0, tooltip = "Used when distance mode = 'Points'.",
+     group = "Call Credit Spread")
+bool   i_cShowStrike = input.bool(true,  "Plot short-call strike line", group = "Call Credit Spread")
+bool   i_cShowTrades = input.bool(true,  "Plot resolved trades (win/loss markers)",
+     group = "Call Credit Spread")
+
+// ── Strategy / P&L model ───────────────────────────────────────────────────────
+string i_pnlModel    = input.string("Capped spread P&L", "P&L model",
+     options = ["Capped spread P&L", "Directional underlying"],
+     tooltip = "Capped spread P&L: binary option accounting (win=+credit, loss=-(width-credit)) reported in the table; no native orders. Directional underlying: trade SPX as a proxy so the native Strategy Tester populates.",
+     group = "Strategy / P&L")
+float  i_creditPts   = input.float(1.0, "Credit received (points)",
+     minval = 0.0, step = 0.1,
+     tooltip = "Premium collected per spread, in index points. A WIN books +credit.",
+     group = "Strategy / P&L")
+float  i_widthPts    = input.float(5.0, "Spread width (points)",
+     minval = 0.1, step = 0.5,
+     tooltip = "Distance between short and long strike. Max loss = width − credit, booked on a LOSS.",
+     group = "Strategy / P&L")
+string i_dirSide     = input.string("Put spread (long SPX)", "Directional side",
+     options = ["Put spread (long SPX)", "Call spread (short SPX)"],
+     tooltip = "Which spread's directional bias to trade in the 'Directional underlying' model. Put credit spread = bullish = long; call credit spread = bearish = short.",
+     group = "Strategy / P&L")
+
+bool   i_showCounter = input.bool(true,  "Show stats table",           group = "Counter")
+string i_tblPos      = input.string("Top Right", "Counter table position",
+     options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right","Middle Left"],
+     group = "Counter")
+int    i_lookback    = input.int(0, "Counter lookback (bars, 0 = all history)",
+     minval = 0,
+     tooltip = "0 counts every confirmed bar on the chart. A positive value only counts the most recent N bars.",
+     group = "Counter")
+color  i_bandColor   = input.color(#ffffff, "Band color",            group = "Style · Lines & Ranges")
+int    i_bandWidth   = input.int(1, "Band line width", minval = 1, maxval = 5,
+     group = "Style · Lines & Ranges")
+int    i_fillTransp  = input.int(90, "Range fill transparency", minval = 0, maxval = 100,
+     group = "Style · Lines & Ranges")
+color  i_strikeColor = input.color(color.red, "Short-put strike color",
+     group = "Style · Lines & Ranges")
+int    i_strikeWidth = input.int(1, "Strike line width", minval = 1, maxval = 5,
+     group = "Style · Lines & Ranges")
+color  i_cStrikeColor = input.color(color.orange, "Short-call strike color",
+     group = "Style · Lines & Ranges")
+color  i_winColor    = input.color(color.green, "Win marker color",
+     group = "Style · Lines & Ranges")
+color  i_lossColor   = input.color(color.rgb(188, 76, 76), "Loss marker color",
+     group = "Style · Lines & Ranges")
+
+color  i_tblText     = input.color(color.white, "Table text color",   group = "Style · Table")
+color  i_tblHeaderBg = input.color(color.new(color.blue, 30), "Header background",  group = "Style · Table")
+color  i_tblWinBg    = input.color(color.new(color.green, 50), "Win row background", group = "Style · Table")
+color  i_tblLossBg   = input.color(color.new(color.red, 50), "Loss row background", group = "Style · Table")
+color  i_tblNeutBg   = input.color(color.new(color.gray, 60), "Neutral row background", group = "Style · Table")
+color  i_tblFrame    = input.color(color.gray, "Table frame/border color", group = "Style · Table")
+string i_tblSize     = input.string("Normal", "Table text size",
+     options = ["Tiny", "Small", "Normal", "Large"], group = "Style · Table")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Expected move from VIX
+// ──────────────────────────────────────────────────────────────────────────────
+vixData = request.security("CBOE:VIX", timeframe.period, close)
+
+scaleFreq = if timeframe.period == "D"
+    math.sqrt(252)
+else if timeframe.period == "W"
+    math.sqrt(52)
+else if timeframe.period == "M"
+    math.sqrt(12)
+else if timeframe.period == "15"
+    math.sqrt(6552)
+else if timeframe.period == "60"
+    math.sqrt(1638)
+else if timeframe.period == "120"
+    math.sqrt(819)
+else if timeframe.period == "240"
+    math.sqrt(409)
+else
+    math.sqrt(252)
+
+probPercMove = vixData / scaleFreq
+
+changeUpper = close + (close * (probPercMove / 100))
+changeLower = close - (close * (probPercMove / 100))
+
+int projOff = i_projectFwd ? i_drift : 0
+
+p1 = plot(changeUpper, 'Probable Upper Level', i_bandColor, linewidth = i_bandWidth, offset = projOff)
+p2 = plot(changeLower, 'Probable Lower Level', i_bandColor, linewidth = i_bandWidth, offset = projOff)
+fill(p1, p2, color = color.new(i_bandColor, i_fillTransp))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Trade engine — strikes fixed at entry, scaled to the holding horizon.
+// ──────────────────────────────────────────────────────────────────────────────
+withinLookback = i_lookback == 0 or (bar_index >= (last_bar_index - i_lookback + 1))
+
+// expected % move over the whole holding window
+emHold = probPercMove * math.sqrt(i_drift)
+
+// strike a trade opened on THIS bar would carry (fixed, anchored to this close)
+pOffNow = i_offsetMode  == "Points" ? i_offsetPts  : i_offsetMode  == "% of price" ? close * (i_offsetPct  / 100) : 0.0
+cOffNow = i_cOffsetMode == "Points" ? i_cOffsetPts : i_cOffsetMode == "% of price" ? close * (i_cOffsetPct / 100) : 0.0
+pStrikeNow = close * (1 - emHold / 100) - pOffNow
+cStrikeNow = close * (1 + emHold / 100) + cOffNow
+
+var int   cTotal   = 0
+var int   cWin      = 0
+var int   cTotalC  = 0
+var int   cWinC     = 0
+var float pHold    = na      // non-overlap: strike held flat for the trade
+var float cHold    = na
+var int   holdLeft = 0       // non-overlap: bars remaining until expiry
+
+// Capped P&L accounting (always computed; binary option model)
+float maxLossPts = i_widthPts - i_creditPts
+var float netP   = 0.0       // PCS net P&L in points
+var float netC   = 0.0       // CCS net P&L in points
+var float gwP    = 0.0       // PCS gross winning points
+var float glP    = 0.0       // PCS gross losing points (positive magnitude)
+var float gwC    = 0.0
+var float glC    = 0.0
+var float peakP  = 0.0
+var float ddP    = 0.0
+var float peakC  = 0.0
+var float ddC    = 0.0
+
+bool pcsWin  = false
+bool pcsLoss = false
+bool ccsWin  = false
+bool ccsLoss = false
+
+// Overlapping: resolve the trade that was opened i_drift bars ago.
+ovResolvable = i_everyBar and barstate.isconfirmed and withinLookback and bar_index >= i_drift and not na(pStrikeNow[i_drift])
+if ovResolvable
+    pcsWin  := close >  pStrikeNow[i_drift]
+    pcsLoss := close <= pStrikeNow[i_drift]
+    cTotal  += 1
+    cWin    += pcsWin ? 1 : 0
+    netP    += pcsWin ? i_creditPts : -maxLossPts
+    gwP     += pcsWin ? i_creditPts : 0.0
+    glP     += pcsWin ? 0.0 : maxLossPts
+    peakP   := math.max(peakP, netP)
+    ddP     := math.max(ddP, peakP - netP)
+    if i_ccsEnable
+        ccsWin  := close <  cStrikeNow[i_drift]
+        ccsLoss := close >= cStrikeNow[i_drift]
+        cTotalC += 1
+        cWinC   += ccsWin ? 1 : 0
+        netC    += ccsWin ? i_creditPts : -maxLossPts
+        gwC     += ccsWin ? i_creditPts : 0.0
+        glC     += ccsWin ? 0.0 : maxLossPts
+        peakC   := math.max(peakC, netC)
+        ddC     := math.max(ddC, peakC - netC)
+
+// Non-overlapping: one trade at a time, rolled at expiry.
+if (not i_everyBar) and barstate.isconfirmed and withinLookback
+    if holdLeft > 0
+        holdLeft -= 1
+        if holdLeft == 0
+            pcsWin  := close >  pHold
+            pcsLoss := close <= pHold
+            cTotal  += 1
+            cWin    += pcsWin ? 1 : 0
+            netP    += pcsWin ? i_creditPts : -maxLossPts
+            gwP     += pcsWin ? i_creditPts : 0.0
+            glP     += pcsWin ? 0.0 : maxLossPts
+            peakP   := math.max(peakP, netP)
+            ddP     := math.max(ddP, peakP - netP)
+            if i_ccsEnable
+                ccsWin  := close <  cHold
+                ccsLoss := close >= cHold
+                cTotalC += 1
+                cWinC   += ccsWin ? 1 : 0
+                netC    += ccsWin ? i_creditPts : -maxLossPts
+                gwC     += ccsWin ? i_creditPts : 0.0
+                glC     += ccsWin ? 0.0 : maxLossPts
+                peakC   := math.max(peakC, netC)
+                ddC     := math.max(ddC, peakC - netC)
+    if holdLeft == 0
+        pHold    := pStrikeNow
+        cHold    := cStrikeNow
+        holdLeft := i_drift
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Native orders — "Directional underlying" model only.
+// One position at a time: enter on a signal bar, exit i_drift bars later.
+// ──────────────────────────────────────────────────────────────────────────────
+var int dirBarsHeld = 0
+isDirModel = i_pnlModel == "Directional underlying"
+goLong     = i_dirSide == "Put spread (long SPX)"
+
+if isDirModel and barstate.isconfirmed
+    if strategy.position_size != 0
+        dirBarsHeld += 1
+        if dirBarsHeld >= i_drift
+            strategy.close("Dir")
+    if strategy.position_size == 0 and withinLookback
+        if goLong
+            strategy.entry("Dir", strategy.long)
+        else
+            strategy.entry("Dir", strategy.short)
+        dirBarsHeld := 0
+
+int   plotOff     = i_everyBar ? i_drift : 0
+float pStrikePlot = i_everyBar ? pStrikeNow : pHold
+float cStrikePlot = i_everyBar ? cStrikeNow : cHold
+
+plot(i_showStrike ? pStrikePlot : na, 'Short Put Strike', i_strikeColor,
+     linewidth = i_strikeWidth, style = plot.style_linebr, offset = plotOff)
+plot(i_ccsEnable and i_cShowStrike ? cStrikePlot : na, 'Short Call Strike', i_cStrikeColor,
+     linewidth = i_strikeWidth, style = plot.style_linebr, offset = plotOff)
+
+plotshape(i_showTrades and pcsWin,  title = "PCS win",
+     style = shape.triangleup,   location = location.belowbar, color = i_winColor,  size = size.tiny)
+plotshape(i_showTrades and pcsLoss, title = "PCS loss",
+     style = shape.flag,         location = location.belowbar, color = i_lossColor, size = size.small)
+plotshape(i_ccsEnable and i_cShowTrades and ccsWin,  title = "CCS win",
+     style = shape.triangledown, location = location.abovebar, color = i_winColor,  size = size.tiny)
+plotshape(i_ccsEnable and i_cShowTrades and ccsLoss, title = "CCS loss",
+     style = shape.flag,         location = location.abovebar, color = i_lossColor, size = size.small)
+
+cLoss    = cTotal - cWin
+hitRate  = cTotal  > 0 ? (cWin  / cTotal)  * 100 : 0.0
+cLossC   = cTotalC - cWinC
+hitRateC = cTotalC > 0 ? (cWinC / cTotalC) * 100 : 0.0
+pfP      = glP > 0 ? gwP / glP : na
+pfC      = glC > 0 ? gwC / glC : na
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stats table
+// ──────────────────────────────────────────────────────────────────────────────
+tblPosition(p) =>
+    p == "Top Right"     ? position.top_right    :
+     p == "Top Left"     ? position.top_left     :
+     p == "Bottom Right" ? position.bottom_right :
+     p == "Bottom Left"  ? position.bottom_left  :
+     p == "Middle Right" ? position.middle_right : position.middle_left
+
+tblTextSize = i_tblSize == "Tiny"  ? size.tiny  :
+              i_tblSize == "Small" ? size.small :
+              i_tblSize == "Large" ? size.large : size.normal
+
+f_num(v, enabled)  => enabled ? str.tostring(v) : "—"
+f_rate(v, enabled) => enabled ? str.tostring(v, "#.##") + " %" : "—"
+f_pts(v, enabled)  => enabled ? str.tostring(v, "#.##") : "—"
+f_pf(v, enabled)   => enabled and not na(v) ? str.tostring(v, "#.##") : "—"
+
+var table t = table.new(tblPosition(i_tblPos), 3, 8,
+     border_width = 1, frame_color = i_tblFrame, frame_width = 1)
+
+if i_showCounter and barstate.islast
+    table.cell(t, 0, 0, str.tostring(timeframe.period), text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
+    table.cell(t, 1, 0, "Put Credit",  text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
+    table.cell(t, 2, 0, "Call Credit", text_color = i_tblText, bgcolor = i_tblHeaderBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 1, "Trades", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 1, f_num(cTotal,  true),         text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 2, 1, f_num(cTotalC, i_ccsEnable),  text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 2, "Wins", text_color = i_tblText, bgcolor = i_tblWinBg, text_size = tblTextSize)
+    table.cell(t, 1, 2, f_num(cWin,  true),         text_color = i_tblText, bgcolor = i_tblWinBg, text_size = tblTextSize)
+    table.cell(t, 2, 2, f_num(cWinC, i_ccsEnable),  text_color = i_tblText, bgcolor = i_tblWinBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 3, "Losses", text_color = i_tblText, bgcolor = i_tblLossBg, text_size = tblTextSize)
+    table.cell(t, 1, 3, f_num(cLoss,  true),        text_color = i_tblText, bgcolor = i_tblLossBg, text_size = tblTextSize)
+    table.cell(t, 2, 3, f_num(cLossC, i_ccsEnable), text_color = i_tblText, bgcolor = i_tblLossBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 4, "Win rate", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 4, f_rate(hitRate,  true),        text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 2, 4, f_rate(hitRateC, i_ccsEnable), text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 5, "Net P&L (pts)", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 5, f_pts(netP, true),         text_color = i_tblText, bgcolor = netP >= 0 ? i_tblWinBg : i_tblLossBg, text_size = tblTextSize)
+    table.cell(t, 2, 5, f_pts(netC, i_ccsEnable),  text_color = i_tblText, bgcolor = netC >= 0 ? i_tblWinBg : i_tblLossBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 6, "Profit factor", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 6, f_pf(pfP, true),         text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 2, 6, f_pf(pfC, i_ccsEnable),  text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+
+    table.cell(t, 0, 7, "Max DD (pts)", text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 1, 7, f_pts(ddP, true),         text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
+    table.cell(t, 2, 7, f_pts(ddC, i_ccsEnable),  text_color = i_tblText, bgcolor = i_tblNeutBg, text_size = tblTextSize)
