@@ -69,11 +69,11 @@ float  i_offsetPts   = input.float(10.0, "  ↳ distance (points)",
 bool   i_showStrike  = input.bool(true,  "Plot short-put strike line", group = "Put Credit Spread")
 bool   i_showTrades  = input.bool(true,  "Plot resolved trades (win/loss markers)",
      group = "Put Credit Spread")
-int    i_drift       = input.int(1, "Option tenor / holding period (bars)",
+int    i_drift       = input.int(5, "Option tenor / holding period (bars)",
      minval = 1, maxval = 20,
      tooltip = "How many bars the spread is held before it expires and is resolved on close. On a WEEKLY chart, 1 = a 7DTE trade opened every weekly bar and rolled at expiry. The expected move is scaled to this horizon (per-bar VIX move x sqrt(tenor)).",
      group = "Put Credit Spread")
-bool   i_everyBar    = input.bool(true, "Open a trade every bar (overlapping)",
+bool   i_everyBar    = input.bool(false, "Open a trade every bar (overlapping)",
      tooltip = "ON: a new trade is opened on every bar and held for the tenor, so trades overlap (e.g. DAILY chart + tenor 5 = a fresh ~1-week trade entered every day). OFF: non-overlapping, one trade at a time rolled at expiry (independent samples, fewer trades). Affects the capped-table sampling; the native directional model is always non-overlapping.",
      group = "Put Credit Spread")
 bool   i_projectFwd  = input.bool(true, "Project range/strike to its resolution bar",
@@ -97,7 +97,7 @@ bool   i_cShowTrades = input.bool(true,  "Plot resolved trades (win/loss markers
      group = "Call Credit Spread")
 
 // ── Strategy / P&L model ───────────────────────────────────────────────────────
-string i_pnlModel    = input.string("Capped spread P&L", "P&L model",
+string i_pnlModel    = input.string("Directional underlying", "P&L model",
      options = ["Capped spread P&L", "Directional underlying"],
      tooltip = "Capped spread P&L: binary option accounting (win=+credit, loss=-(width-credit)) reported in the table; no native orders. Directional underlying: trade SPX as a proxy so the native Strategy Tester populates.",
      group = "Strategy / P&L")
