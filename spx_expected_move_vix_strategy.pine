@@ -275,7 +275,7 @@ if ovResolvable
             strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
 
 // Non-overlapping: one trade at a time, rolled at expiry.
-if (not i_everyBar) and barstate.isconfirmed and withinLookback
+if (not i_everyBar) and barstate.isconfirmed and withinLookback and not na(probPercMove)
     if holdLeft > 0
         holdLeft -= 1
         if holdLeft == 0
