@@ -30,6 +30,14 @@ levelsBelow  = input.int(3, "Levels Drawn Below Price", minval=1, maxval=10, gro
 proximityPts = input.float(8.0, "Active-Level Proximity (pts)", minval=1.0, maxval=30.0, step=0.5, group=grpLevels,
                   tooltip="Only levels within this many points of price are eligible to trade. Keeps the strategy from arming on far-away lines.")
 
+// Optional no-trade band — skip entries when price is sandwiched between the
+// 80 of one block and the 20 of the next (the chop band straddling each
+// round-hundred). Default 80→20 = a 40-point band from xx80 to (xx+1)20.
+useNoTradeZone = input.bool(false, "Block Entries Between 80 and 20", group=grpLevels,
+                  tooltip="When ON, no entries fire if price is inside the band between the upper level (80) of one 100-block and the lower level (20) of the next. Keeps trades to the 'body' of each block.")
+ntzPaddingPts  = input.float(0.0, "No-Trade Zone Padding (pts)", minval=0.0, maxval=20.0, step=0.5, group=grpLevels,
+                  tooltip="Extra points added inside the band on each side. 0 = exact 80↔20 boundary.")
+
 // Session — NQ trades on CME, so use exchange (CT) time. Default 0830-1000 CT = 0930-1100 ET.
 tradeSession = input.session("0830-1000", "Trading Window (Exchange TZ)", group=grpSess,
                   tooltip="NQ futures use CME (Chicago) time. 0830-1000 CT = 9:30am-11:00am ET. If your chart is on Eastern time, change to 0930-1100.")
@@ -37,7 +45,7 @@ flatBySessEnd = input.bool(true, "Flatten at Session Close", group=grpSess,
                   tooltip="Close any open trade when the trading window ends.")
 
 // Entry
-entryMode    = input.string("Break & Retest", "Entry Mode",
+entryMode    = input.string("Both", "Entry Mode",
                   options=["Breakout", "Break & Retest", "Both"], group=grpEntry,
                   tooltip="Breakout: enter on first confirmed close beyond the level.\nBreak & Retest: wait for price to push away, return to the level, and hold.\nBoth: take whichever signal comes first per level.")
 confirmBars  = input.int(1, "Breakout Confirmation Candles", minval=1, maxval=3, group=grpEntry)
@@ -106,12 +114,8 @@ f_nearestBelow(arr, p) =>
             best := v
     best
 
-upLevel = f_nearestAbove(levels, close)   // resistance candidate
-dnLevel = f_nearestBelow(levels, close)   // support candidate
-
-// Eligible only if price is within proximity of the level
-upActive = not na(upLevel) and (upLevel - close) <= proximityPts
-dnActive = not na(dnLevel) and (close - dnLevel) <= proximityPts
+upLevel = f_nearestAbove(levels, close)   // resistance candidate (live)
+dnLevel = f_nearestBelow(levels, close)   // support candidate (live)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STATE MACHINE  —  per-level, per-side, reset each day
@@ -136,26 +140,47 @@ var bool  longPulledAway   = false
 var bool  shortPulledAway  = false
 var bool  longRetestArmed  = false
 var bool  shortRetestArmed = false
+var bool  longFired        = false
+var bool  shortFired       = false
 var int   tradesToday      = 0
 
 if isNewDay
     tradesToday := 0
 
-// Reset upside state if the tracked level changed
-if not na(upLevel) and (na(trackedUp) or upLevel != trackedUp)
+// Reset upside state if the tracked level changed — but ONLY while no break
+// is in progress.  Once price has broken above trackedUp, hold it locked so
+// the retest state machine can complete on the original level instead of
+// hopping to the next line up.
+if isNewDay or not inSession
+    longBroke        := false
+    longPulledAway   := false
+    longRetestArmed  := false
+    longFired        := false
+    longCount        := 0
+    shortBroke       := false
+    shortPulledAway  := false
+    shortRetestArmed := false
+    shortFired       := false
+    shortCount       := 0
+
+// Update trackedUp only while no break is in progress (or after a trade fired
+// and we're free to look for the next level). This keeps the retest state
+// machine anchored to the level it actually broke.
+if (not longBroke or longFired) and not na(upLevel) and (na(trackedUp) or upLevel != trackedUp)
     trackedUp        := upLevel
     longCount        := 0
     longBroke        := false
     longPulledAway   := false
     longRetestArmed  := false
+    longFired        := false
 
-// Reset downside state if the tracked level changed
-if not na(dnLevel) and (na(trackedDn) or dnLevel != trackedDn)
+if (not shortBroke or shortFired) and not na(dnLevel) and (na(trackedDn) or dnLevel != trackedDn)
     trackedDn        := dnLevel
     shortCount       := 0
     shortBroke       := false
     shortPulledAway  := false
     shortRetestArmed := false
+    shortFired       := false
 
 // Update state only while in the trading window
 if inSession
@@ -195,14 +220,29 @@ if inSession
 useBreakout = entryMode == "Breakout"        or entryMode == "Both"
 useRetest   = entryMode == "Break & Retest"  or entryMode == "Both"
 
+// Eligibility — measured against the LOCKED-IN level, not whichever line
+// happens to be nearest right now. After a break, trackedUp/Dn stays fixed.
+upActive = not na(trackedUp) and math.abs(close - trackedUp) <= proximityPts * 4
+dnActive = not na(trackedDn) and math.abs(close - trackedDn) <= proximityPts * 4
+
 longBreakoutBar  = inSession and upActive and longBroke  and not longBroke[1]
 shortBreakoutBar = inSession and dnActive and shortBroke and not shortBroke[1]
 
 longRetestBar    = inSession and upActive and longRetestArmed  and close > trackedUp
 shortRetestBar   = inSession and dnActive and shortRetestArmed and close < trackedDn
 
+// Optional no-trade band — block entries when price is between the upper
+// (80) level of one 100-block and the lower (20) level of the next block.
+// e.g. with levels 20/80 the band runs from xx80 → (xx+1)20.
+hi80 = math.floor(close / 100.0) * 100.0 + levelB           // the 80 below price's block top
+lo20 = math.floor(close / 100.0) * 100.0 + 100.0 + levelA   // the 20 above it
+inNoTradeZone = useNoTradeZone and close >= (hi80 - ntzPaddingPts) and close <= (lo20 + ntzPaddingPts)
+
 longSignal  = (useBreakout and longBreakoutBar)  or (useRetest and longRetestBar)
 shortSignal = (useBreakout and shortBreakoutBar) or (useRetest and shortRetestBar)
+
+longSignal  := longSignal  and not inNoTradeZone and not longFired
+shortSignal := shortSignal and not inNoTradeZone and not shortFired
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ORDER MANAGEMENT
@@ -218,6 +258,7 @@ if longSignal and canLong and slotOpen
     tp     = entryP + tpPts
     strategy.entry("Long", strategy.long)
     strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    longFired   := true
     tradesToday += 1
 
 if shortSignal and canShort and slotOpen
@@ -226,6 +267,7 @@ if shortSignal and canShort and slotOpen
     tp     = entryP - tpPts
     strategy.entry("Short", strategy.short)
     strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    shortFired  := true
     tradesToday += 1
 
 // Force-flat at session close
@@ -237,6 +279,7 @@ if flatBySessEnd and sessJustEnd and strategy.position_size != 0
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bgcolor(showSessBG and inSession ? color.new(color.teal, 92) : na, title="Trading Window")
+bgcolor(useNoTradeZone and inNoTradeZone ? color.new(color.gray, 80) : na, title="No-Trade Zone")
 
 // Draw the active up/down levels (these are the ones the strategy actually trades)
 plot(showLevels and not na(trackedUp) ? trackedUp : na, "Resistance (20/80)", color=color.new(color.red,  0),  linewidth=2, style=plot.style_linebr)
