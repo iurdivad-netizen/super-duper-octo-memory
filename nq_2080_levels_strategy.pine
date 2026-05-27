@@ -38,9 +38,14 @@ useNoTradeZone = input.bool(false, "Block Entries Between 80 and 20", group=grpL
 ntzPaddingPts  = input.float(0.0, "No-Trade Zone Padding (pts)", minval=0.0, maxval=20.0, step=0.5, group=grpLevels,
                   tooltip="Extra points added inside the band on each side. 0 = exact 80↔20 boundary.")
 
-// Session — NQ trades on CME, so use exchange (CT) time. Default 0830-1000 CT = 0930-1100 ET.
-tradeSession = input.session("0830-1000", "Trading Window (Exchange TZ)", group=grpSess,
-                  tooltip="NQ futures use CME (Chicago) time. 0830-1000 CT = 9:30am-11:00am ET. If your chart is on Eastern time, change to 0930-1100.")
+// Session — explicit timezone so it isn't tied to whatever syminfo.timezone
+// reports for the futures contract. Default 0930-1100 New York time =
+// the user's intended 9:30am-11:00am ET window.
+tradeSession = input.session("0930-1100", "Trading Window", group=grpSess,
+                  tooltip="Times are evaluated in the timezone selected below — not the chart's display timezone and not syminfo.timezone. Default 0930-1100 in America/New_York = 9:30am-11:00am ET.")
+sessTZ       = input.string("America/New_York", "Session Timezone",
+                  options=["America/New_York", "America/Chicago", "UTC", "Exchange"], group=grpSess,
+                  tooltip="Which timezone the Trading Window string above is evaluated in. 'Exchange' uses syminfo.timezone for the symbol (can vary).")
 flatBySessEnd = input.bool(true, "Flatten at Session Close", group=grpSess,
                   tooltip="Close any open trade when the trading window ends.")
 
@@ -70,7 +75,8 @@ showLabels   = input.bool(true,  "Show Level Labels", group=grpDisp)
 // SESSION / DAY HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-inSession   = not na(time("", tradeSession))
+resolvedTZ  = sessTZ == "Exchange" ? syminfo.timezone : sessTZ
+inSession   = not na(time(timeframe.period, tradeSession, resolvedTZ))
 sessJustEnd = inSession[1] and not inSession
 isNewDay    = ta.change(time("D")) != 0
 
@@ -279,7 +285,7 @@ if flatBySessEnd and sessJustEnd and strategy.position_size != 0
 // ═══════════════════════════════════════════════════════════════════════════════
 
 bgcolor(showSessBG and inSession ? color.new(color.teal, 92) : na, title="Trading Window")
-bgcolor(useNoTradeZone and inNoTradeZone ? color.new(color.gray, 80) : na, title="No-Trade Zone")
+bgcolor(useNoTradeZone and inNoTradeZone and inSession ? color.new(color.gray, 80) : na, title="No-Trade Zone")
 
 // Draw the active up/down levels (these are the ones the strategy actually trades)
 plot(showLevels and not na(trackedUp) ? trackedUp : na, "Resistance (20/80)", color=color.new(color.red,  0),  linewidth=2, style=plot.style_linebr)
@@ -360,7 +366,7 @@ if barstate.islast
                text_color=color.aqua, text_size=size.small, bgcolor=bg)
 
     table.cell(t, 0, 4, "Session", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 4, tradeSession + (inSession ? "  (LIVE)" : ""),
+    table.cell(t, 1, 4, tradeSession + " " + resolvedTZ + (inSession ? "  (LIVE)" : ""),
                text_color=inSession ? color.lime : color.gray, text_size=size.small, bgcolor=bg)
 
     table.cell(t, 0, 5, "Trades Today", text_color=tCol0, text_size=size.small, bgcolor=bg)
