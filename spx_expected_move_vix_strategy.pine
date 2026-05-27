@@ -109,6 +109,9 @@ float  i_widthPts    = input.float(5.0, "Spread width (points)",
      minval = 0.1, step = 0.5,
      tooltip = "Distance between short and long strike. Max loss = width − credit, booked on a LOSS.",
      group = "Strategy / P&L")
+bool   i_autoCredit  = input.bool(true, "Auto-derive credit from breach probability",
+     tooltip = "ON (no-arbitrage): each trade's credit = P(breach) × width, where P(breach) is the normal-CDF probability the strike is breached given the VIX-implied move over the hold. The table then reflects fair-value pricing — expected P&L per trade is ~0 minus realized vs implied vol drift (the volatility risk premium). OFF: use the fixed 'Credit received' input for every trade (legacy behavior).",
+     group = "Strategy / P&L")
 string i_dirSide     = input.string("Put spread (long SPX)", "Directional side",
      options = ["Put spread (long SPX)", "Call spread (short SPX)"],
      tooltip = "Which spread's directional bias to trade in the 'Directional underlying' model. Put credit spread = bullish = long; call credit spread = bearish = short.",
@@ -181,6 +184,20 @@ scaleFreqFor(tf) =>
 
 scaleFreq = scaleFreqFor(emTFeff)
 
+// Standard-normal CDF (Abramowitz & Stegun 7.1.26, erf form). ~1.5e-7 accuracy.
+ncdf(x) =>
+    a1 =  0.254829592
+    a2 = -0.284496736
+    a3 =  1.421413741
+    a4 = -1.453152027
+    a5 =  1.061405429
+    pp =  0.3275911
+    sgn = x < 0.0 ? -1.0 : 1.0
+    ax  = math.abs(x) / math.sqrt(2.0)
+    t   = 1.0 / (1.0 + pp * ax)
+    y   = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * math.exp(-ax * ax)
+    0.5 * (1.0 + sgn * y)
+
 probPercMove = vixData / scaleFreq
 
 // Band anchor: the displayed band only. 'EM timeframe close' uses the prior
@@ -214,6 +231,19 @@ cOffNow = i_cOffsetMode == "Points" ? i_cOffsetPts : i_cOffsetMode == "% of pric
 pStrikeNow = close * (1 - emHold / 100) - pOffNow
 cStrikeNow = close * (1 + emHold / 100) + cOffNow
 
+// Per-bar fair credit (no-arbitrage): credit = P(strike breached) × width.
+// Strike distance from close in σ units, where σ = emHold (the implied move
+// over the holding window in percent). For the put, breach prob = Φ(-z); for
+// the call, P(close > upper strike) is symmetric, = Φ(-z).
+pStrikeDistPct = emHold + (close > 0 ? pOffNow / close * 100.0 : 0.0)
+cStrikeDistPct = emHold + (close > 0 ? cOffNow / close * 100.0 : 0.0)
+pBreachProb    = emHold > 0 ? 1.0 - ncdf(pStrikeDistPct / emHold) : na
+cBreachProb    = emHold > 0 ? 1.0 - ncdf(cStrikeDistPct / emHold) : na
+pFairCreditNow = na(pBreachProb) ? na : pBreachProb * i_widthPts
+cFairCreditNow = na(cBreachProb) ? na : cBreachProb * i_widthPts
+pCreditNow     = i_autoCredit ? pFairCreditNow : i_creditPts
+cCreditNow     = i_autoCredit ? cFairCreditNow : i_creditPts
+
 var int   cTotal   = 0
 var int   cWin      = 0
 var int   cTotalC  = 0
@@ -222,11 +252,10 @@ var float pHold    = na      // non-overlap: strike held flat for the trade
 var float cHold    = na
 var int   holdLeft = 0       // non-overlap: bars remaining until expiry
 
-// Capped P&L accounting (always computed; binary option model)
-float maxLossPts = i_widthPts - i_creditPts
-isCapped        = i_pnlModel == "Capped spread P&L"
-int   creditTicks = int(math.max(1, math.round(i_creditPts / syminfo.mintick)))
-int   lossTicks   = int(math.max(1, math.round(maxLossPts  / syminfo.mintick)))
+// Capped P&L accounting (always computed; binary option model).
+// Credit and max-loss are per-trade when i_autoCredit is on, so the fixed
+// width-derived constants below are only the fallback (autoCredit OFF).
+isCapped = i_pnlModel == "Capped spread P&L"
 var float netP   = 0.0       // PCS net P&L in points
 var float netC   = 0.0       // CCS net P&L in points
 var float gwP    = 0.0       // PCS gross winning points
@@ -246,70 +275,92 @@ bool ccsLoss = false
 // Overlapping: resolve the trade that was opened i_drift bars ago.
 ovResolvable = i_everyBar and barstate.isconfirmed and withinLookback and bar_index >= i_drift and not na(pStrikeNow[i_drift])
 if ovResolvable
+    tradeCreditP  = i_autoCredit ? pCreditNow[i_drift] : i_creditPts
+    tradeMaxLossP = i_widthPts - tradeCreditP
     pcsWin  := close >  pStrikeNow[i_drift]
     pcsLoss := close <= pStrikeNow[i_drift]
     cTotal  += 1
     cWin    += pcsWin ? 1 : 0
-    netP    += pcsWin ? i_creditPts : -maxLossPts
-    gwP     += pcsWin ? i_creditPts : 0.0
-    glP     += pcsWin ? 0.0 : maxLossPts
+    netP    += pcsWin ? tradeCreditP : -tradeMaxLossP
+    gwP     += pcsWin ? tradeCreditP : 0.0
+    glP     += pcsWin ? 0.0 : tradeMaxLossP
     peakP   := math.max(peakP, netP)
     ddP     := math.max(ddP, peakP - netP)
     if isCapped and i_nativeOrders
         pid = "P" + str.tostring(bar_index)
+        cTicks = int(math.max(1, math.round(tradeCreditP  / syminfo.mintick)))
+        lTicks = int(math.max(1, math.round(tradeMaxLossP / syminfo.mintick)))
         strategy.entry(pid, strategy.long)
-        strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? creditTicks : na, loss = pcsWin ? na : lossTicks)
+        strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? cTicks : na, loss = pcsWin ? na : lTicks)
     if i_ccsEnable
+        tradeCreditC  = i_autoCredit ? cCreditNow[i_drift] : i_creditPts
+        tradeMaxLossC = i_widthPts - tradeCreditC
         ccsWin  := close <  cStrikeNow[i_drift]
         ccsLoss := close >= cStrikeNow[i_drift]
         cTotalC += 1
         cWinC   += ccsWin ? 1 : 0
-        netC    += ccsWin ? i_creditPts : -maxLossPts
-        gwC     += ccsWin ? i_creditPts : 0.0
-        glC     += ccsWin ? 0.0 : maxLossPts
+        netC    += ccsWin ? tradeCreditC : -tradeMaxLossC
+        gwC     += ccsWin ? tradeCreditC : 0.0
+        glC     += ccsWin ? 0.0 : tradeMaxLossC
         peakC   := math.max(peakC, netC)
         ddC     := math.max(ddC, peakC - netC)
         if isCapped and i_nativeOrders
             cid = "C" + str.tostring(bar_index)
+            cTicks = int(math.max(1, math.round(tradeCreditC  / syminfo.mintick)))
+            lTicks = int(math.max(1, math.round(tradeMaxLossC / syminfo.mintick)))
             strategy.entry(cid, strategy.long)
-            strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
+            strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? cTicks : na, loss = ccsWin ? na : lTicks)
 
 // Non-overlapping: one trade at a time, rolled at expiry.
+// pCreditHold/cCreditHold snapshot the per-trade credit at arm time so the
+// resolution uses the strike's breach probability as seen at entry, not now.
+var float pCreditHold = na
+var float cCreditHold = na
 if (not i_everyBar) and barstate.isconfirmed and withinLookback and not na(probPercMove)
     if holdLeft > 0
         holdLeft -= 1
         if holdLeft == 0
+            tradeCreditP  = i_autoCredit ? pCreditHold : i_creditPts
+            tradeMaxLossP = i_widthPts - tradeCreditP
             pcsWin  := close >  pHold
             pcsLoss := close <= pHold
             cTotal  += 1
             cWin    += pcsWin ? 1 : 0
-            netP    += pcsWin ? i_creditPts : -maxLossPts
-            gwP     += pcsWin ? i_creditPts : 0.0
-            glP     += pcsWin ? 0.0 : maxLossPts
+            netP    += pcsWin ? tradeCreditP : -tradeMaxLossP
+            gwP     += pcsWin ? tradeCreditP : 0.0
+            glP     += pcsWin ? 0.0 : tradeMaxLossP
             peakP   := math.max(peakP, netP)
             ddP     := math.max(ddP, peakP - netP)
             if isCapped and i_nativeOrders
                 pid = "P" + str.tostring(bar_index)
+                cTicks = int(math.max(1, math.round(tradeCreditP  / syminfo.mintick)))
+                lTicks = int(math.max(1, math.round(tradeMaxLossP / syminfo.mintick)))
                 strategy.entry(pid, strategy.long)
-                strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? creditTicks : na, loss = pcsWin ? na : lossTicks)
+                strategy.exit("x" + pid, from_entry = pid, profit = pcsWin ? cTicks : na, loss = pcsWin ? na : lTicks)
             if i_ccsEnable
+                tradeCreditC  = i_autoCredit ? cCreditHold : i_creditPts
+                tradeMaxLossC = i_widthPts - tradeCreditC
                 ccsWin  := close <  cHold
                 ccsLoss := close >= cHold
                 cTotalC += 1
                 cWinC   += ccsWin ? 1 : 0
-                netC    += ccsWin ? i_creditPts : -maxLossPts
-                gwC     += ccsWin ? i_creditPts : 0.0
-                glC     += ccsWin ? 0.0 : maxLossPts
+                netC    += ccsWin ? tradeCreditC : -tradeMaxLossC
+                gwC     += ccsWin ? tradeCreditC : 0.0
+                glC     += ccsWin ? 0.0 : tradeMaxLossC
                 peakC   := math.max(peakC, netC)
                 ddC     := math.max(ddC, peakC - netC)
                 if isCapped and i_nativeOrders
                     cid = "C" + str.tostring(bar_index)
+                    cTicks = int(math.max(1, math.round(tradeCreditC  / syminfo.mintick)))
+                    lTicks = int(math.max(1, math.round(tradeMaxLossC / syminfo.mintick)))
                     strategy.entry(cid, strategy.long)
-                    strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? creditTicks : na, loss = ccsWin ? na : lossTicks)
+                    strategy.exit("x" + cid, from_entry = cid, profit = ccsWin ? cTicks : na, loss = ccsWin ? na : lTicks)
     if holdLeft == 0
-        pHold    := pStrikeNow
-        cHold    := cStrikeNow
-        holdLeft := i_drift
+        pHold       := pStrikeNow
+        cHold       := cStrikeNow
+        pCreditHold := pCreditNow
+        cCreditHold := cCreditNow
+        holdLeft    := i_drift
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Native orders — "Directional underlying" model only.
