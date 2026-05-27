@@ -1,0 +1,338 @@
+//@version=5
+strategy("NQ 20/80 Round-Number S/R – Breakout & Retest",
+         overlay=true,
+         default_qty_type=strategy.fixed,
+         default_qty_value=1,
+         pyramiding=0,
+         commission_type=strategy.commission.cash_per_contract,
+         commission_value=2.50,
+         slippage=2,
+         calc_on_every_tick=false,
+         process_orders_on_close=true)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+grpLevels  = "20 / 80 Levels"
+grpSess    = "Session"
+grpEntry   = "Entry"
+grpRisk    = "Risk (NQ points)"
+grpDisp    = "Display"
+
+// Round-number levels — defaults to NQ's classic 20 / 80 "magnet" prints
+levelA       = input.int(20, "Lower Level (mod 100)", minval=0, maxval=99, group=grpLevels,
+                  tooltip="The 'tens' digit at which a horizontal support/resistance is drawn inside every 100-point block. Default 20.")
+levelB       = input.int(80, "Upper Level (mod 100)", minval=0, maxval=99, group=grpLevels,
+                  tooltip="Second horizontal S/R inside every 100-point block. Default 80.")
+levelsAbove  = input.int(3, "Levels Drawn Above Price", minval=1, maxval=10, group=grpLevels)
+levelsBelow  = input.int(3, "Levels Drawn Below Price", minval=1, maxval=10, group=grpLevels)
+proximityPts = input.float(8.0, "Active-Level Proximity (pts)", minval=1.0, maxval=30.0, step=0.5, group=grpLevels,
+                  tooltip="Only levels within this many points of price are eligible to trade. Keeps the strategy from arming on far-away lines.")
+
+// Session — NQ trades on CME, so use exchange (CT) time. Default 0830-1000 CT = 0930-1100 ET.
+tradeSession = input.session("0830-1000", "Trading Window (Exchange TZ)", group=grpSess,
+                  tooltip="NQ futures use CME (Chicago) time. 0830-1000 CT = 9:30am-11:00am ET. If your chart is on Eastern time, change to 0930-1100.")
+flatBySessEnd = input.bool(true, "Flatten at Session Close", group=grpSess,
+                  tooltip="Close any open trade when the trading window ends.")
+
+// Entry
+entryMode    = input.string("Break & Retest", "Entry Mode",
+                  options=["Breakout", "Break & Retest", "Both"], group=grpEntry,
+                  tooltip="Breakout: enter on first confirmed close beyond the level.\nBreak & Retest: wait for price to push away, return to the level, and hold.\nBoth: take whichever signal comes first per level.")
+confirmBars  = input.int(1, "Breakout Confirmation Candles", minval=1, maxval=3, group=grpEntry)
+retestTolPts = input.float(3.0, "Retest Tolerance (pts)", minval=0.5, maxval=15.0, step=0.5, group=grpEntry,
+                  tooltip="How close price must return to the broken level to arm the retest.")
+pullAwayPts  = input.float(5.0, "Min Pull-Away After Break (pts)", minval=1.0, maxval=30.0, step=0.5, group=grpEntry,
+                  tooltip="Price must travel at least this far past the level before a retest can be considered.")
+tradeDir     = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"], group=grpEntry)
+maxTradesDay = input.int(2, "Max Trades per Day", minval=1, maxval=10, group=grpEntry)
+
+// Risk — fixed point distances per the user's spec
+slPts        = input.float(10.0, "Stop Loss (pts)", minval=1.0, step=0.5, group=grpRisk)
+tpPts        = input.float(20.0, "Take Profit (pts)", minval=1.0, step=0.5, group=grpRisk)
+
+// Display
+showLevels   = input.bool(true,  "Show 20/80 Levels", group=grpDisp)
+showSessBG   = input.bool(true,  "Highlight Trading Window", group=grpDisp)
+showSignals  = input.bool(true,  "Show Entry Markers", group=grpDisp)
+showLabels   = input.bool(true,  "Show Level Labels", group=grpDisp)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SESSION / DAY HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+inSession   = not na(time("", tradeSession))
+sessJustEnd = inSession[1] and not inSession
+isNewDay    = ta.change(time("D")) != 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 20 / 80 LEVEL GRID
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Build a sorted ladder of S/R lines around the current price.  For each
+// 100-point block we add two lines: one at (block + levelA) and one at
+// (block + levelB).  The ladder is recalculated on every bar so it follows
+// price across day-to-day drift.
+
+f_buildLadder() =>
+    nearestBlock = math.floor(close / 100.0) * 100.0
+    arr = array.new<float>()
+    for i = -levelsBelow to levelsAbove
+        base = nearestBlock + i * 100.0
+        array.push(arr, base + levelA)
+        array.push(arr, base + levelB)
+    array.sort(arr, order.ascending)
+    arr
+
+levels = f_buildLadder()
+
+// Nearest level above & below price
+f_nearestAbove(arr, p) =>
+    float best = na
+    n = array.size(arr)
+    for i = 0 to n - 1
+        v = array.get(arr, i)
+        if v > p and (na(best) or v < best)
+            best := v
+    best
+
+f_nearestBelow(arr, p) =>
+    float best = na
+    n = array.size(arr)
+    for i = 0 to n - 1
+        v = array.get(arr, i)
+        if v < p and (na(best) or v > best)
+            best := v
+    best
+
+upLevel = f_nearestAbove(levels, close)   // resistance candidate
+dnLevel = f_nearestBelow(levels, close)   // support candidate
+
+// Eligible only if price is within proximity of the level
+upActive = not na(upLevel) and (upLevel - close) <= proximityPts
+dnActive = not na(dnLevel) and (close - dnLevel) <= proximityPts
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE MACHINE  —  per-level, per-side, reset each day
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// We lock onto ONE upside level and ONE downside level at a time (the closest).
+// If price moves to a new closest level, the state for that side resets.
+//
+// Long side workflow (breaking ABOVE upLevel):
+//   watching → break (close > level for confirmBars) → pull-away (high ≥ level + pullAwayPts)
+//   → retest armed (low ≤ level + retestTolPts) → retest fires (close > level)
+//
+// Short side mirrors below dnLevel.
+
+var float trackedUp        = na
+var float trackedDn        = na
+var int   longCount        = 0
+var int   shortCount       = 0
+var bool  longBroke        = false
+var bool  shortBroke       = false
+var bool  longPulledAway   = false
+var bool  shortPulledAway  = false
+var bool  longRetestArmed  = false
+var bool  shortRetestArmed = false
+var int   tradesToday      = 0
+
+if isNewDay
+    tradesToday := 0
+
+// Reset upside state if the tracked level changed
+if not na(upLevel) and (na(trackedUp) or upLevel != trackedUp)
+    trackedUp        := upLevel
+    longCount        := 0
+    longBroke        := false
+    longPulledAway   := false
+    longRetestArmed  := false
+
+// Reset downside state if the tracked level changed
+if not na(dnLevel) and (na(trackedDn) or dnLevel != trackedDn)
+    trackedDn        := dnLevel
+    shortCount       := 0
+    shortBroke       := false
+    shortPulledAway  := false
+    shortRetestArmed := false
+
+// Update state only while in the trading window
+if inSession
+
+    // ── Long side  (breaking above trackedUp) ─────────────────────────────────
+    if not na(trackedUp)
+        if not longBroke
+            longCount := close > trackedUp ? longCount + 1 : 0
+            if longCount >= confirmBars
+                longBroke := true
+        else
+            if not longPulledAway
+                if high >= trackedUp + pullAwayPts
+                    longPulledAway := true
+            else if not longRetestArmed
+                if low <= trackedUp + retestTolPts
+                    longRetestArmed := true
+
+    // ── Short side  (breaking below trackedDn) ────────────────────────────────
+    if not na(trackedDn)
+        if not shortBroke
+            shortCount := close < trackedDn ? shortCount + 1 : 0
+            if shortCount >= confirmBars
+                shortBroke := true
+        else
+            if not shortPulledAway
+                if low <= trackedDn - pullAwayPts
+                    shortPulledAway := true
+            else if not shortRetestArmed
+                if high >= trackedDn - retestTolPts
+                    shortRetestArmed := true
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY SIGNALS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+useBreakout = entryMode == "Breakout"        or entryMode == "Both"
+useRetest   = entryMode == "Break & Retest"  or entryMode == "Both"
+
+longBreakoutBar  = inSession and upActive and longBroke  and not longBroke[1]
+shortBreakoutBar = inSession and dnActive and shortBroke and not shortBroke[1]
+
+longRetestBar    = inSession and upActive and longRetestArmed  and close > trackedUp
+shortRetestBar   = inSession and dnActive and shortRetestArmed and close < trackedDn
+
+longSignal  = (useBreakout and longBreakoutBar)  or (useRetest and longRetestBar)
+shortSignal = (useBreakout and shortBreakoutBar) or (useRetest and shortRetestBar)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDER MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+canLong  = tradeDir != "Short Only"
+canShort = tradeDir != "Long Only"
+slotOpen = strategy.position_size == 0 and tradesToday < maxTradesDay and inSession
+
+if longSignal and canLong and slotOpen
+    entryP = close
+    sl     = entryP - slPts
+    tp     = entryP + tpPts
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=sl, limit=tp)
+    tradesToday += 1
+
+if shortSignal and canShort and slotOpen
+    entryP = close
+    sl     = entryP + slPts
+    tp     = entryP - tpPts
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=sl, limit=tp)
+    tradesToday += 1
+
+// Force-flat at session close
+if flatBySessEnd and sessJustEnd and strategy.position_size != 0
+    strategy.close_all(comment="Session End")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bgcolor(showSessBG and inSession ? color.new(color.teal, 92) : na, title="Trading Window")
+
+// Draw the active up/down levels (these are the ones the strategy actually trades)
+plot(showLevels and not na(trackedUp) ? trackedUp : na, "Resistance (20/80)", color=color.new(color.red,  0),  linewidth=2, style=plot.style_linebr)
+plot(showLevels and not na(trackedDn) ? trackedDn : na, "Support (20/80)",    color=color.new(color.lime, 0),  linewidth=2, style=plot.style_linebr)
+
+// Shade the proximity zone so it's clear when a level is "in play"
+upZoneTop = not na(trackedUp) ? trackedUp + proximityPts : na
+upZoneBot = not na(trackedUp) ? trackedUp - proximityPts : na
+dnZoneTop = not na(trackedDn) ? trackedDn + proximityPts : na
+dnZoneBot = not na(trackedDn) ? trackedDn - proximityPts : na
+
+pUT = plot(showLevels ? upZoneTop : na, "", color=color.new(color.red, 100), display=display.none)
+pUB = plot(showLevels ? upZoneBot : na, "", color=color.new(color.red, 100), display=display.none)
+pDT = plot(showLevels ? dnZoneTop : na, "", color=color.new(color.lime, 100), display=display.none)
+pDB = plot(showLevels ? dnZoneBot : na, "", color=color.new(color.lime, 100), display=display.none)
+fill(pUT, pUB, color=color.new(color.red,  92), title="Resistance Zone")
+fill(pDT, pDB, color=color.new(color.lime, 92), title="Support Zone")
+
+// Entry markers
+plotshape(showSignals and longSignal  and canLong  and slotOpen, "Long Entry",
+          shape.triangleup,   location.belowbar, color.new(color.lime, 0), size=size.small)
+plotshape(showSignals and shortSignal and canShort and slotOpen, "Short Entry",
+          shape.triangledown, location.abovebar, color.new(color.red,  0), size=size.small)
+
+// State indicators (informational — no trade fires here)
+plotshape(showSignals and longBroke   and not longBroke[1]   and inSession, "Long Break",
+          shape.diamond, location.abovebar, color.new(color.lime, 60), size=size.tiny)
+plotshape(showSignals and shortBroke  and not shortBroke[1]  and inSession, "Short Break",
+          shape.diamond, location.belowbar, color.new(color.red,  60), size=size.tiny)
+plotshape(showSignals and longRetestArmed  and not longRetestArmed[1]  and inSession, "Long Retest Armed",
+          shape.xcross, location.belowbar, color.new(color.aqua,    50), size=size.tiny)
+plotshape(showSignals and shortRetestArmed and not shortRetestArmed[1] and inSession, "Short Retest Armed",
+          shape.xcross, location.abovebar, color.new(color.fuchsia, 50), size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LEVEL LABELS  (drawn on the last bar to avoid clutter)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if showLabels and barstate.islast
+    lx = bar_index + 2
+    n  = array.size(levels)
+    for i = 0 to n - 1
+        v = array.get(levels, i)
+        digits  = math.round(v) % 100
+        isLvlA  = digits == levelA
+        col     = isLvlA ? color.orange : color.yellow
+        label.new(lx, v,
+             str.tostring(digits, "00") + "  " + str.tostring(v, "#"),
+             color=color.new(col, 80),
+             textcolor=col,
+             style=label.style_label_left,
+             size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INFO TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table t = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(color.black, 60), border_width=1, border_color=color.new(color.gray, 50))
+
+tCol0 = color.new(color.silver, 0)
+bg    = color.new(color.black, 70)
+
+if barstate.islast
+    table.cell(t, 0, 0, "Resistance", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 0, na(trackedUp) ? "—" : str.tostring(trackedUp, "#.##"),
+               text_color=color.red, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 1, "Support", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 1, na(trackedDn) ? "—" : str.tostring(trackedDn, "#.##"),
+               text_color=color.lime, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 2, "Entry Mode", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 2, entryMode, text_color=color.aqua, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 3, "SL / TP (pts)", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 3, str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#"),
+               text_color=color.aqua, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 4, "Session", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 4, tradeSession + (inSession ? "  (LIVE)" : ""),
+               text_color=inSession ? color.lime : color.gray, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 5, "Trades Today", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay),
+               text_color=color.aqua, text_size=size.small, bgcolor=bg)
+
+    longPhase  = na(trackedUp) ? "—" : not longBroke ? "watching" : not longPulledAway ? "broke – pull away" : not longRetestArmed ? "pulled – retest?" : "retest armed"
+    shortPhase = na(trackedDn) ? "—" : not shortBroke ? "watching" : not shortPulledAway ? "broke – pull away" : not shortRetestArmed ? "pulled – retest?" : "retest armed"
+
+    table.cell(t, 0, 6, "Long Phase",  text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 6, longPhase,
+               text_color=longRetestArmed ? color.aqua : longBroke ? color.yellow : color.gray,
+               text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 7, "Short Phase", text_color=tCol0, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 7, shortPhase,
+               text_color=shortRetestArmed ? color.fuchsia : shortBroke ? color.yellow : color.gray,
+               text_size=size.small, bgcolor=bg)
