@@ -120,8 +120,14 @@ f_nearestBelow(arr, p) =>
             best := v
     best
 
-upLevel = f_nearestAbove(levels, close)   // resistance candidate (live)
-dnLevel = f_nearestBelow(levels, close)   // support candidate (live)
+// Reference the PRIOR bar's close so a level doesn't get re-mapped to the
+// next line up/down on the exact bar that price crosses it. Without this,
+// when close pierces e.g. 30080, nearestAbove(close) returns 30120 the same
+// bar, trackedUp gets relocked to 30120, and `close > trackedUp` evaluates
+// false → the break is never registered.
+priceRef = na(close[1]) ? close : close[1]
+upLevel  = f_nearestAbove(levels, priceRef)   // resistance candidate
+dnLevel  = f_nearestBelow(levels, priceRef)   // support candidate
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STATE MACHINE  —  per-level, per-side, reset each day
