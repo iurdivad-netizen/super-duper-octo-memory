@@ -245,6 +245,25 @@ if isNewDay or not inSession
     shortFired       := false
     shortCount       := 0
 
+// Abandon stale break — if a break fired but no trade was taken (quality /
+// trend filters blocked it) and price has retraced past the level by more
+// than the stop distance, treat the break as failed so trackedUp / trackedDn
+// can re-anchor to the next nearby level. Without this the level stays
+// locked for the rest of the session, leaving the red/green line stranded
+// far above/below current price.
+abandonDistPts = slPts
+if longBroke and not longFired and not na(trackedUp) and close < trackedUp - abandonDistPts
+    longBroke        := false
+    longPulledAway   := false
+    longRetestArmed  := false
+    longCount        := 0
+
+if shortBroke and not shortFired and not na(trackedDn) and close > trackedDn + abandonDistPts
+    shortBroke       := false
+    shortPulledAway  := false
+    shortRetestArmed := false
+    shortCount       := 0
+
 // Update trackedUp only while no break is in progress (or after a trade fired
 // and we're free to look for the next level). This keeps the retest state
 // machine anchored to the level it actually broke.
