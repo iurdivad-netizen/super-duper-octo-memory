@@ -7,8 +7,7 @@ strategy("NQ 20/80 Round-Number S/R – Breakout & Retest",
          commission_type=strategy.commission.cash_per_contract,
          commission_value=2.50,
          slippage=2,
-         calc_on_every_tick=false,
-         process_orders_on_close=true)
+         calc_on_every_tick=false)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INPUTS
@@ -18,6 +17,7 @@ grpLevels  = "20 / 80 Levels"
 grpSess    = "Session"
 grpEntry   = "Entry"
 grpTrend   = "Trend Filter"
+grpQuality = "Quality Filters"
 grpRisk    = "Risk (NQ points)"
 grpDisp    = "Display"
 grpTable   = "Status Table"
@@ -86,6 +86,28 @@ useSlope     = input.bool(false, "Require EMA Slope", group=grpTrend,
                   tooltip="EMA must be sloping in the trade's direction over the last N bars.")
 slopeLook    = input.int(5, "Slope Lookback (bars)", minval=2, maxval=30, group=grpTrend)
 
+// ── Quality filters — kill noise / chop trades. Each toggle gates ALL entries.
+useATR       = input.bool(true, "ATR Volatility Floor", group=grpQuality,
+                  tooltip="Skip entries when ATR is below a minimum — keeps the strategy out of dead, choppy ranges.")
+atrLen       = input.int(14, "ATR Length", minval=2, maxval=100, group=grpQuality)
+atrMinPts    = input.float(4.0, "Min ATR (pts)", minval=0.5, maxval=50.0, step=0.5, group=grpQuality,
+                  tooltip="Entries only fire when ATR ≥ this many NQ points. 1-min default around 4 keeps you out of dead tape.")
+
+useStrong    = input.bool(true, "Require Strong Break Candle", group=grpQuality,
+                  tooltip="Breakout candle must close at least N pts beyond the level and have a body that takes up most of its range.")
+minPenPts    = input.float(2.0, "Min Penetration Beyond Level (pts)", minval=0.0, maxval=20.0, step=0.5, group=grpQuality,
+                  tooltip="Filters fake breaks where price barely tips past the level. 0 = off.")
+minBodyPct   = input.float(50.0, "Min Body % of Candle Range", minval=0.0, maxval=100.0, step=5.0, group=grpQuality,
+                  tooltip="Body / range %. 50% keeps doji-style fake breaks out. 0 = off.")
+
+useCooldown  = input.bool(true, "Cool-Down After Loss", group=grpQuality,
+                  tooltip="After a losing trade, block new entries for N minutes to avoid revenge / repeat false breaks.")
+cooldownMins = input.int(10, "Cool-Down (mins)", minval=1, maxval=120, group=grpQuality)
+
+useWarmup    = input.bool(true, "Skip First N Minutes of Session", group=grpQuality,
+                  tooltip="The opening minutes are usually the choppiest. Block entries during the warm-up.")
+warmupMins   = input.int(5, "Warm-Up (mins)", minval=0, maxval=60, group=grpQuality)
+
 // Risk — fixed point distances per the user's spec
 slPts        = input.float(10.0, "Stop Loss (pts)", minval=1.0, step=0.5, group=grpRisk)
 tpPts        = input.float(20.0, "Take Profit (pts)", minval=1.0, step=0.5, group=grpRisk)
@@ -116,6 +138,7 @@ rowSess       = input.bool(true,  "Row: Session",              group=grpTable)
 rowTrades     = input.bool(true,  "Row: Trades Today",         group=grpTable)
 rowPhases     = input.bool(true,  "Row: Long / Short Phase",   group=grpTable)
 rowTrend      = input.bool(true,  "Row: Trend Filter Status",  group=grpTable)
+rowQuality    = input.bool(true,  "Row: Quality Filter Status",group=grpTable)
 rowPnL        = input.bool(false, "Row: Strategy P&L",         group=grpTable)
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -358,8 +381,34 @@ shortTrendOK = (not useEMA      or close < emaVal)              and
                (not useOpenBias or orBiasShort)                 and
                (not useSlope    or emaSlopeDn)
 
-longSignal  := longSignal  and not inNoTradeZone and not longFired  and longTrendOK
-shortSignal := shortSignal and not inNoTradeZone and not shortFired and shortTrendOK
+// ── Quality filters ─────────────────────────────────────────────────────────
+atrVal     = ta.atr(atrLen)
+atrOK      = not useATR or (not na(atrVal) and atrVal >= atrMinPts)
+
+candleRng  = high - low
+candleBody = math.abs(close - open)
+bodyOK     = not useStrong or (candleRng > 0 and (candleBody / candleRng * 100.0) >= minBodyPct)
+
+longPenOK  = not useStrong or (not na(trackedUp) and close >= trackedUp + minPenPts)
+shortPenOK = not useStrong or (not na(trackedDn) and close <= trackedDn - minPenPts)
+
+// Cool-down — track last loss timestamp; block entries until cooldownMins have passed.
+var int  lastLossT = na
+var int  lastTrades = 0
+if strategy.closedtrades > lastTrades
+    // A trade just closed — record its exit time if it was a loser.
+    if strategy.closedtrades.profit(strategy.closedtrades - 1) < 0
+        lastLossT := time
+    lastTrades := strategy.closedtrades
+cooldownOK = not useCooldown or na(lastLossT) or (time - lastLossT) >= cooldownMins * 60 * 1000
+
+// Warm-up — skip first warmupMins of the trading window.
+warmupOK   = not useWarmup or na(orStartT) or (time - orStartT) >= warmupMins * 60 * 1000
+
+qualityOK  = atrOK and bodyOK and cooldownOK and warmupOK
+
+longSignal  := longSignal  and not inNoTradeZone and not longFired  and longTrendOK  and qualityOK and longPenOK
+shortSignal := shortSignal and not inNoTradeZone and not shortFired and shortTrendOK and qualityOK and shortPenOK
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ORDER MANAGEMENT
@@ -480,7 +529,7 @@ f_sz(s) =>
         "Huge"   => size.huge
         => size.small
 
-var table t = table.new(f_pos(tablePosStr), 2, 12,
+var table t = table.new(f_pos(tablePosStr), 2, 14,
      bgcolor=color.new(color.black, tableBgOpacity),
      border_width=tableBorder ? 1 : 0,
      border_color=color.new(color.gray, 50))
@@ -494,7 +543,7 @@ f_row(r, label_, value, valColor) =>
     table.cell(t, 1, r, value,  text_color=valColor, text_size=tSize, bgcolor=bg)
 
 if showTable and barstate.islast
-    table.clear(t, 0, 0, 1, 11)
+    table.clear(t, 0, 0, 1, 13)
     int r = 0
 
     if rowSR
@@ -550,6 +599,18 @@ if showTable and barstate.islast
                      shortTrendOK and not longTrendOK ? color.red  :
                      longTrendOK and shortTrendOK     ? color.aqua : color.orange
         f_row(r, "Trend (" + filtersOn + ")", trendStr, trendCol)
+        r += 1
+
+    if rowQuality
+        qFlags = (useATR ? "ATR " : "") + (useStrong ? "Str " : "") + (useCooldown ? "CD " : "") + (useWarmup ? "Warm " : "")
+        qStr   = qFlags == "" ? "off" :
+                  not atrOK      ? "ATR low" :
+                  not warmupOK   ? "warmup"  :
+                  not cooldownOK ? "cooldown":
+                  not bodyOK     ? "weak candle" :
+                  "ok"
+        qCol   = qFlags == "" ? color.gray : qualityOK ? color.lime : color.orange
+        f_row(r, "Quality (" + qFlags + ")", qStr + "  ATR=" + str.tostring(atrVal, "#.#"), qCol)
         r += 1
 
     if rowPnL
