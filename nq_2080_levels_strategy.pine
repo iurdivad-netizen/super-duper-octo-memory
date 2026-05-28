@@ -17,8 +17,10 @@ strategy("NQ 20/80 Round-Number S/R – Breakout & Retest",
 grpLevels  = "20 / 80 Levels"
 grpSess    = "Session"
 grpEntry   = "Entry"
+grpTrend   = "Trend Filter"
 grpRisk    = "Risk (NQ points)"
 grpDisp    = "Display"
+grpTable   = "Status Table"
 
 // Round-number levels — defaults to NQ's classic 20 / 80 "magnet" prints
 levelA       = input.int(20, "Lower Level (mod 100)", minval=0, maxval=99, group=grpLevels,
@@ -61,6 +63,29 @@ pullAwayPts  = input.float(5.0, "Min Pull-Away After Break (pts)", minval=1.0, m
 tradeDir     = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"], group=grpEntry)
 maxTradesDay = input.int(2, "Max Trades per Day", minval=1, maxval=10, group=grpEntry)
 
+// ── Trend / bias filters — gate entries to align with higher-level direction.
+// Combine as many as you like; ALL enabled filters must agree for a side to
+// fire. None enabled = unfiltered (legacy behaviour).
+useEMA       = input.bool(true, "EMA Trend Filter", group=grpTrend,
+                  tooltip="Only longs when close > EMA, only shorts when close < EMA. Computed on the chart timeframe.")
+emaLen       = input.int(50, "EMA Length", minval=2, maxval=400, group=grpTrend)
+
+useHTFEMA    = input.bool(false, "Higher-Timeframe EMA Filter", group=grpTrend,
+                  tooltip="Confirm with a longer-timeframe EMA. Avoids fighting the macro trend on a 1-min chart.")
+htfRes       = input.timeframe("15", "HTF Resolution", group=grpTrend)
+htfEmaLen    = input.int(50, "HTF EMA Length", minval=2, maxval=400, group=grpTrend)
+
+useVWAP      = input.bool(false, "VWAP Filter", group=grpTrend,
+                  tooltip="Only longs above session VWAP, only shorts below it.")
+
+useOpenBias  = input.bool(false, "Opening-Range Bias", group=grpTrend,
+                  tooltip="Lock direction from the first N minutes of the session: if the opening range closes up, only longs allowed; closes down, only shorts.")
+openMins     = input.int(15, "Opening Range (mins)", minval=1, maxval=60, group=grpTrend)
+
+useSlope     = input.bool(false, "Require EMA Slope", group=grpTrend,
+                  tooltip="EMA must be sloping in the trade's direction over the last N bars.")
+slopeLook    = input.int(5, "Slope Lookback (bars)", minval=2, maxval=30, group=grpTrend)
+
 // Risk — fixed point distances per the user's spec
 slPts        = input.float(10.0, "Stop Loss (pts)", minval=1.0, step=0.5, group=grpRisk)
 tpPts        = input.float(20.0, "Take Profit (pts)", minval=1.0, step=0.5, group=grpRisk)
@@ -70,6 +95,28 @@ showLevels   = input.bool(true,  "Show 20/80 Levels", group=grpDisp)
 showSessBG   = input.bool(true,  "Highlight Trading Window", group=grpDisp)
 showSignals  = input.bool(true,  "Show Entry Markers", group=grpDisp)
 showLabels   = input.bool(true,  "Show Level Labels", group=grpDisp)
+showTrendPlot= input.bool(false, "Plot Trend Filter Lines", group=grpDisp,
+                  tooltip="Overlays EMA / HTF EMA / VWAP on the chart when their filters are enabled.")
+
+// Status table customization
+showTable     = input.bool(true,  "Show Status Table", group=grpTable)
+tablePosStr   = input.string("Top Right", "Position",
+                  options=["Top Right", "Top Left", "Top Center", "Middle Right", "Middle Left",
+                           "Bottom Right", "Bottom Left", "Bottom Center"], group=grpTable)
+tableSizeStr  = input.string("Small", "Text Size",
+                  options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpTable)
+tableBgOpacity= input.int(60, "Background Opacity (%)", minval=0, maxval=100, group=grpTable,
+                  tooltip="0 = fully opaque background, 100 = fully transparent.")
+tableBorder   = input.bool(true, "Show Borders", group=grpTable)
+// Per-row toggles — turn off whatever you don't care to see
+rowSR         = input.bool(true,  "Row: Support / Resistance", group=grpTable)
+rowEntry      = input.bool(true,  "Row: Entry Mode",           group=grpTable)
+rowRisk       = input.bool(true,  "Row: SL / TP",              group=grpTable)
+rowSess       = input.bool(true,  "Row: Session",              group=grpTable)
+rowTrades     = input.bool(true,  "Row: Trades Today",         group=grpTable)
+rowPhases     = input.bool(true,  "Row: Long / Short Phase",   group=grpTable)
+rowTrend      = input.bool(true,  "Row: Trend Filter Status",  group=grpTable)
+rowPnL        = input.bool(false, "Row: Strategy P&L",         group=grpTable)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SESSION / DAY HELPERS
@@ -253,8 +300,66 @@ inNoTradeZone = useNoTradeZone and close >= (hi80 - ntzPaddingPts) and close <= 
 longSignal  = (useBreakout and longBreakoutBar)  or (useRetest and longRetestBar)
 shortSignal = (useBreakout and shortBreakoutBar) or (useRetest and shortRetestBar)
 
-longSignal  := longSignal  and not inNoTradeZone and not longFired
-shortSignal := shortSignal and not inNoTradeZone and not shortFired
+// ── Trend / bias filters ─────────────────────────────────────────────────────
+emaVal     = ta.ema(close, emaLen)
+emaSlopeUp = emaVal > emaVal[slopeLook]
+emaSlopeDn = emaVal < emaVal[slopeLook]
+
+htfEma     = request.security(syminfo.tickerid, htfRes, ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+
+// Session-anchored VWAP (resets each new day so it tracks the trading day)
+var float vwapNum  = na
+var float vwapDen  = na
+if isNewDay
+    vwapNum := 0.0
+    vwapDen := 0.0
+tp_       = (high + low + close) / 3.0
+vwapNum  := nz(vwapNum) + tp_ * volume
+vwapDen  := nz(vwapDen) + volume
+vwapVal   = vwapDen > 0 ? vwapNum / vwapDen : na
+
+// Opening-range bias — first openMins minutes of the trading window decide
+// the day's allowed direction.
+var float orHigh   = na
+var float orLow    = na
+var float orOpen   = na
+var float orClose  = na
+var bool  orDone   = false
+var int   orStartT = na
+if isNewDay
+    orHigh   := na
+    orLow    := na
+    orOpen   := na
+    orClose  := na
+    orDone   := false
+    orStartT := na
+if inSession and not inSession[1]
+    orStartT := time
+    orOpen   := open
+if inSession and not orDone and not na(orStartT)
+    orHigh  := na(orHigh) ? high : math.max(orHigh, high)
+    orLow   := na(orLow)  ? low  : math.min(orLow,  low)
+    orClose := close
+    if time - orStartT >= openMins * 60 * 1000
+        orDone := true
+orBiasLong  = orDone and orClose >  orOpen
+orBiasShort = orDone and orClose <  orOpen
+
+// Combine — each enabled filter must agree. Disabled filter = always pass.
+longTrendOK  = (not useEMA      or close > emaVal)              and
+               (not useHTFEMA   or (not na(htfEma) and close > htfEma)) and
+               (not useVWAP     or (not na(vwapVal) and close > vwapVal)) and
+               (not useOpenBias or orBiasLong)                  and
+               (not useSlope    or emaSlopeUp)
+
+shortTrendOK = (not useEMA      or close < emaVal)              and
+               (not useHTFEMA   or (not na(htfEma) and close < htfEma)) and
+               (not useVWAP     or (not na(vwapVal) and close < vwapVal)) and
+               (not useOpenBias or orBiasShort)                 and
+               (not useSlope    or emaSlopeDn)
+
+longSignal  := longSignal  and not inNoTradeZone and not longFired  and longTrendOK
+shortSignal := shortSignal and not inNoTradeZone and not shortFired and shortTrendOK
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ORDER MANAGEMENT
@@ -310,6 +415,11 @@ pDB = plot(showLevels ? dnZoneBot : na, "", color=color.new(color.lime, 100), di
 fill(pUT, pUB, color=color.new(color.red,  92), title="Resistance Zone")
 fill(pDT, pDB, color=color.new(color.lime, 92), title="Support Zone")
 
+// Trend filter overlays (optional)
+plot(showTrendPlot and useEMA    ? emaVal  : na, "EMA",     color=color.new(color.yellow, 30), linewidth=1)
+plot(showTrendPlot and useHTFEMA ? htfEma  : na, "HTF EMA", color=color.new(color.orange, 20), linewidth=2)
+plot(showTrendPlot and useVWAP   ? vwapVal : na, "VWAP",    color=color.new(color.aqua,   20), linewidth=2)
+
 // Entry markers
 plotshape(showSignals and longSignal  and canLong  and slotOpen, "Long Entry",
           shape.triangleup,   location.belowbar, color.new(color.lime, 0), size=size.small)
@@ -346,48 +456,110 @@ if showLabels and barstate.islast
              size=size.small)
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// INFO TABLE
+// INFO TABLE  (customizable position / size / rows)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-var table t = table.new(position.top_right, 2, 8,
-     bgcolor=color.new(color.black, 60), border_width=1, border_color=color.new(color.gray, 50))
+f_pos(s) =>
+    switch s
+        "Top Right"     => position.top_right
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Middle Right"  => position.middle_right
+        "Middle Left"   => position.middle_left
+        "Bottom Right"  => position.bottom_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.top_right
 
-tCol0 = color.new(color.silver, 0)
-bg    = color.new(color.black, 70)
+f_sz(s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        "Huge"   => size.huge
+        => size.small
 
-if barstate.islast
-    table.cell(t, 0, 0, "Resistance", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 0, na(trackedUp) ? "—" : str.tostring(trackedUp, "#.##"),
-               text_color=color.red, text_size=size.small, bgcolor=bg)
+var table t = table.new(f_pos(tablePosStr), 2, 12,
+     bgcolor=color.new(color.black, tableBgOpacity),
+     border_width=tableBorder ? 1 : 0,
+     border_color=color.new(color.gray, 50))
 
-    table.cell(t, 0, 1, "Support", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 1, na(trackedDn) ? "—" : str.tostring(trackedDn, "#.##"),
-               text_color=color.lime, text_size=size.small, bgcolor=bg)
+tCol0   = color.new(color.silver, 0)
+bg      = color.new(color.black, math.max(tableBgOpacity - 10, 0))
+tSize   = f_sz(tableSizeStr)
 
-    table.cell(t, 0, 2, "Entry Mode", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 2, entryMode, text_color=color.aqua, text_size=size.small, bgcolor=bg)
+f_row(r, label_, value, valColor) =>
+    table.cell(t, 0, r, label_, text_color=tCol0,    text_size=tSize, bgcolor=bg)
+    table.cell(t, 1, r, value,  text_color=valColor, text_size=tSize, bgcolor=bg)
 
-    table.cell(t, 0, 3, "SL / TP (pts)", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 3, str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#"),
-               text_color=color.aqua, text_size=size.small, bgcolor=bg)
+if showTable and barstate.islast
+    table.clear(t, 0, 0, 1, 11)
+    int r = 0
 
-    table.cell(t, 0, 4, "Session", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 4, tradeSession + " " + resolvedTZ + (inSession ? "  (LIVE)" : ""),
-               text_color=inSession ? color.lime : color.gray, text_size=size.small, bgcolor=bg)
+    if rowSR
+        f_row(r, "Resistance",
+              na(trackedUp) ? "—" : str.tostring(trackedUp, "#.##"),
+              color.red)
+        r += 1
+        f_row(r, "Support",
+              na(trackedDn) ? "—" : str.tostring(trackedDn, "#.##"),
+              color.lime)
+        r += 1
 
-    table.cell(t, 0, 5, "Trades Today", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay),
-               text_color=color.aqua, text_size=size.small, bgcolor=bg)
+    if rowEntry
+        f_row(r, "Entry Mode", entryMode, color.aqua)
+        r += 1
 
-    longPhase  = na(trackedUp) ? "—" : not longBroke ? "watching" : not longPulledAway ? "broke – pull away" : not longRetestArmed ? "pulled – retest?" : "retest armed"
-    shortPhase = na(trackedDn) ? "—" : not shortBroke ? "watching" : not shortPulledAway ? "broke – pull away" : not shortRetestArmed ? "pulled – retest?" : "retest armed"
+    if rowRisk
+        f_row(r, "SL / TP (pts)",
+              str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#"),
+              color.aqua)
+        r += 1
 
-    table.cell(t, 0, 6, "Long Phase",  text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 6, longPhase,
-               text_color=longRetestArmed ? color.aqua : longBroke ? color.yellow : color.gray,
-               text_size=size.small, bgcolor=bg)
+    if rowSess
+        f_row(r, "Session",
+              tradeSession + " " + resolvedTZ + (inSession ? "  (LIVE)" : ""),
+              inSession ? color.lime : color.gray)
+        r += 1
 
-    table.cell(t, 0, 7, "Short Phase", text_color=tCol0, text_size=size.small, bgcolor=bg)
-    table.cell(t, 1, 7, shortPhase,
-               text_color=shortRetestArmed ? color.fuchsia : shortBroke ? color.yellow : color.gray,
-               text_size=size.small, bgcolor=bg)
+    if rowTrades
+        f_row(r, "Trades Today",
+              str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay),
+              color.aqua)
+        r += 1
+
+    if rowPhases
+        longPhase  = na(trackedUp) ? "—" : not longBroke ? "watching" : not longPulledAway ? "broke – pull away" : not longRetestArmed ? "pulled – retest?" : "retest armed"
+        shortPhase = na(trackedDn) ? "—" : not shortBroke ? "watching" : not shortPulledAway ? "broke – pull away" : not shortRetestArmed ? "pulled – retest?" : "retest armed"
+        f_row(r, "Long Phase",  longPhase,
+              longRetestArmed ? color.aqua : longBroke ? color.yellow : color.gray)
+        r += 1
+        f_row(r, "Short Phase", shortPhase,
+              shortRetestArmed ? color.fuchsia : shortBroke ? color.yellow : color.gray)
+        r += 1
+
+    if rowTrend
+        filtersOn = (useEMA ? "EMA " : "") + (useHTFEMA ? "HTF " : "") + (useVWAP ? "VWAP " : "") + (useOpenBias ? "OR " : "") + (useSlope ? "Slope " : "")
+        trendStr  = filtersOn == "" ? "off" :
+                     longTrendOK and shortTrendOK ? "both ok" :
+                     longTrendOK  ? "long ok"  :
+                     shortTrendOK ? "short ok" : "blocked"
+        trendCol  = filtersOn == "" ? color.gray :
+                     longTrendOK and not shortTrendOK ? color.lime :
+                     shortTrendOK and not longTrendOK ? color.red  :
+                     longTrendOK and shortTrendOK     ? color.aqua : color.orange
+        f_row(r, "Trend (" + filtersOn + ")", trendStr, trendCol)
+        r += 1
+
+    if rowPnL
+        f_row(r, "Net P&L",
+              str.tostring(strategy.netprofit, "#.##"),
+              strategy.netprofit >= 0 ? color.lime : color.red)
+        r += 1
+        wins   = strategy.wintrades
+        losses = strategy.losstrades
+        total  = wins + losses
+        wrStr  = total > 0 ? str.tostring(math.round(wins * 100.0 / total)) + "%  (" + str.tostring(wins) + "/" + str.tostring(total) + ")" : "—"
+        f_row(r, "Win Rate", wrStr, color.aqua)
+        r += 1
