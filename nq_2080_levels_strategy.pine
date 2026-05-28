@@ -248,7 +248,11 @@ if isNewDay or not inSession
 // Update trackedUp only while no break is in progress (or after a trade fired
 // and we're free to look for the next level). This keeps the retest state
 // machine anchored to the level it actually broke.
-if (not longBroke or longFired) and not na(upLevel) and (na(trackedUp) or upLevel != trackedUp)
+// Also require the candidate level to actually be above current close — without
+// this, a fast down-then-up bar can drop trackedUp to a lower 20/80 line while
+// close is still above it, immediately triggering a false longBroke that locks
+// trackedUp for the rest of the session.
+if (not longBroke or longFired) and not na(upLevel) and (na(trackedUp) or upLevel != trackedUp) and close <= upLevel
     trackedUp        := upLevel
     longCount        := 0
     longBroke        := false
@@ -256,7 +260,7 @@ if (not longBroke or longFired) and not na(upLevel) and (na(trackedUp) or upLeve
     longRetestArmed  := false
     longFired        := false
 
-if (not shortBroke or shortFired) and not na(dnLevel) and (na(trackedDn) or dnLevel != trackedDn)
+if (not shortBroke or shortFired) and not na(dnLevel) and (na(trackedDn) or dnLevel != trackedDn) and close >= dnLevel
     trackedDn        := dnLevel
     shortCount       := 0
     shortBroke       := false
