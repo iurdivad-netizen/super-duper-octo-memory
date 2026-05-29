@@ -16,6 +16,7 @@ strategy("NQ 20/80 Round-Number S/R – Breakout & Retest",
 grpLevels  = "20 / 80 Levels"
 grpSess    = "Session"
 grpEntry   = "Entry"
+grpPattern = "Candle Pattern Entries"
 grpTrend   = "Trend Filter"
 grpQuality = "Quality Filters"
 grpRisk    = "Risk (NQ points)"
@@ -62,6 +63,24 @@ pullAwayPts  = input.float(5.0, "Min Pull-Away After Break (pts)", minval=1.0, m
                   tooltip="Price must travel at least this far past the level before a retest can be considered.")
 tradeDir     = input.string("Both", "Direction", options=["Both", "Long Only", "Short Only"], group=grpEntry)
 maxTradesDay = input.int(2, "Max Trades per Day", minval=1, maxval=10, group=grpEntry)
+
+// ── Candle pattern entries — additional triggers that fire when a pin bar or
+// doji prints at a tracked 20/80 level. These work alongside (not instead of)
+// the Breakout / Retest signals — enable any combination you want.
+usePinEntry  = input.bool(false, "Pin Bar Entry", group=grpPattern,
+                  tooltip="Enter long on a bullish pin (long lower wick) printing at the tracked support, short on a bearish pin (long upper wick) at the tracked resistance.")
+pinWickRatio = input.float(2.0, "Pin Wick / Body Ratio", minval=1.0, maxval=10.0, step=0.25, group=grpPattern,
+                  tooltip="Dominant wick must be at least this many times the candle body. Higher = stricter.")
+pinOppMaxPct = input.float(25.0, "Pin Opposite-Wick Max % of Range", minval=0.0, maxval=50.0, step=5.0, group=grpPattern,
+                  tooltip="The opposite (non-dominant) wick must be no more than this % of the candle's total range. Keeps real pins, rejects symmetric spinning tops.")
+
+useDojiEntry = input.bool(false, "Doji Entry", group=grpPattern,
+                  tooltip="Enter long on a doji at the tracked support, short on a doji at the tracked resistance. Doji = body is tiny relative to range, signalling rejection / indecision.")
+dojiMaxBody  = input.float(10.0, "Doji Max Body % of Range", minval=1.0, maxval=30.0, step=1.0, group=grpPattern,
+                  tooltip="Candle body / range %. 10% or less = a true doji.")
+
+patternProx  = input.float(5.0, "Pattern Proximity to Level (pts)", minval=0.5, maxval=30.0, step=0.5, group=grpPattern,
+                  tooltip="Pattern's wick must touch within this many points of the tracked level for the signal to count.")
 
 // ── Trend / bias filters — gate entries to align with higher-level direction.
 // Combine as many as you like; ALL enabled filters must agree for a side to
@@ -343,8 +362,30 @@ hi80 = math.floor(close / 100.0) * 100.0 + levelB           // the 80 below pric
 lo20 = math.floor(close / 100.0) * 100.0 + 100.0 + levelA   // the 20 above it
 inNoTradeZone = useNoTradeZone and close >= (hi80 - ntzPaddingPts) and close <= (lo20 + ntzPaddingPts)
 
-longSignal  = (useBreakout and longBreakoutBar)  or (useRetest and longRetestBar)
-shortSignal = (useBreakout and shortBreakoutBar) or (useRetest and shortRetestBar)
+// ── Candle pattern detectors (pin bar / doji) ────────────────────────────────
+patBody     = math.abs(close - open)
+patRange    = high - low
+patUpperWk  = high - math.max(open, close)
+patLowerWk  = math.min(open, close) - low
+
+isBullPin  = patRange > 0 and patBody > 0 and patLowerWk >= pinWickRatio * patBody and patLowerWk > patUpperWk and (patUpperWk / patRange * 100.0) <= pinOppMaxPct
+isBearPin  = patRange > 0 and patBody > 0 and patUpperWk >= pinWickRatio * patBody and patUpperWk > patLowerWk and (patLowerWk / patRange * 100.0) <= pinOppMaxPct
+isDoji     = patRange > 0 and (patBody / patRange * 100.0) <= dojiMaxBody
+
+// Pattern must touch the level with its wick (low for support, high for resistance)
+atSupportLevel    = not na(trackedDn) and low  <= trackedDn + patternProx and low  >= trackedDn - patternProx
+atResistanceLevel = not na(trackedUp) and high >= trackedUp - patternProx and high <= trackedUp + patternProx
+
+longPinBar  = usePinEntry  and isBullPin and atSupportLevel
+shortPinBar = usePinEntry  and isBearPin and atResistanceLevel
+longDoji    = useDojiEntry and isDoji    and atSupportLevel
+shortDoji   = useDojiEntry and isDoji    and atResistanceLevel
+
+longPatternBar  = inSession and (longPinBar  or longDoji)
+shortPatternBar = inSession and (shortPinBar or shortDoji)
+
+longSignal  = (useBreakout and longBreakoutBar)  or (useRetest and longRetestBar)  or longPatternBar
+shortSignal = (useBreakout and shortBreakoutBar) or (useRetest and shortRetestBar) or shortPatternBar
 
 // ── Trend / bias filters ─────────────────────────────────────────────────────
 emaVal     = ta.ema(close, emaLen)
@@ -428,10 +469,20 @@ cooldownOK = not useCooldown or na(lastLossT) or (time - lastLossT) >= cooldownM
 // Warm-up — skip first warmupMins of the trading window.
 warmupOK   = not useWarmup or na(orStartT) or (time - orStartT) >= warmupMins * 60 * 1000
 
-qualityOK  = atrOK and bodyOK and cooldownOK and warmupOK
+// Base quality applies to every entry; strong-break filter (bodyOK / penOK)
+// applies only to Breakout / Retest entries — pin bar and doji are by
+// definition weak-body patterns, so they're exempt.
+baseQualityOK = atrOK and cooldownOK and warmupOK
+qualityOK     = baseQualityOK and bodyOK  // legacy alias for the status table
 
-longSignal  := longSignal  and not inNoTradeZone and not longFired  and longTrendOK  and qualityOK and longPenOK
-shortSignal := shortSignal and not inNoTradeZone and not shortFired and shortTrendOK and qualityOK and shortPenOK
+brLongQualityOK  = not useStrong or (bodyOK and longPenOK)
+brShortQualityOK = not useStrong or (bodyOK and shortPenOK)
+
+brLongOK     = ((useBreakout and longBreakoutBar)  or (useRetest and longRetestBar))  and brLongQualityOK
+brShortOK    = ((useBreakout and shortBreakoutBar) or (useRetest and shortRetestBar)) and brShortQualityOK
+
+longSignal   := (brLongOK  or longPatternBar)  and not inNoTradeZone and not longFired  and longTrendOK  and baseQualityOK
+shortSignal  := (brShortOK or shortPatternBar) and not inNoTradeZone and not shortFired and shortTrendOK and baseQualityOK
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ORDER MANAGEMENT
@@ -507,6 +558,12 @@ plotshape(showSignals and longRetestArmed  and not longRetestArmed[1]  and inSes
           shape.xcross, location.belowbar, color.new(color.aqua,    50), size=size.tiny)
 plotshape(showSignals and shortRetestArmed and not shortRetestArmed[1] and inSession, "Short Retest Armed",
           shape.xcross, location.abovebar, color.new(color.fuchsia, 50), size=size.tiny)
+
+// Candle pattern detections at a level (informational — entry triangle still fires above/below)
+plotshape(showSignals and longPinBar  and inSession, "Long Pin Bar",  shape.labelup,   location.belowbar, color.new(color.yellow, 30), size=size.tiny, text="P", textcolor=color.black)
+plotshape(showSignals and shortPinBar and inSession, "Short Pin Bar", shape.labeldown, location.abovebar, color.new(color.yellow, 30), size=size.tiny, text="P", textcolor=color.black)
+plotshape(showSignals and longDoji    and inSession, "Long Doji",     shape.labelup,   location.belowbar, color.new(color.aqua,   30), size=size.tiny, text="D", textcolor=color.black)
+plotshape(showSignals and shortDoji   and inSession, "Short Doji",    shape.labeldown, location.abovebar, color.new(color.aqua,   30), size=size.tiny, text="D", textcolor=color.black)
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // LEVEL LABELS  (drawn on the last bar to avoid clutter)
