@@ -47,6 +47,10 @@ dateFmt        = input.string("MMM dd", title="H/L Label Date Format", group=grp
      tooltip="str.format_time tokens, e.g. yyyy-MM-dd, MMM dd, dd/MM")
 minBarsVisible = input.int(4, title="Min H/L Line Length (bars)", minval=1, maxval=200, group=grpHL,
      tooltip="When a line is capped (either by being broken in Plot-Unbroken mode, or by the next period boundary in single-line mode), its endpoint is pushed out to at least this many bars from its creation so very-short lines are still visible.")
+breakBufferTicks = input.int(1, title="Break Tolerance (mintick units)", minval=0, maxval=1000, group=grpHL,
+     tooltip="Price must exceed the H/L level by at least this many mintick units before the line is considered broken. Prevents float-precision noise (where the bar's high equals the stored daily high) from instantly freezing the most-recent line. Set to 0 for strict comparison.")
+graceBars      = input.int(1, title="Break Detection Grace (bars)", minval=0, maxval=50, group=grpHL,
+     tooltip="A newly created line cannot be marked broken for this many bars after creation. Default 1 keeps the very-first bar after the new HTF period from instantly freezing the line.")
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -137,14 +141,16 @@ var line highLineL  = na
 
 // Multi-line state (used when hideBroken = true). Every period adds a new
 // pair of lines that keeps extending until price takes the level out.
-var array<line>  hLineArr   = array.new<line>()
-var array<float> hLevelArr  = array.new<float>()
-var array<bool>  hBrokenArr = array.new<bool>()
-var array<label> hLabelArr  = array.new<label>()
-var array<line>  lLineArr   = array.new<line>()
-var array<float> lLevelArr  = array.new<float>()
-var array<bool>  lBrokenArr = array.new<bool>()
-var array<label> lLabelArr  = array.new<label>()
+var array<line>  hLineArr    = array.new<line>()
+var array<float> hLevelArr   = array.new<float>()
+var array<bool>  hBrokenArr  = array.new<bool>()
+var array<label> hLabelArr   = array.new<label>()
+var array<int>   hCreatedArr = array.new<int>()
+var array<line>  lLineArr    = array.new<line>()
+var array<float> lLevelArr   = array.new<float>()
+var array<bool>  lBrokenArr  = array.new<bool>()
+var array<label> lLabelArr   = array.new<label>()
+var array<int>   lCreatedArr = array.new<int>()
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
 
@@ -165,19 +171,20 @@ newPeriod = not na(prevTimeHTF[1]) and prevTimeHTF != prevTimeHTF[1]
 // before they can be frozen. Capped x2 is clamped to at least x1+minBarsVisible
 // so an opening-bar wick past the level doesn't produce an invisible zero-
 // length segment.
+breakBufferPrice = breakBufferTicks * syminfo.mintick
 if lables and hideBroken and isIntraday
     if array.size(hLineArr) > 0
         for i = 0 to array.size(hLineArr) - 1
-            if not array.get(hBrokenArr, i)
-                if highBreakSrc > array.get(hLevelArr, i)
+            if not array.get(hBrokenArr, i) and bar_index > array.get(hCreatedArr, i) + graceBars
+                if highBreakSrc > array.get(hLevelArr, i) + breakBufferPrice
                     ln = array.get(hLineArr, i)
                     line.set_x2(ln, math.max(bar_index, line.get_x1(ln) + minBarsVisible))
                     line.set_extend(ln, extend.none)
                     array.set(hBrokenArr, i, true)
     if array.size(lLineArr) > 0
         for j = 0 to array.size(lLineArr) - 1
-            if not array.get(lBrokenArr, j)
-                if lowBreakSrc < array.get(lLevelArr, j)
+            if not array.get(lBrokenArr, j) and bar_index > array.get(lCreatedArr, j) + graceBars
+                if lowBreakSrc < array.get(lLevelArr, j) - breakBufferPrice
                     ln = array.get(lLineArr, j)
                     line.set_x2(ln, math.max(bar_index, line.get_x1(ln) + minBarsVisible))
                     line.set_extend(ln, extend.none)
@@ -191,27 +198,31 @@ if lables and newPeriod and isIntraday
             line.delete(array.shift(hLineArr))
             array.shift(hLevelArr)
             array.shift(hBrokenArr)
+            array.shift(hCreatedArr)
             if array.size(hLabelArr) > 0
                 label.delete(array.shift(hLabelArr))
         while array.size(lLineArr) >= lookbackPeriods
             line.delete(array.shift(lLineArr))
             array.shift(lLevelArr)
             array.shift(lBrokenArr)
+            array.shift(lCreatedArr)
             if array.size(lLabelArr) > 0
                 label.delete(array.shift(lLabelArr))
         if not na(highLevel)
             nH = line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
-            array.push(hLineArr,   nH)
-            array.push(hLevelArr,  highLevel)
-            array.push(hBrokenArr, false)
+            array.push(hLineArr,    nH)
+            array.push(hLevelArr,   highLevel)
+            array.push(hBrokenArr,  false)
+            array.push(hCreatedArr, bar_index)
             if showHLLabels
                 lblH = label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
                 array.push(hLabelArr, lblH)
         if not na(lowLevel)
             nL = line.new(bar_index, lowLevel, bar_index, lowLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
-            array.push(lLineArr,   nL)
-            array.push(lLevelArr,  lowLevel)
-            array.push(lBrokenArr, false)
+            array.push(lLineArr,    nL)
+            array.push(lLevelArr,   lowLevel)
+            array.push(lBrokenArr,  false)
+            array.push(lCreatedArr, bar_index)
             if showHLLabels
                 lblL = label.new(bar_index, lowLevel, labelTxtL, style=label.style_none, textcolor=hlLabelColor)
                 array.push(lLabelArr, lblL)
