@@ -8,7 +8,6 @@
 //
 // Legend
 //   RED BG       = Sunday Trading
-//   MAROON STAR  = Experimental significant-move marker
 //   Blue X       = Engulfing candle
 //-----------------------------------------------------------------------------
 
@@ -101,11 +100,10 @@ sundayColor    = input.color(color.red, title="Sunday BG Color",  group=grpVL)
 sundayTransp   = input.int(60, title="Sunday BG Transparency", minval=0, maxval=100, group=grpVL)
 
 // =============================================================================
-// EXTRAS (Engulfing / Experimental)
+// EXTRAS (Engulfing)
 // =============================================================================
-grpExtra        = "Extras"
-engulfColor     = input.color(color.blue,   title="Engulfing Bar Color", group=grpExtra)
-experimentColor = input.color(color.maroon, title="Experimental Star Color", group=grpExtra)
+grpExtra    = "Extras"
+engulfColor = input.color(color.blue, title="Engulfing Bar Color", group=grpExtra)
 
 // =============================================================================
 // ENGULFING
@@ -116,8 +114,6 @@ plotshape(insideBar, style=shape.xcross, location=location.abovebar, color=engul
 // =============================================================================
 // HTF DATA
 // =============================================================================
-prevCloseHTF = request.security(syminfo.tickerid, higherTF, close[1], lookahead=barmerge.lookahead_on)
-prevOpenHTF  = request.security(syminfo.tickerid, higherTF, open[1],  lookahead=barmerge.lookahead_on)
 prevHighHTF  = request.security(syminfo.tickerid, higherTF, high[1],  lookahead=barmerge.lookahead_on)
 prevLowHTF   = request.security(syminfo.tickerid, higherTF, low[1],   lookahead=barmerge.lookahead_on)
 prevTimeHTF  = request.security(syminfo.tickerid, higherTF, time[1],  lookahead=barmerge.lookahead_on)
@@ -156,10 +152,6 @@ useCalendar = detectionMethod == "Calendar"
 highLevel = useCalendar ? trackedPrevH : prevHighHTF
 lowLevel  = useCalendar ? trackedPrevL : prevLowHTF
 labelTime = useCalendar ? trackedPrevTime : prevTimeHTF
-
-// Experimental star
-equalHigh = (prevCloseHTF[2] > prevOpenHTF[2] and prevOpenHTF[2] < prevCloseHTF[1] and prevHighHTF[1] > open and prevOpenHTF[1] > close) ? prevCloseHTF[1] : 0
-plotchar(equalHigh, color=experimentColor, title="Experimental")
 
 // Buffer levels
 highLevelH = highLevel + (bufferTicks * syminfo.mintick)
