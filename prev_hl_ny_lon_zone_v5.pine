@@ -37,8 +37,8 @@ hlStyle        = hlStyleOpt == "Solid" ? line.style_solid : hlStyleOpt == "Dashe
 
 hlLabelColor   = input.color(color.blue,  title="H/L Label Text Color", group=grpHL)
 showHLLabels   = input.bool(true,         title="Show H/L Labels",       group=grpHL)
-hideBroken     = input.bool(false,        title="Hide H/L After Broken", group=grpHL,
-     tooltip="When enabled, the High line stops extending once price trades above it, and the Low line stops extending once price trades below it.")
+hideBroken     = input.bool(false,        title="Plot Unbroken Levels Until Taken", group=grpHL,
+     tooltip="ON: every period's H/L is plotted and keeps extending across subsequent periods until price trades through it. OFF: only the most recent period's H/L is drawn (capped at the next period boundary).")
 breakSrcOpt    = input.string("Wick", title="Break Source", options=["Wick", "Close"], group=grpHL)
 
 // Buffer bands
@@ -118,75 +118,87 @@ lowLevelL  = lowLevel  - (bufferTicks * syminfo.mintick)
 // =============================================================================
 // LINES
 // =============================================================================
+// Single-line state (used when hideBroken = false). One pair of H/L lines
+// at a time, capped at the next period boundary.
 var line lowLine    = na
 var line lowLineH   = na
 var line lowLineL   = na
 var line highLine   = na
 var line highLineH  = na
 var line highLineL  = na
-var bool highBroken = false
-var bool lowBroken  = false
+
+// Multi-line state (used when hideBroken = true). Every period adds a new
+// pair of lines that keeps extending until price takes the level out.
+var array<line>  hLineArr  = array.new<line>()
+var array<float> hLevelArr = array.new<float>()
+var array<line>  lLineArr  = array.new<line>()
+var array<float> lLevelArr = array.new<float>()
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
 
 highBreakSrc = breakSrcOpt == "Close" ? close : high
 lowBreakSrc  = breakSrcOpt == "Close" ? close : low
 
+// New period: add new H/L lines
 if lables and highLevel[1] != highLevel and isIntraday
-    line.set_x2(highLine, bar_index)
-    line.set_extend(highLine, extend.none)
-    highLine := line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
-    line.set_x2(lowLine, bar_index)
-    line.set_extend(lowLine, extend.none)
-    lowLine := line.new(bar_index, lowLevel, bar_index, lowLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+    if hideBroken
+        nH = line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+        nL = line.new(bar_index, lowLevel,  bar_index, lowLevel,  width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+        array.push(hLineArr,  nH)
+        array.push(hLevelArr, highLevel)
+        array.push(lLineArr,  nL)
+        array.push(lLevelArr, lowLevel)
+    else
+        if not na(highLine)
+            line.set_x2(highLine, bar_index)
+            line.set_extend(highLine, extend.none)
+        if not na(lowLine)
+            line.set_x2(lowLine, bar_index)
+            line.set_extend(lowLine, extend.none)
+        highLine := line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+        lowLine  := line.new(bar_index, lowLevel,  bar_index, lowLevel,  width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+        if showBuffer
+            if not na(highLineH)
+                line.set_x2(highLineH, bar_index)
+                line.set_extend(highLineH, extend.none)
+                line.set_x2(highLineL, bar_index)
+                line.set_extend(highLineL, extend.none)
+                line.set_x2(lowLineH,  bar_index)
+                line.set_extend(lowLineH,  extend.none)
+                line.set_x2(lowLineL,  bar_index)
+                line.set_extend(lowLineL,  extend.none)
+            highLineH := line.new(bar_index, highLevelH, bar_index, highLevelH, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+            highLineL := line.new(bar_index, highLevelL, bar_index, highLevelL, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+            lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+            lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
     if showHLLabels
         label.new(bar_index, highLevel, "H", style=label.style_none, textcolor=hlLabelColor)
         label.new(bar_index, lowLevel,  "L", style=label.style_none, textcolor=hlLabelColor)
-    highBroken := false
-    lowBroken  := false
 
-// Freeze H/L (and buffer) lines once the level is taken out
+// Each bar: freeze any tracked line whose level has just been broken.
 if lables and hideBroken and isIntraday
-    if not highBroken and not na(highLine) and highBreakSrc > highLevel
-        highBroken := true
-        line.set_x2(highLine, bar_index)
-        line.set_extend(highLine, extend.none)
-        if not na(highLineH)
-            line.set_x2(highLineH, bar_index)
-            line.set_extend(highLineH, extend.none)
-            line.set_x2(highLineL, bar_index)
-            line.set_extend(highLineL, extend.none)
-    if not lowBroken and not na(lowLine) and lowBreakSrc < lowLevel
-        lowBroken := true
-        line.set_x2(lowLine, bar_index)
-        line.set_extend(lowLine, extend.none)
-        if not na(lowLineH)
-            line.set_x2(lowLineH, bar_index)
-            line.set_extend(lowLineH, extend.none)
-            line.set_x2(lowLineL, bar_index)
-            line.set_extend(lowLineL, extend.none)
-
-if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
-    if not (hideBroken and lowBroken)
-        line.set_x2(lowLine, bar_index)
-    if not (hideBroken and highBroken)
-        line.set_x2(highLine, bar_index)
-
-if lables and showBuffer and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
-    if not (hideBroken and highBroken)
-        line.set_x2(highLineH, bar_index)
-        line.set_x2(highLineL, bar_index)
-        line.set_extend(highLineH, extend.none)
-        line.set_extend(highLineL, extend.none)
-    if not (hideBroken and lowBroken)
-        line.set_x2(lowLineH,  bar_index)
-        line.set_x2(lowLineL,  bar_index)
-        line.set_extend(lowLineH,  extend.none)
-        line.set_extend(lowLineL,  extend.none)
-    lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
-    lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
-    highLineH := line.new(bar_index, highLevelH, bar_index, highLevelH, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
-    highLineL := line.new(bar_index, highLevelL, bar_index, highLevelL, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+    i = 0
+    while i < array.size(hLineArr)
+        lvl = array.get(hLevelArr, i)
+        ln  = array.get(hLineArr,  i)
+        if highBreakSrc > lvl
+            line.set_x2(ln, bar_index)
+            line.set_extend(ln, extend.none)
+            array.remove(hLineArr,  i)
+            array.remove(hLevelArr, i)
+        else
+            i += 1
+    j = 0
+    while j < array.size(lLineArr)
+        lvl = array.get(lLevelArr, j)
+        ln  = array.get(lLineArr,  j)
+        if lowBreakSrc < lvl
+            line.set_x2(ln, bar_index)
+            line.set_extend(ln, extend.none)
+            array.remove(lLineArr,  j)
+            array.remove(lLevelArr, j)
+        else
+            j += 1
 
 // =============================================================================
 // SESSION SHADING
