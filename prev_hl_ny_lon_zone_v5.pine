@@ -154,11 +154,31 @@ labelDateStr = str.format_time(prevTimeHTF, dateFmt, syminfo.timezone)
 labelTxtH    = "H " + labelDateStr
 labelTxtL    = "L " + labelDateStr
 
-// Detect new HTF period via the HTF bar's start time changing. This is more
-// reliable than comparing prev high values (which can be identical across
-// periods, or stale around forex weekend gaps with lookahead_on).
-htfStart    = time(higherTF)
-newPeriod   = not na(htfStart[1]) and htfStart != htfStart[1]
+// Detect new HTF period via prevTimeHTF changing. Using the same series that
+// drives the label text keeps detection and labels perfectly in sync, and
+// fires reliably across forex weekend gaps and identical-high days.
+newPeriod = not na(prevTimeHTF[1]) and prevTimeHTF != prevTimeHTF[1]
+
+// Break check FIRST so newly created lines get at least one bar of visibility
+// before they can be frozen (otherwise an opening-bar wick past the level
+// freezes a zero-length line on the same bar it was created).
+if lables and hideBroken and isIntraday
+    if array.size(hLineArr) > 0
+        for i = 0 to array.size(hLineArr) - 1
+            if not array.get(hBrokenArr, i)
+                if highBreakSrc > array.get(hLevelArr, i)
+                    ln = array.get(hLineArr, i)
+                    line.set_x2(ln, bar_index)
+                    line.set_extend(ln, extend.none)
+                    array.set(hBrokenArr, i, true)
+    if array.size(lLineArr) > 0
+        for j = 0 to array.size(lLineArr) - 1
+            if not array.get(lBrokenArr, j)
+                if lowBreakSrc < array.get(lLevelArr, j)
+                    ln = array.get(lLineArr, j)
+                    line.set_x2(ln, bar_index)
+                    line.set_extend(ln, extend.none)
+                    array.set(lBrokenArr, j, true)
 
 // New period: add new H/L lines
 if lables and newPeriod and isIntraday
@@ -215,25 +235,6 @@ if lables and newPeriod and isIntraday
         if showHLLabels
             label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
             label.new(bar_index, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
-
-// Each bar: freeze any tracked line whose level has just been broken.
-if lables and hideBroken and isIntraday
-    if array.size(hLineArr) > 0
-        for i = 0 to array.size(hLineArr) - 1
-            if not array.get(hBrokenArr, i)
-                if highBreakSrc > array.get(hLevelArr, i)
-                    ln = array.get(hLineArr, i)
-                    line.set_x2(ln, bar_index)
-                    line.set_extend(ln, extend.none)
-                    array.set(hBrokenArr, i, true)
-    if array.size(lLineArr) > 0
-        for j = 0 to array.size(lLineArr) - 1
-            if not array.get(lBrokenArr, j)
-                if lowBreakSrc < array.get(lLevelArr, j)
-                    ln = array.get(lLineArr, j)
-                    line.set_x2(ln, bar_index)
-                    line.set_extend(ln, extend.none)
-                    array.set(lBrokenArr, j, true)
 
 // =============================================================================
 // SESSION SHADING
