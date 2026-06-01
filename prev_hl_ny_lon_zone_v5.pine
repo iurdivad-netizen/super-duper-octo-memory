@@ -53,6 +53,8 @@ graceBars      = input.int(1, title="Break Detection Grace (bars)", minval=0, ma
      tooltip="A newly created line cannot be marked broken for this many bars after creation. Default 1 keeps the very-first bar after the new HTF period from instantly freezing the line.")
 detectionMethod = input.string("Calendar", title="Boundary Detection", options=["Calendar", "HTF Security"], group=grpHL,
      tooltip="Calendar (recommended): detects a new period via change of dayofmonth / weekofyear / month / year in the symbol's timezone, and tracks H/L from the chart bars themselves. Bulletproof to forex weekend gaps and live-bar lookahead repaints. HTF Security: original behavior using request.security with lookahead_on.")
+tradingDaysOnly = input.bool(true, title="Trading Days Only (skip Sat/Sun)", group=grpHL,
+     tooltip="Calendar mode + Day period only. When ON, Saturday and Sunday do NOT get their own H/L levels — the previous Friday's H/L is preserved through the weekend and labeled on Monday. Useful for FX/indices which don't really trade weekends. Turn OFF for 24/7 assets like crypto.")
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -119,7 +121,9 @@ prevTimeHTF  = request.security(syminfo.tickerid, higherTF, time[1],  lookahead=
 // Calendar-based period detection and manual H/L tracking. Operates on the
 // chart bars directly so the new-period transition cannot be lost to security
 // lookahead repainting or forex weekend gaps.
-calNewPeriod = pp_period == "Day"   ? ta.change(dayofmonth) != 0 :
+isWeekend = dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday
+skipDay   = pp_period == "Day" and tradingDaysOnly and isWeekend
+calNewPeriod = pp_period == "Day"   ? (ta.change(dayofmonth) != 0 and not skipDay) :
                pp_period == "Week"  ? ta.change(weekofyear) != 0 :
                pp_period == "Month" ? ta.change(month) != 0 :
                                       ta.change(year) != 0
@@ -136,7 +140,7 @@ if calNewPeriod
     curPeriodHigh   := high
     curPeriodLow    := low
     curPeriodStart  := time
-else
+else if not skipDay
     curPeriodHigh := na(curPeriodHigh) ? high : math.max(curPeriodHigh, high)
     curPeriodLow  := na(curPeriodLow)  ? low  : math.min(curPeriodLow,  low)
 
