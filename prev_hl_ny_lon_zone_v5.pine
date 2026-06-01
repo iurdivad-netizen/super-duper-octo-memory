@@ -55,6 +55,10 @@ detectionMethod = input.string("Calendar", title="Boundary Detection", options=[
      tooltip="Calendar (recommended): detects a new period via change of dayofmonth / weekofyear / month / year in the symbol's timezone, and tracks H/L from the chart bars themselves. Bulletproof to forex weekend gaps and live-bar lookahead repaints. HTF Security: original behavior using request.security with lookahead_on.")
 tradingDaysOnly = input.bool(true, title="Trading Days Only (skip Sat/Sun)", group=grpHL,
      tooltip="Calendar mode + Day period only. When ON, Saturday and Sunday do NOT get their own H/L levels — the previous Friday's H/L is preserved through the weekend and labeled on Monday. Useful for FX/indices which don't really trade weekends. Turn OFF for 24/7 assets like crypto.")
+labelPosition  = input.string("Right", title="H/L Label Position", options=["Left", "Right"], group=grpHL,
+     tooltip="Left: label appears at the line's anchor (the period's first bar). Right: label travels with the chart's right edge for unbroken lines, and freezes at the break point once the line is broken — useful when you want the label out of the price-action area.")
+hideBrokenAfter = input.int(0, title="Auto-Hide Broken Segments After (bars, 0=off)", minval=0, maxval=20000, group=grpHL,
+     tooltip="Plot-Unbroken mode only. Once a line is taken out it becomes a frozen segment. Set N > 0 to automatically delete that segment N bars after it was broken — reduces clutter on long histories. 0 keeps every broken segment forever.")
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -168,25 +172,29 @@ lowLevelL  = lowLevel  - (bufferTicks * syminfo.mintick)
 // =============================================================================
 // Single-line state (used when hideBroken = false). One pair of H/L lines
 // at a time, capped at the next period boundary.
-var line lowLine    = na
-var line lowLineH   = na
-var line lowLineL   = na
-var line highLine   = na
-var line highLineH  = na
-var line highLineL  = na
+var line  lowLine    = na
+var line  lowLineH   = na
+var line  lowLineL   = na
+var line  highLine   = na
+var line  highLineH  = na
+var line  highLineL  = na
+var label highLabel  = na
+var label lowLabel   = na
 
 // Multi-line state (used when hideBroken = true). Every period adds a new
 // pair of lines that keeps extending until price takes the level out.
-var array<line>  hLineArr    = array.new<line>()
-var array<float> hLevelArr   = array.new<float>()
-var array<bool>  hBrokenArr  = array.new<bool>()
-var array<label> hLabelArr   = array.new<label>()
-var array<int>   hCreatedArr = array.new<int>()
-var array<line>  lLineArr    = array.new<line>()
-var array<float> lLevelArr   = array.new<float>()
-var array<bool>  lBrokenArr  = array.new<bool>()
-var array<label> lLabelArr   = array.new<label>()
-var array<int>   lCreatedArr = array.new<int>()
+var array<line>  hLineArr      = array.new<line>()
+var array<float> hLevelArr     = array.new<float>()
+var array<bool>  hBrokenArr    = array.new<bool>()
+var array<label> hLabelArr     = array.new<label>()
+var array<int>   hCreatedArr   = array.new<int>()
+var array<int>   hBrokenBarArr = array.new<int>()
+var array<line>  lLineArr      = array.new<line>()
+var array<float> lLevelArr     = array.new<float>()
+var array<bool>  lBrokenArr    = array.new<bool>()
+var array<label> lLabelArr     = array.new<label>()
+var array<int>   lCreatedArr   = array.new<int>()
+var array<int>   lBrokenBarArr = array.new<int>()
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
 
@@ -219,17 +227,29 @@ if lables and hideBroken and isIntraday
             if not array.get(hBrokenArr, i) and bar_index > array.get(hCreatedArr, i) + graceBars
                 if highBreakSrc > array.get(hLevelArr, i) + breakBufferPrice
                     ln = array.get(hLineArr, i)
-                    line.set_x2(ln, math.max(bar_index, line.get_x1(ln) + minBarsVisible))
+                    capX = math.max(bar_index, line.get_x1(ln) + minBarsVisible)
+                    line.set_x2(ln, capX)
                     line.set_extend(ln, extend.none)
                     array.set(hBrokenArr, i, true)
+                    array.set(hBrokenBarArr, i, bar_index)
+                    if labelPosition == "Right" and array.size(hLabelArr) > i
+                        lbl = array.get(hLabelArr, i)
+                        if not na(lbl)
+                            label.set_x(lbl, capX)
     if array.size(lLineArr) > 0
         for j = 0 to array.size(lLineArr) - 1
             if not array.get(lBrokenArr, j) and bar_index > array.get(lCreatedArr, j) + graceBars
                 if lowBreakSrc < array.get(lLevelArr, j) - breakBufferPrice
                     ln = array.get(lLineArr, j)
-                    line.set_x2(ln, math.max(bar_index, line.get_x1(ln) + minBarsVisible))
+                    capX = math.max(bar_index, line.get_x1(ln) + minBarsVisible)
+                    line.set_x2(ln, capX)
                     line.set_extend(ln, extend.none)
                     array.set(lBrokenArr, j, true)
+                    array.set(lBrokenBarArr, j, bar_index)
+                    if labelPosition == "Right" and array.size(lLabelArr) > j
+                        lbl = array.get(lLabelArr, j)
+                        if not na(lbl)
+                            label.set_x(lbl, capX)
 
 // New period: add new H/L lines
 if lables and newPeriod and isIntraday
@@ -240,32 +260,41 @@ if lables and newPeriod and isIntraday
             array.shift(hLevelArr)
             array.shift(hBrokenArr)
             array.shift(hCreatedArr)
+            array.shift(hBrokenBarArr)
             if array.size(hLabelArr) > 0
-                label.delete(array.shift(hLabelArr))
+                lblOld = array.shift(hLabelArr)
+                if not na(lblOld)
+                    label.delete(lblOld)
         while array.size(lLineArr) >= lookbackPeriods
             line.delete(array.shift(lLineArr))
             array.shift(lLevelArr)
             array.shift(lBrokenArr)
             array.shift(lCreatedArr)
+            array.shift(lBrokenBarArr)
             if array.size(lLabelArr) > 0
-                label.delete(array.shift(lLabelArr))
+                lblOld = array.shift(lLabelArr)
+                if not na(lblOld)
+                    label.delete(lblOld)
+        labelX = labelPosition == "Right" ? bar_index : lineX1
         if not na(highLevel)
             nH = line.new(lineX1, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
-            array.push(hLineArr,    nH)
-            array.push(hLevelArr,   highLevel)
-            array.push(hBrokenArr,  false)
-            array.push(hCreatedArr, bar_index)
+            array.push(hLineArr,      nH)
+            array.push(hLevelArr,     highLevel)
+            array.push(hBrokenArr,    false)
+            array.push(hCreatedArr,   bar_index)
+            array.push(hBrokenBarArr, na)
             if showHLLabels
-                lblH = label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
+                lblH = label.new(labelX, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
                 array.push(hLabelArr, lblH)
         if not na(lowLevel)
             nL = line.new(lineX1, lowLevel, bar_index, lowLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
-            array.push(lLineArr,    nL)
-            array.push(lLevelArr,   lowLevel)
-            array.push(lBrokenArr,  false)
-            array.push(lCreatedArr, bar_index)
+            array.push(lLineArr,      nL)
+            array.push(lLevelArr,     lowLevel)
+            array.push(lBrokenArr,    false)
+            array.push(lCreatedArr,   bar_index)
+            array.push(lBrokenBarArr, na)
             if showHLLabels
-                lblL = label.new(bar_index, lowLevel, labelTxtL, style=label.style_none, textcolor=hlLabelColor)
+                lblL = label.new(labelX, lowLevel, labelTxtL, style=label.style_none, textcolor=hlLabelColor)
                 array.push(lLabelArr, lblL)
     else
         if not na(highLine)
@@ -293,8 +322,65 @@ if lables and newPeriod and isIntraday
             lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
             lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
         if showHLLabels
-            label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
-            label.new(bar_index, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
+            slLabelX = labelPosition == "Right" ? bar_index : lineX1
+            highLabel := label.new(slLabelX, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
+            lowLabel  := label.new(slLabelX, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
+
+// Per-bar updates: move Right-side labels with the chart edge, and prune
+// broken-and-aged-out segments when hideBrokenAfter > 0.
+if lables and labelPosition == "Right" and isIntraday
+    if hideBroken
+        if array.size(hLineArr) > 0
+            for i = 0 to array.size(hLineArr) - 1
+                if not array.get(hBrokenArr, i) and array.size(hLabelArr) > i
+                    lbl = array.get(hLabelArr, i)
+                    if not na(lbl)
+                        label.set_x(lbl, bar_index)
+        if array.size(lLineArr) > 0
+            for j = 0 to array.size(lLineArr) - 1
+                if not array.get(lBrokenArr, j) and array.size(lLabelArr) > j
+                    lbl = array.get(lLabelArr, j)
+                    if not na(lbl)
+                        label.set_x(lbl, bar_index)
+    else
+        if not na(highLabel)
+            label.set_x(highLabel, bar_index)
+        if not na(lowLabel)
+            label.set_x(lowLabel,  bar_index)
+
+if lables and hideBroken and isIntraday and hideBrokenAfter > 0
+    i = array.size(hLineArr) - 1
+    while i >= 0
+        bbar = array.get(hBrokenBarArr, i)
+        if not na(bbar) and bar_index - bbar >= hideBrokenAfter
+            line.delete(array.get(hLineArr, i))
+            array.remove(hLineArr, i)
+            array.remove(hLevelArr, i)
+            array.remove(hBrokenArr, i)
+            array.remove(hBrokenBarArr, i)
+            array.remove(hCreatedArr, i)
+            if array.size(hLabelArr) > i
+                lbl = array.get(hLabelArr, i)
+                if not na(lbl)
+                    label.delete(lbl)
+                array.remove(hLabelArr, i)
+        i -= 1
+    j = array.size(lLineArr) - 1
+    while j >= 0
+        bbar = array.get(lBrokenBarArr, j)
+        if not na(bbar) and bar_index - bbar >= hideBrokenAfter
+            line.delete(array.get(lLineArr, j))
+            array.remove(lLineArr, j)
+            array.remove(lLevelArr, j)
+            array.remove(lBrokenArr, j)
+            array.remove(lBrokenBarArr, j)
+            array.remove(lCreatedArr, j)
+            if array.size(lLabelArr) > j
+                lbl = array.get(lLabelArr, j)
+                if not na(lbl)
+                    label.delete(lbl)
+                array.remove(lLabelArr, j)
+        j -= 1
 
 // =============================================================================
 // SESSION SHADING
