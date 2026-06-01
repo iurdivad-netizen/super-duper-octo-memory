@@ -3,7 +3,8 @@
 //
 // Previous High/Low by Period + NY & London session shading.
 // Pine v5 conversion adds alertcondition() outputs for price crossing
-// the previous-period high/low lines (and the +/- buffer bands).
+// the previous-period high/low lines (and the +/- buffer bands), plus
+// full visual customization (colors, widths, styles, transparency).
 //
 // Legend
 //   RED BG       = Sunday Trading
@@ -14,21 +15,85 @@
 //@version=5
 indicator("Prevous High & Low by Period + NY & Lon Zone", shorttitle="H/L GB+NY", overlay=true)
 
-// ---------------- INPUTS ----------------
-lables       = input.bool(true, title="Show High/Lows")
-showSessions = input.bool(true, title="Show Sessions")
-pp_period    = input.string("Day", title="Period", options=["Day", "Week", "Month", "Year"])
+// =============================================================================
+// GENERAL
+// =============================================================================
+grpGen       = "General"
+lables       = input.bool(true,  title="Show High/Lows",  group=grpGen)
+showSessions = input.bool(true,  title="Show Sessions",   group=grpGen)
+showVertLine = input.bool(true,  title="Show Vertical Line", group=grpGen)
+plotCross    = input.bool(true,  title="Show Engulfing Bar", group=grpGen)
+pp_period    = input.string("Day", title="Period", options=["Day", "Week", "Month", "Year"], group=grpGen)
 higherTF     = pp_period == "Day" ? "D" : pp_period == "Week" ? "W" : pp_period == "Month" ? "M" : "Y"
 
-// Buffer (in mintick units) above/below the level used for the gray bands.
-bufferTicks  = input.int(100, title="High/Low Buffer (mintick units)", minval=0)
+// =============================================================================
+// HIGH / LOW LINE STYLE
+// =============================================================================
+grpHL          = "High / Low Lines"
+hlColor        = input.color(color.blue,  title="High/Low Line Color", group=grpHL)
+hlWidth        = input.int(2, title="High/Low Line Width", minval=1, maxval=10, group=grpHL)
+hlStyleOpt     = input.string("Solid", title="High/Low Line Style", options=["Solid", "Dashed", "Dotted"], group=grpHL)
+hlStyle        = hlStyleOpt == "Solid" ? line.style_solid : hlStyleOpt == "Dashed" ? line.style_dashed : line.style_dotted
 
-// Engulfing
-plotCross    = input.bool(true, title="Show Engulfing Bar")
-insideBar    = plotCross and high < high[1] and low > low[1]
-plotshape(insideBar, style=shape.xcross, location=location.abovebar, color=color.blue, title="Engulfing Bars")
+hlLabelColor   = input.color(color.blue,  title="H/L Label Text Color", group=grpHL)
+showHLLabels   = input.bool(true,         title="Show H/L Labels",       group=grpHL)
 
-// ---------------- HTF DATA ----------------
+// Buffer bands
+bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
+bufferColor    = input.color(color.gray,  title="Buffer Band Color",  group=grpHL)
+bufferWidth    = input.int(2, title="Buffer Band Width", minval=1, maxval=10, group=grpHL)
+bufferStyleOpt = input.string("Solid", title="Buffer Band Style", options=["Solid", "Dashed", "Dotted"], group=grpHL)
+bufferStyle    = bufferStyleOpt == "Solid" ? line.style_solid : bufferStyleOpt == "Dashed" ? line.style_dashed : line.style_dotted
+showBuffer     = input.bool(true, title="Show Buffer Bands", group=grpHL)
+
+// =============================================================================
+// SESSIONS
+// =============================================================================
+grpSess     = "Sessions"
+baseTimeValue = "1"
+res         = input.timeframe(baseTimeValue, title="Resolution", group=grpSess)
+NYsessPre   = input.session("0800-0830", title="NY PRE-Session",  group=grpSess)
+NYsess      = input.session("0830-1100", title="NY Session",      group=grpSess)
+NYsessPost  = input.session("1100-1130", title="NY POST-Session", group=grpSess)
+GBsessPre   = input.session("0230-0300", title="GB PRE-Session",  group=grpSess)
+GBsess      = input.session("0300-0500", title="GB Session",      group=grpSess)
+GBsessPost  = input.session("0500-0530", title="GB POST-Session", group=grpSess)
+
+grpSessClr  = "Session Colors"
+preColor    = input.color(color.olive, title="Pre-Market Color",   group=grpSessClr)
+nyColor     = input.color(color.lime,  title="NY Session Color",   group=grpSessClr)
+gbColor     = input.color(color.blue,  title="London Session Color", group=grpSessClr)
+postColor   = input.color(color.gray,  title="Post-Market Color",  group=grpSessClr)
+sessTransp  = input.int(75, title="Session BG Transparency", minval=0, maxval=100, group=grpSessClr)
+
+// =============================================================================
+// VERTICAL LINE / SUNDAY
+// =============================================================================
+grpVL          = "Vertical Line & Sunday"
+vlColor        = input.color(color.gray, title="Vertical Line Color", group=grpVL)
+vlWidth        = input.int(1, title="Vertical Line Width", minval=1, maxval=10, group=grpVL)
+vlStyleOpt     = input.string("Solid", title="Vertical Line Style", options=["Solid", "Dashed", "Dotted"], group=grpVL)
+vlStyle        = vlStyleOpt == "Solid" ? line.style_solid : vlStyleOpt == "Dashed" ? line.style_dashed : line.style_dotted
+
+sundayColor    = input.color(color.red, title="Sunday BG Color",  group=grpVL)
+sundayTransp   = input.int(60, title="Sunday BG Transparency", minval=0, maxval=100, group=grpVL)
+
+// =============================================================================
+// EXTRAS (Engulfing / Experimental)
+// =============================================================================
+grpExtra        = "Extras"
+engulfColor     = input.color(color.blue,   title="Engulfing Bar Color", group=grpExtra)
+experimentColor = input.color(color.maroon, title="Experimental Star Color", group=grpExtra)
+
+// =============================================================================
+// ENGULFING
+// =============================================================================
+insideBar = plotCross and high < high[1] and low > low[1]
+plotshape(insideBar, style=shape.xcross, location=location.abovebar, color=engulfColor, title="Engulfing Bars")
+
+// =============================================================================
+// HTF DATA
+// =============================================================================
 prevCloseHTF = request.security(syminfo.tickerid, higherTF, close[1], lookahead=barmerge.lookahead_on)
 prevOpenHTF  = request.security(syminfo.tickerid, higherTF, open[1],  lookahead=barmerge.lookahead_on)
 prevHighHTF  = request.security(syminfo.tickerid, higherTF, high[1],  lookahead=barmerge.lookahead_on)
@@ -37,17 +102,19 @@ prevLowHTF   = request.security(syminfo.tickerid, higherTF, low[1],   lookahead=
 highLevel = prevHighHTF
 lowLevel  = prevLowHTF
 
-// ---------------- EXPERIMENTAL STAR ----------------
+// Experimental star
 equalHigh = (prevCloseHTF[2] > prevOpenHTF[2] and prevOpenHTF[2] < prevCloseHTF[1] and prevHighHTF[1] > open and prevOpenHTF[1] > close) ? prevCloseHTF[1] : 0
-plotchar(equalHigh, color=color.maroon, title="Experimental")
+plotchar(equalHigh, color=experimentColor, title="Experimental")
 
-// ---------------- BUFFER BANDS ----------------
+// Buffer levels
 highLevelH = highLevel + (bufferTicks * syminfo.mintick)
 highLevelL = highLevel - (bufferTicks * syminfo.mintick)
 lowLevelH  = lowLevel  + (bufferTicks * syminfo.mintick)
 lowLevelL  = lowLevel  - (bufferTicks * syminfo.mintick)
 
-// ---------------- LINES ----------------
+// =============================================================================
+// LINES
+// =============================================================================
 var line lowLine   = na
 var line lowLineH  = na
 var line lowLineL  = na
@@ -60,18 +127,19 @@ isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily
 if lables and highLevel[1] != highLevel and isIntraday
     line.set_x2(highLine, bar_index)
     line.set_extend(highLine, extend.none)
-    highLine := line.new(bar_index, highLevel, bar_index, highLevel, width=2, extend=extend.right)
+    highLine := line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
     line.set_x2(lowLine, bar_index)
     line.set_extend(lowLine, extend.none)
-    lowLine := line.new(bar_index, lowLevel, bar_index, lowLevel, width=2, extend=extend.right)
-    label.new(bar_index, highLevel, "H", style=label.style_none, textcolor=color.blue)
-    label.new(bar_index, lowLevel,  "L", style=label.style_none, textcolor=color.blue)
+    lowLine := line.new(bar_index, lowLevel, bar_index, lowLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+    if showHLLabels
+        label.new(bar_index, highLevel, "H", style=label.style_none, textcolor=hlLabelColor)
+        label.new(bar_index, lowLevel,  "L", style=label.style_none, textcolor=hlLabelColor)
 
 if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
     line.set_x2(lowLine, bar_index)
     line.set_x2(highLine, bar_index)
 
-if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
+if lables and showBuffer and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
     line.set_x2(highLineH, bar_index)
     line.set_x2(highLineL, bar_index)
     line.set_x2(lowLineH,  bar_index)
@@ -80,61 +148,47 @@ if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntr
     line.set_extend(highLineL, extend.none)
     line.set_extend(lowLineH,  extend.none)
     line.set_extend(lowLineL,  extend.none)
-    lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=2, extend=extend.right, color=color.gray)
-    lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=2, extend=extend.right, color=color.gray)
-    highLineH := line.new(bar_index, highLevelH, bar_index, highLevelH, width=2, extend=extend.right, color=color.gray)
-    highLineL := line.new(bar_index, highLevelL, bar_index, highLevelL, width=2, extend=extend.right, color=color.gray)
+    lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+    lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+    highLineH := line.new(bar_index, highLevelH, bar_index, highLevelH, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
+    highLineL := line.new(bar_index, highLevelL, bar_index, highLevelL, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
 
-// ---------------- SESSIONS ----------------
-baseTimeValue = "1"
-res        = input.timeframe(baseTimeValue, title="Resolution")
-
-NYsessPre  = input.session("0800-0830", title="NY PRE-Session")
-NYsess     = input.session("0830-1100", title="NY Session")
-NYsessPost = input.session("1100-1130", title="NY POST-Session")
-
-GBsessPre  = input.session("0230-0300", title="GB PRE-Session")
-GBsess     = input.session("0300-0500", title="GB Session")
-GBsessPost = input.session("0500-0530", title="GB POST-Session")
-
-color premarket   = color.olive
-color inSessionNY = color.lime
-color inSessionGB = color.blue
-color postmarket  = color.gray
-color notrading   = na
+// =============================================================================
+// SESSION SHADING
+// =============================================================================
+color notrading = na
 
 timeinrange(_res, _sess) => time(_res, _sess) != 0
 
-sessioncolorNY = timeinrange(baseTimeValue, NYsessPre) ? premarket : timeinrange(baseTimeValue, NYsess) ? inSessionNY : timeinrange(baseTimeValue, NYsessPost) ? postmarket : notrading
-bgcolor(showSessions ? color.new(sessioncolorNY, 75) : na, title="New York Session")
+sessioncolorNY = timeinrange(baseTimeValue, NYsessPre) ? preColor : timeinrange(baseTimeValue, NYsess) ? nyColor : timeinrange(baseTimeValue, NYsessPost) ? postColor : notrading
+bgcolor(showSessions ? color.new(sessioncolorNY, sessTransp) : na, title="New York Session")
 
-sessioncolorGB = timeinrange(baseTimeValue, GBsessPre) ? premarket : timeinrange(baseTimeValue, GBsess) ? inSessionGB : timeinrange(baseTimeValue, GBsessPost) ? postmarket : notrading
-bgcolor(showSessions ? color.new(sessioncolorGB, 75) : na, title="London Session")
+sessioncolorGB = timeinrange(baseTimeValue, GBsessPre) ? preColor : timeinrange(baseTimeValue, GBsess) ? gbColor : timeinrange(baseTimeValue, GBsessPost) ? postColor : notrading
+bgcolor(showSessions ? color.new(sessioncolorGB, sessTransp) : na, title="London Session")
 
-// ---------------- VERTICAL LINES ----------------
+// =============================================================================
+// VERTICAL LINES
+// =============================================================================
 verticalLine(BarIndex, Color, LineStyle, LineWidth) =>
     line.new(BarIndex, low - ta.tr, BarIndex, high + ta.tr, xloc.bar_index, extend.both, Color, LineStyle, LineWidth)
 
-isDaily      = timeframe.isdaily ? "W" : "D"
-showVertLine = input.bool(true, title="Show Vertical Line")
+isDaily = timeframe.isdaily ? "W" : "D"
 
 if ta.change(time(isDaily)) and showVertLine and ta.change(time(timeframe.period)) and timeframe.period != "W" and timeframe.period != "M"
-    verticalLine(bar_index, color.gray, line.style_solid, 1)
+    verticalLine(bar_index, vlColor, vlStyle, vlWidth)
 
-// Sunday paint
-isSunday()  => dayofweek == dayofweek.sunday
-paintBGColor = color.red
-paintBG = (isSunday() and showVertLine and ta.change(time(timeframe.period)) and timeframe.period != "W" and timeframe.period != "M") ? paintBGColor : notrading
-bgcolor(color.new(paintBG, 60), title="Sunday Color")
+isSunday() => dayofweek == dayofweek.sunday
+paintBG = (isSunday() and showVertLine and ta.change(time(timeframe.period)) and timeframe.period != "W" and timeframe.period != "M") ? sundayColor : notrading
+bgcolor(color.new(paintBG, sundayTransp), title="Sunday Color")
 
-// ---------------- ALERTS ----------------
-// Cross detection against the previous-period high/low levels.
-crossAboveHigh = ta.crossover(close, highLevel)
-crossBelowHigh = ta.crossunder(close, highLevel)
-crossAboveLow  = ta.crossover(close, lowLevel)
-crossBelowLow  = ta.crossunder(close, lowLevel)
+// =============================================================================
+// ALERTS
+// =============================================================================
+crossAboveHigh  = ta.crossover(close, highLevel)
+crossBelowHigh  = ta.crossunder(close, highLevel)
+crossAboveLow   = ta.crossover(close, lowLevel)
+crossBelowLow   = ta.crossunder(close, lowLevel)
 
-// Cross detection against the +/- buffer bands.
 crossAboveHighH = ta.crossover(close, highLevelH)
 crossBelowHighL = ta.crossunder(close, highLevelL)
 crossAboveLowH  = ta.crossover(close, lowLevelH)
