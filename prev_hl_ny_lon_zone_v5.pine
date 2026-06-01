@@ -37,6 +37,9 @@ hlStyle        = hlStyleOpt == "Solid" ? line.style_solid : hlStyleOpt == "Dashe
 
 hlLabelColor   = input.color(color.blue,  title="H/L Label Text Color", group=grpHL)
 showHLLabels   = input.bool(true,         title="Show H/L Labels",       group=grpHL)
+hideBroken     = input.bool(false,        title="Hide H/L After Broken", group=grpHL,
+     tooltip="When enabled, the High line stops extending once price trades above it, and the Low line stops extending once price trades below it.")
+breakSrcOpt    = input.string("Wick", title="Break Source", options=["Wick", "Close"], group=grpHL)
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -115,14 +118,19 @@ lowLevelL  = lowLevel  - (bufferTicks * syminfo.mintick)
 // =============================================================================
 // LINES
 // =============================================================================
-var line lowLine   = na
-var line lowLineH  = na
-var line lowLineL  = na
-var line highLine  = na
-var line highLineH = na
-var line highLineL = na
+var line lowLine    = na
+var line lowLineH   = na
+var line lowLineL   = na
+var line highLine   = na
+var line highLineH  = na
+var line highLineL  = na
+var bool highBroken = false
+var bool lowBroken  = false
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
+
+highBreakSrc = breakSrcOpt == "Close" ? close : high
+lowBreakSrc  = breakSrcOpt == "Close" ? close : low
 
 if lables and highLevel[1] != highLevel and isIntraday
     line.set_x2(highLine, bar_index)
@@ -134,20 +142,47 @@ if lables and highLevel[1] != highLevel and isIntraday
     if showHLLabels
         label.new(bar_index, highLevel, "H", style=label.style_none, textcolor=hlLabelColor)
         label.new(bar_index, lowLevel,  "L", style=label.style_none, textcolor=hlLabelColor)
+    highBroken := false
+    lowBroken  := false
+
+// Freeze H/L (and buffer) lines once the level is taken out
+if lables and hideBroken and isIntraday
+    if not highBroken and not na(highLine) and highBreakSrc > highLevel
+        highBroken := true
+        line.set_x2(highLine, bar_index)
+        line.set_extend(highLine, extend.none)
+        if not na(highLineH)
+            line.set_x2(highLineH, bar_index)
+            line.set_extend(highLineH, extend.none)
+            line.set_x2(highLineL, bar_index)
+            line.set_extend(highLineL, extend.none)
+    if not lowBroken and not na(lowLine) and lowBreakSrc < lowLevel
+        lowBroken := true
+        line.set_x2(lowLine, bar_index)
+        line.set_extend(lowLine, extend.none)
+        if not na(lowLineH)
+            line.set_x2(lowLineH, bar_index)
+            line.set_extend(lowLineH, extend.none)
+            line.set_x2(lowLineL, bar_index)
+            line.set_extend(lowLineL, extend.none)
 
 if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
-    line.set_x2(lowLine, bar_index)
-    line.set_x2(highLine, bar_index)
+    if not (hideBroken and lowBroken)
+        line.set_x2(lowLine, bar_index)
+    if not (hideBroken and highBroken)
+        line.set_x2(highLine, bar_index)
 
 if lables and showBuffer and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
-    line.set_x2(highLineH, bar_index)
-    line.set_x2(highLineL, bar_index)
-    line.set_x2(lowLineH,  bar_index)
-    line.set_x2(lowLineL,  bar_index)
-    line.set_extend(highLineH, extend.none)
-    line.set_extend(highLineL, extend.none)
-    line.set_extend(lowLineH,  extend.none)
-    line.set_extend(lowLineL,  extend.none)
+    if not (hideBroken and highBroken)
+        line.set_x2(highLineH, bar_index)
+        line.set_x2(highLineL, bar_index)
+        line.set_extend(highLineH, extend.none)
+        line.set_extend(highLineL, extend.none)
+    if not (hideBroken and lowBroken)
+        line.set_x2(lowLineH,  bar_index)
+        line.set_x2(lowLineL,  bar_index)
+        line.set_extend(lowLineH,  extend.none)
+        line.set_extend(lowLineL,  extend.none)
     lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
     lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
     highLineH := line.new(bar_index, highLevelH, bar_index, highLevelH, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
