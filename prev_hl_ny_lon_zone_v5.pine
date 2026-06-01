@@ -40,6 +40,10 @@ showHLLabels   = input.bool(true,         title="Show H/L Labels",       group=g
 hideBroken     = input.bool(false,        title="Plot Unbroken Levels Until Taken", group=grpHL,
      tooltip="ON: every period's H/L is plotted and keeps extending across subsequent periods until price trades through it. OFF: only the most recent period's H/L is drawn (capped at the next period boundary).")
 breakSrcOpt    = input.string("Wick", title="Break Source", options=["Wick", "Close"], group=grpHL)
+lookbackPeriods = input.int(30, title="Lookback Periods (max 500)", minval=1, maxval=500, group=grpHL,
+     tooltip="How many past period H/L pairs to keep on the chart. Older lines and labels are auto-deleted as new periods come in. Only applies when Plot Unbroken Levels is ON.")
+dateFmt        = input.string("MMM dd", title="H/L Label Date Format", group=grpHL,
+     tooltip="str.format_time tokens, e.g. yyyy-MM-dd, MMM dd, dd/MM")
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -101,6 +105,7 @@ prevCloseHTF = request.security(syminfo.tickerid, higherTF, close[1], lookahead=
 prevOpenHTF  = request.security(syminfo.tickerid, higherTF, open[1],  lookahead=barmerge.lookahead_on)
 prevHighHTF  = request.security(syminfo.tickerid, higherTF, high[1],  lookahead=barmerge.lookahead_on)
 prevLowHTF   = request.security(syminfo.tickerid, higherTF, low[1],   lookahead=barmerge.lookahead_on)
+prevTimeHTF  = request.security(syminfo.tickerid, higherTF, time[1],  lookahead=barmerge.lookahead_on)
 
 highLevel = prevHighHTF
 lowLevel  = prevLowHTF
@@ -129,25 +134,54 @@ var line highLineL  = na
 
 // Multi-line state (used when hideBroken = true). Every period adds a new
 // pair of lines that keeps extending until price takes the level out.
-var array<line>  hLineArr  = array.new<line>()
-var array<float> hLevelArr = array.new<float>()
-var array<line>  lLineArr  = array.new<line>()
-var array<float> lLevelArr = array.new<float>()
+var array<line>  hLineArr   = array.new<line>()
+var array<float> hLevelArr  = array.new<float>()
+var array<bool>  hBrokenArr = array.new<bool>()
+var array<label> hLabelArr  = array.new<label>()
+var array<line>  lLineArr   = array.new<line>()
+var array<float> lLevelArr  = array.new<float>()
+var array<bool>  lBrokenArr = array.new<bool>()
+var array<label> lLabelArr  = array.new<label>()
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
 
 highBreakSrc = breakSrcOpt == "Close" ? close : high
 lowBreakSrc  = breakSrcOpt == "Close" ? close : low
 
+// Date label for the previous-period H/L
+labelDateStr = str.format_time(prevTimeHTF, dateFmt, syminfo.timezone)
+labelTxtH    = "H " + labelDateStr
+labelTxtL    = "L " + labelDateStr
+
 // New period: add new H/L lines
 if lables and highLevel[1] != highLevel and isIntraday
     if hideBroken
+        // Trim oldest tracked entries down to the lookback budget
+        while array.size(hLineArr) >= lookbackPeriods
+            line.delete(array.shift(hLineArr))
+            array.shift(hLevelArr)
+            array.shift(hBrokenArr)
+            if array.size(hLabelArr) > 0
+                label.delete(array.shift(hLabelArr))
+        while array.size(lLineArr) >= lookbackPeriods
+            line.delete(array.shift(lLineArr))
+            array.shift(lLevelArr)
+            array.shift(lBrokenArr)
+            if array.size(lLabelArr) > 0
+                label.delete(array.shift(lLabelArr))
         nH = line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
         nL = line.new(bar_index, lowLevel,  bar_index, lowLevel,  width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
-        array.push(hLineArr,  nH)
-        array.push(hLevelArr, highLevel)
-        array.push(lLineArr,  nL)
-        array.push(lLevelArr, lowLevel)
+        array.push(hLineArr,   nH)
+        array.push(hLevelArr,  highLevel)
+        array.push(hBrokenArr, false)
+        array.push(lLineArr,   nL)
+        array.push(lLevelArr,  lowLevel)
+        array.push(lBrokenArr, false)
+        if showHLLabels
+            lblH = label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
+            lblL = label.new(bar_index, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
+            array.push(hLabelArr, lblH)
+            array.push(lLabelArr, lblL)
     else
         if not na(highLine)
             line.set_x2(highLine, bar_index)
@@ -171,34 +205,28 @@ if lables and highLevel[1] != highLevel and isIntraday
             highLineL := line.new(bar_index, highLevelL, bar_index, highLevelL, width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
             lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
             lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=bufferWidth, extend=extend.right, color=bufferColor, style=bufferStyle)
-    if showHLLabels
-        label.new(bar_index, highLevel, "H", style=label.style_none, textcolor=hlLabelColor)
-        label.new(bar_index, lowLevel,  "L", style=label.style_none, textcolor=hlLabelColor)
+        if showHLLabels
+            label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
+            label.new(bar_index, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
 
 // Each bar: freeze any tracked line whose level has just been broken.
 if lables and hideBroken and isIntraday
-    i = 0
-    while i < array.size(hLineArr)
-        lvl = array.get(hLevelArr, i)
-        ln  = array.get(hLineArr,  i)
-        if highBreakSrc > lvl
-            line.set_x2(ln, bar_index)
-            line.set_extend(ln, extend.none)
-            array.remove(hLineArr,  i)
-            array.remove(hLevelArr, i)
-        else
-            i += 1
-    j = 0
-    while j < array.size(lLineArr)
-        lvl = array.get(lLevelArr, j)
-        ln  = array.get(lLineArr,  j)
-        if lowBreakSrc < lvl
-            line.set_x2(ln, bar_index)
-            line.set_extend(ln, extend.none)
-            array.remove(lLineArr,  j)
-            array.remove(lLevelArr, j)
-        else
-            j += 1
+    if array.size(hLineArr) > 0
+        for i = 0 to array.size(hLineArr) - 1
+            if not array.get(hBrokenArr, i)
+                if highBreakSrc > array.get(hLevelArr, i)
+                    ln = array.get(hLineArr, i)
+                    line.set_x2(ln, bar_index)
+                    line.set_extend(ln, extend.none)
+                    array.set(hBrokenArr, i, true)
+    if array.size(lLineArr) > 0
+        for j = 0 to array.size(lLineArr) - 1
+            if not array.get(lBrokenArr, j)
+                if lowBreakSrc < array.get(lLevelArr, j)
+                    ln = array.get(lLineArr, j)
+                    line.set_x2(ln, bar_index)
+                    line.set_extend(ln, extend.none)
+                    array.set(lBrokenArr, j, true)
 
 // =============================================================================
 // SESSION SHADING
