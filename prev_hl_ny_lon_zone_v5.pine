@@ -127,13 +127,17 @@ calNewPeriod = pp_period == "Day"   ? (ta.change(dayofmonth) != 0 and not skipDa
                pp_period == "Week"  ? ta.change(weekofyear) != 0 :
                pp_period == "Month" ? ta.change(month) != 0 :
                                       ta.change(year) != 0
-var float curPeriodHigh   = na
-var float curPeriodLow    = na
-var float trackedPrevH    = na
-var float trackedPrevL    = na
-var int   trackedPrevTime = na
-var int   curPeriodStart  = na
+var float curPeriodHigh    = na
+var float curPeriodLow     = na
+var float trackedPrevH     = na
+var float trackedPrevL     = na
+var int   trackedPrevTime  = na
+var int   curPeriodStart   = na
+var int   curPeriodStartBar  = na
+var int   prevPeriodStartBar = na
 if calNewPeriod
+    prevPeriodStartBar := curPeriodStartBar
+    curPeriodStartBar  := bar_index
     trackedPrevH    := curPeriodHigh
     trackedPrevL    := curPeriodLow
     trackedPrevTime := nz(curPeriodStart, time)
@@ -199,6 +203,11 @@ labelTxtL    = "L " + labelDateStr
 // behavior for backward compatibility.
 newPeriod = useCalendar ? calNewPeriod : (not na(prevTimeHTF[1]) and prevTimeHTF != prevTimeHTF[1])
 
+// x1 anchor for new H/L lines. In Calendar mode, anchor to the previous
+// period's first bar so the level visually spans Fri's session, the weekend
+// gap, and into Monday rather than starting at Monday's first bar.
+lineX1 = useCalendar ? nz(prevPeriodStartBar, bar_index) : bar_index
+
 // Break check FIRST so newly created lines get at least one bar of visibility
 // before they can be frozen. Capped x2 is clamped to at least x1+minBarsVisible
 // so an opening-bar wick past the level doesn't produce an invisible zero-
@@ -241,7 +250,7 @@ if lables and newPeriod and isIntraday
             if array.size(lLabelArr) > 0
                 label.delete(array.shift(lLabelArr))
         if not na(highLevel)
-            nH = line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+            nH = line.new(lineX1, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
             array.push(hLineArr,    nH)
             array.push(hLevelArr,   highLevel)
             array.push(hBrokenArr,  false)
@@ -250,7 +259,7 @@ if lables and newPeriod and isIntraday
                 lblH = label.new(bar_index, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
                 array.push(hLabelArr, lblH)
         if not na(lowLevel)
-            nL = line.new(bar_index, lowLevel, bar_index, lowLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+            nL = line.new(lineX1, lowLevel, bar_index, lowLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
             array.push(lLineArr,    nL)
             array.push(lLevelArr,   lowLevel)
             array.push(lBrokenArr,  false)
@@ -266,9 +275,9 @@ if lables and newPeriod and isIntraday
             line.set_x2(lowLine, math.max(bar_index, line.get_x1(lowLine) + minBarsVisible))
             line.set_extend(lowLine, extend.none)
         if not na(highLevel)
-            highLine := line.new(bar_index, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+            highLine := line.new(lineX1, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
         if not na(lowLevel)
-            lowLine  := line.new(bar_index, lowLevel,  bar_index, lowLevel,  width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+            lowLine  := line.new(lineX1, lowLevel,  bar_index, lowLevel,  width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
         if showBuffer
             if not na(highLineH)
                 line.set_x2(highLineH, bar_index)
