@@ -1,0 +1,164 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © NickDolan 2020-May-30 - v5 conversion 2026
+//
+// Previous High/Low by Period + NY & London session shading.
+// Pine v5 conversion adds alertcondition() outputs for price crossing
+// the previous-period high/low lines (and the +/- buffer bands).
+//
+// Legend
+//   RED BG       = Sunday Trading
+//   MAROON STAR  = Experimental significant-move marker
+//   Blue X       = Engulfing candle
+//-----------------------------------------------------------------------------
+
+//@version=5
+indicator("Prevous High & Low by Period + NY & Lon Zone", shorttitle="H/L GB+NY", overlay=true)
+
+// ---------------- INPUTS ----------------
+lables       = input.bool(true, title="Show High/Lows")
+showSessions = input.bool(true, title="Show Sessions")
+pp_period    = input.string("Day", title="Period", options=["Day", "Week", "Month", "Year"])
+higherTF     = pp_period == "Day" ? "D" : pp_period == "Week" ? "W" : pp_period == "Month" ? "M" : "Y"
+
+// Buffer (in mintick units) above/below the level used for the gray bands.
+bufferTicks  = input.int(100, title="High/Low Buffer (mintick units)", minval=0)
+
+// Engulfing
+plotCross    = input.bool(true, title="Show Engulfing Bar")
+insideBar    = plotCross and high < high[1] and low > low[1]
+plotshape(insideBar, style=shape.xcross, location=location.abovebar, color=color.blue, title="Engulfing Bars")
+
+// ---------------- HTF DATA ----------------
+prevCloseHTF = request.security(syminfo.tickerid, higherTF, close[1], lookahead=barmerge.lookahead_on)
+prevOpenHTF  = request.security(syminfo.tickerid, higherTF, open[1],  lookahead=barmerge.lookahead_on)
+prevHighHTF  = request.security(syminfo.tickerid, higherTF, high[1],  lookahead=barmerge.lookahead_on)
+prevLowHTF   = request.security(syminfo.tickerid, higherTF, low[1],   lookahead=barmerge.lookahead_on)
+
+highLevel = prevHighHTF
+lowLevel  = prevLowHTF
+
+// ---------------- EXPERIMENTAL STAR ----------------
+equalHigh = (prevCloseHTF[2] > prevOpenHTF[2] and prevOpenHTF[2] < prevCloseHTF[1] and prevHighHTF[1] > open and prevOpenHTF[1] > close) ? prevCloseHTF[1] : 0
+plotchar(equalHigh, color=color.maroon, title="Experimental")
+
+// ---------------- BUFFER BANDS ----------------
+highLevelH = highLevel + (bufferTicks * syminfo.mintick)
+highLevelL = highLevel - (bufferTicks * syminfo.mintick)
+lowLevelH  = lowLevel  + (bufferTicks * syminfo.mintick)
+lowLevelL  = lowLevel  - (bufferTicks * syminfo.mintick)
+
+// ---------------- LINES ----------------
+var line lowLine   = na
+var line lowLineH  = na
+var line lowLineL  = na
+var line highLine  = na
+var line highLineH = na
+var line highLineL = na
+
+isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
+
+if lables and highLevel[1] != highLevel and isIntraday
+    line.set_x2(highLine, bar_index)
+    line.set_extend(highLine, extend.none)
+    highLine := line.new(bar_index, highLevel, bar_index, highLevel, width=2, extend=extend.right)
+    line.set_x2(lowLine, bar_index)
+    line.set_extend(lowLine, extend.none)
+    lowLine := line.new(bar_index, lowLevel, bar_index, lowLevel, width=2, extend=extend.right)
+    label.new(bar_index, highLevel, "H", style=label.style_none, textcolor=color.blue)
+    label.new(bar_index, lowLevel,  "L", style=label.style_none, textcolor=color.blue)
+
+if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
+    line.set_x2(lowLine, bar_index)
+    line.set_x2(highLine, bar_index)
+
+if lables and not na(highLine) and line.get_x2(highLine) != bar_index and isIntraday
+    line.set_x2(highLineH, bar_index)
+    line.set_x2(highLineL, bar_index)
+    line.set_x2(lowLineH,  bar_index)
+    line.set_x2(lowLineL,  bar_index)
+    line.set_extend(highLineH, extend.none)
+    line.set_extend(highLineL, extend.none)
+    line.set_extend(lowLineH,  extend.none)
+    line.set_extend(lowLineL,  extend.none)
+    lowLineH  := line.new(bar_index, lowLevelH,  bar_index, lowLevelH,  width=2, extend=extend.right, color=color.gray)
+    lowLineL  := line.new(bar_index, lowLevelL,  bar_index, lowLevelL,  width=2, extend=extend.right, color=color.gray)
+    highLineH := line.new(bar_index, highLevelH, bar_index, highLevelH, width=2, extend=extend.right, color=color.gray)
+    highLineL := line.new(bar_index, highLevelL, bar_index, highLevelL, width=2, extend=extend.right, color=color.gray)
+
+// ---------------- SESSIONS ----------------
+baseTimeValue = "1"
+res        = input.timeframe(baseTimeValue, title="Resolution")
+
+NYsessPre  = input.session("0800-0830", title="NY PRE-Session")
+NYsess     = input.session("0830-1100", title="NY Session")
+NYsessPost = input.session("1100-1130", title="NY POST-Session")
+
+GBsessPre  = input.session("0230-0300", title="GB PRE-Session")
+GBsess     = input.session("0300-0500", title="GB Session")
+GBsessPost = input.session("0500-0530", title="GB POST-Session")
+
+color premarket   = color.olive
+color inSessionNY = color.lime
+color inSessionGB = color.blue
+color postmarket  = color.gray
+color notrading   = na
+
+timeinrange(_res, _sess) => time(_res, _sess) != 0
+
+sessioncolorNY = timeinrange(baseTimeValue, NYsessPre) ? premarket : timeinrange(baseTimeValue, NYsess) ? inSessionNY : timeinrange(baseTimeValue, NYsessPost) ? postmarket : notrading
+bgcolor(showSessions ? color.new(sessioncolorNY, 75) : na, title="New York Session")
+
+sessioncolorGB = timeinrange(baseTimeValue, GBsessPre) ? premarket : timeinrange(baseTimeValue, GBsess) ? inSessionGB : timeinrange(baseTimeValue, GBsessPost) ? postmarket : notrading
+bgcolor(showSessions ? color.new(sessioncolorGB, 75) : na, title="London Session")
+
+// ---------------- VERTICAL LINES ----------------
+verticalLine(BarIndex, Color, LineStyle, LineWidth) =>
+    line.new(BarIndex, low - ta.tr, BarIndex, high + ta.tr, xloc.bar_index, extend.both, Color, LineStyle, LineWidth)
+
+isDaily      = timeframe.isdaily ? "W" : "D"
+showVertLine = input.bool(true, title="Show Vertical Line")
+
+if ta.change(time(isDaily)) and showVertLine and ta.change(time(timeframe.period)) and timeframe.period != "W" and timeframe.period != "M"
+    verticalLine(bar_index, color.gray, line.style_solid, 1)
+
+// Sunday paint
+isSunday()  => dayofweek == dayofweek.sunday
+paintBGColor = color.red
+paintBG = (isSunday() and showVertLine and ta.change(time(timeframe.period)) and timeframe.period != "W" and timeframe.period != "M") ? paintBGColor : notrading
+bgcolor(color.new(paintBG, 60), title="Sunday Color")
+
+// ---------------- ALERTS ----------------
+// Cross detection against the previous-period high/low levels.
+crossAboveHigh = ta.crossover(close, highLevel)
+crossBelowHigh = ta.crossunder(close, highLevel)
+crossAboveLow  = ta.crossover(close, lowLevel)
+crossBelowLow  = ta.crossunder(close, lowLevel)
+
+// Cross detection against the +/- buffer bands.
+crossAboveHighH = ta.crossover(close, highLevelH)
+crossBelowHighL = ta.crossunder(close, highLevelL)
+crossAboveLowH  = ta.crossover(close, lowLevelH)
+crossBelowLowL  = ta.crossunder(close, lowLevelL)
+
+alertcondition(crossAboveHigh, title="Price crossed ABOVE previous High",
+     message="{{ticker}} {{interval}}: close crossed ABOVE previous-period High at {{close}}")
+alertcondition(crossBelowHigh, title="Price crossed BELOW previous High",
+     message="{{ticker}} {{interval}}: close crossed BELOW previous-period High at {{close}}")
+alertcondition(crossAboveLow,  title="Price crossed ABOVE previous Low",
+     message="{{ticker}} {{interval}}: close crossed ABOVE previous-period Low at {{close}}")
+alertcondition(crossBelowLow,  title="Price crossed BELOW previous Low",
+     message="{{ticker}} {{interval}}: close crossed BELOW previous-period Low at {{close}}")
+
+alertcondition(crossAboveHigh or crossBelowHigh, title="Price crossed previous High (either side)",
+     message="{{ticker}} {{interval}}: close crossed previous-period High at {{close}}")
+alertcondition(crossAboveLow  or crossBelowLow,  title="Price crossed previous Low (either side)",
+     message="{{ticker}} {{interval}}: close crossed previous-period Low at {{close}}")
+
+alertcondition(crossAboveHighH, title="Price crossed ABOVE High +buffer",
+     message="{{ticker}} {{interval}}: close crossed ABOVE High+buffer at {{close}}")
+alertcondition(crossBelowHighL, title="Price crossed BELOW High -buffer",
+     message="{{ticker}} {{interval}}: close crossed BELOW High-buffer at {{close}}")
+alertcondition(crossAboveLowH,  title="Price crossed ABOVE Low +buffer",
+     message="{{ticker}} {{interval}}: close crossed ABOVE Low+buffer at {{close}}")
+alertcondition(crossBelowLowL,  title="Price crossed BELOW Low -buffer",
+     message="{{ticker}} {{interval}}: close crossed BELOW Low-buffer at {{close}}")
