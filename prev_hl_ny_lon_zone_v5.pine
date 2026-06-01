@@ -156,15 +156,16 @@ if lables and showBuffer and not na(highLine) and line.get_x2(highLine) != bar_i
 // =============================================================================
 // SESSION SHADING
 // =============================================================================
-color notrading = na
-
 timeinrange(_res, _sess) => time(_res, _sess) != 0
 
-sessioncolorNY = timeinrange(baseTimeValue, NYsessPre) ? preColor : timeinrange(baseTimeValue, NYsess) ? nyColor : timeinrange(baseTimeValue, NYsessPost) ? postColor : notrading
-bgcolor(showSessions ? color.new(sessioncolorNY, sessTransp) : na, title="New York Session")
+inNY = timeinrange(baseTimeValue, NYsessPre) or timeinrange(baseTimeValue, NYsess) or timeinrange(baseTimeValue, NYsessPost)
+inGB = timeinrange(baseTimeValue, GBsessPre) or timeinrange(baseTimeValue, GBsess) or timeinrange(baseTimeValue, GBsessPost)
 
-sessioncolorGB = timeinrange(baseTimeValue, GBsessPre) ? preColor : timeinrange(baseTimeValue, GBsess) ? gbColor : timeinrange(baseTimeValue, GBsessPost) ? postColor : notrading
-bgcolor(showSessions ? color.new(sessioncolorGB, sessTransp) : na, title="London Session")
+sessioncolorNY = timeinrange(baseTimeValue, NYsessPre) ? preColor : timeinrange(baseTimeValue, NYsess) ? nyColor : timeinrange(baseTimeValue, NYsessPost) ? postColor : na
+sessioncolorGB = timeinrange(baseTimeValue, GBsessPre) ? preColor : timeinrange(baseTimeValue, GBsess) ? gbColor : timeinrange(baseTimeValue, GBsessPost) ? postColor : na
+
+bgcolor(showSessions and inNY ? color.new(sessioncolorNY, sessTransp) : na, title="New York Session")
+bgcolor(showSessions and inGB ? color.new(sessioncolorGB, sessTransp) : na, title="London Session")
 
 // =============================================================================
 // VERTICAL LINES
@@ -178,8 +179,8 @@ if ta.change(time(isDaily)) and showVertLine and ta.change(time(timeframe.period
     verticalLine(bar_index, vlColor, vlStyle, vlWidth)
 
 isSunday() => dayofweek == dayofweek.sunday
-paintBG = (isSunday() and showVertLine and ta.change(time(timeframe.period)) and timeframe.period != "W" and timeframe.period != "M") ? sundayColor : notrading
-bgcolor(color.new(paintBG, sundayTransp), title="Sunday Color")
+sundayActive = isSunday() and showVertLine and timeframe.period != "W" and timeframe.period != "M"
+bgcolor(sundayActive ? color.new(sundayColor, sundayTransp) : na, title="Sunday Color")
 
 // =============================================================================
 // ALERTS
