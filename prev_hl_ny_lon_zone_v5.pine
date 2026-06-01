@@ -51,6 +51,8 @@ breakBufferTicks = input.int(1, title="Break Tolerance (mintick units)", minval=
      tooltip="Price must exceed the H/L level by at least this many mintick units before the line is considered broken. Prevents float-precision noise (where the bar's high equals the stored daily high) from instantly freezing the most-recent line. Set to 0 for strict comparison.")
 graceBars      = input.int(1, title="Break Detection Grace (bars)", minval=0, maxval=50, group=grpHL,
      tooltip="A newly created line cannot be marked broken for this many bars after creation. Default 1 keeps the very-first bar after the new HTF period from instantly freezing the line.")
+detectionMethod = input.string("Calendar", title="Boundary Detection", options=["Calendar", "HTF Security"], group=grpHL,
+     tooltip="Calendar (recommended): detects a new period via change of dayofmonth / weekofyear / month / year in the symbol's timezone, and tracks H/L from the chart bars themselves. Bulletproof to forex weekend gaps and live-bar lookahead repaints. HTF Security: original behavior using request.security with lookahead_on.")
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -114,8 +116,34 @@ prevHighHTF  = request.security(syminfo.tickerid, higherTF, high[1],  lookahead=
 prevLowHTF   = request.security(syminfo.tickerid, higherTF, low[1],   lookahead=barmerge.lookahead_on)
 prevTimeHTF  = request.security(syminfo.tickerid, higherTF, time[1],  lookahead=barmerge.lookahead_on)
 
-highLevel = prevHighHTF
-lowLevel  = prevLowHTF
+// Calendar-based period detection and manual H/L tracking. Operates on the
+// chart bars directly so the new-period transition cannot be lost to security
+// lookahead repainting or forex weekend gaps.
+calNewPeriod = pp_period == "Day"   ? ta.change(dayofmonth) != 0 :
+               pp_period == "Week"  ? ta.change(weekofyear) != 0 :
+               pp_period == "Month" ? ta.change(month) != 0 :
+                                      ta.change(year) != 0
+var float curPeriodHigh   = na
+var float curPeriodLow    = na
+var float trackedPrevH    = na
+var float trackedPrevL    = na
+var int   trackedPrevTime = na
+var int   curPeriodStart  = na
+if calNewPeriod
+    trackedPrevH    := curPeriodHigh
+    trackedPrevL    := curPeriodLow
+    trackedPrevTime := nz(curPeriodStart, time)
+    curPeriodHigh   := high
+    curPeriodLow    := low
+    curPeriodStart  := time
+else
+    curPeriodHigh := na(curPeriodHigh) ? high : math.max(curPeriodHigh, high)
+    curPeriodLow  := na(curPeriodLow)  ? low  : math.min(curPeriodLow,  low)
+
+useCalendar = detectionMethod == "Calendar"
+highLevel = useCalendar ? trackedPrevH : prevHighHTF
+lowLevel  = useCalendar ? trackedPrevL : prevLowHTF
+labelTime = useCalendar ? trackedPrevTime : prevTimeHTF
 
 // Experimental star
 equalHigh = (prevCloseHTF[2] > prevOpenHTF[2] and prevOpenHTF[2] < prevCloseHTF[1] and prevHighHTF[1] > open and prevOpenHTF[1] > close) ? prevCloseHTF[1] : 0
@@ -158,14 +186,14 @@ highBreakSrc = breakSrcOpt == "Close" ? close : high
 lowBreakSrc  = breakSrcOpt == "Close" ? close : low
 
 // Date label for the previous-period H/L
-labelDateStr = str.format_time(prevTimeHTF, dateFmt, syminfo.timezone)
+labelDateStr = str.format_time(labelTime, dateFmt, syminfo.timezone)
 labelTxtH    = "H " + labelDateStr
 labelTxtL    = "L " + labelDateStr
 
-// Detect new HTF period via prevTimeHTF changing. Using the same series that
-// drives the label text keeps detection and labels perfectly in sync, and
-// fires reliably across forex weekend gaps and identical-high days.
-newPeriod = not na(prevTimeHTF[1]) and prevTimeHTF != prevTimeHTF[1]
+// Detect new period. Calendar mode uses the calendar-day change (most
+// reliable). HTF Security mode keeps the original prevTimeHTF change
+// behavior for backward compatibility.
+newPeriod = useCalendar ? calNewPeriod : (not na(prevTimeHTF[1]) and prevTimeHTF != prevTimeHTF[1])
 
 // Break check FIRST so newly created lines get at least one bar of visibility
 // before they can be frozen. Capped x2 is clamped to at least x1+minBarsVisible
