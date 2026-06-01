@@ -13,7 +13,8 @@
 //-----------------------------------------------------------------------------
 
 //@version=5
-indicator("Prevous High & Low by Period + NY & Lon Zone", shorttitle="H/L GB+NY", overlay=true)
+indicator("Prevous High & Low by Period + NY & Lon Zone", shorttitle="H/L GB+NY",
+     overlay=true, max_lines_count=500, max_labels_count=500)
 
 // =============================================================================
 // GENERAL
@@ -153,8 +154,14 @@ labelDateStr = str.format_time(prevTimeHTF, dateFmt, syminfo.timezone)
 labelTxtH    = "H " + labelDateStr
 labelTxtL    = "L " + labelDateStr
 
+// Detect new HTF period via the HTF bar's start time changing. This is more
+// reliable than comparing prev high values (which can be identical across
+// periods, or stale around forex weekend gaps with lookahead_on).
+htfStart    = time(higherTF)
+newPeriod   = not na(htfStart[1]) and htfStart != htfStart[1]
+
 // New period: add new H/L lines
-if lables and highLevel[1] != highLevel and isIntraday
+if lables and newPeriod and isIntraday
     if hideBroken
         // Trim oldest tracked entries down to the lookback budget
         while array.size(hLineArr) >= lookbackPeriods
