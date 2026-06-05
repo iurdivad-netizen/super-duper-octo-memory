@@ -58,6 +58,8 @@ labelPosition  = input.string("Right", title="H/L Label Position", options=["Lef
      tooltip="Left: label appears at the line's anchor (the period's first bar). Right: label travels with the chart's right edge for unbroken lines, and freezes at the break point once the line is broken — useful when you want the label out of the price-action area.")
 hideBrokenAfter = input.int(0, title="Auto-Hide Broken Segments After (bars, 0=off)", minval=0, maxval=20000, group=grpHL,
      tooltip="Plot-Unbroken mode only. Once a line is taken out it becomes a frozen segment. Set N > 0 to automatically delete that segment N bars after it was broken — reduces clutter on long histories. 0 keeps every broken segment forever.")
+showDaysAgo    = input.bool(false, title="Show Days Ago in Label", group=grpHL,
+     tooltip="Append the elapsed calendar days since the labeled period to every H/L label, e.g. 'H May 28 (4d)'. Updates each bar so the count stays current.")
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -181,12 +183,16 @@ var array<bool>  hBrokenArr    = array.new<bool>()
 var array<label> hLabelArr     = array.new<label>()
 var array<int>   hCreatedArr   = array.new<int>()
 var array<int>   hBrokenBarArr = array.new<int>()
+var array<int>   hLabelTimeArr = array.new<int>()
 var array<line>  lLineArr      = array.new<line>()
 var array<float> lLevelArr     = array.new<float>()
 var array<bool>  lBrokenArr    = array.new<bool>()
 var array<label> lLabelArr     = array.new<label>()
 var array<int>   lCreatedArr   = array.new<int>()
 var array<int>   lBrokenBarArr = array.new<int>()
+var array<int>   lLabelTimeArr = array.new<int>()
+var int highLabelTime = na
+var int lowLabelTime  = na
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
 
@@ -253,6 +259,7 @@ if lables and newPeriod and isIntraday
             array.shift(hBrokenArr)
             array.shift(hCreatedArr)
             array.shift(hBrokenBarArr)
+            array.shift(hLabelTimeArr)
             if array.size(hLabelArr) > 0
                 lblOld = array.shift(hLabelArr)
                 if not na(lblOld)
@@ -263,6 +270,7 @@ if lables and newPeriod and isIntraday
             array.shift(lBrokenArr)
             array.shift(lCreatedArr)
             array.shift(lBrokenBarArr)
+            array.shift(lLabelTimeArr)
             if array.size(lLabelArr) > 0
                 lblOld = array.shift(lLabelArr)
                 if not na(lblOld)
@@ -275,6 +283,7 @@ if lables and newPeriod and isIntraday
             array.push(hBrokenArr,    false)
             array.push(hCreatedArr,   bar_index)
             array.push(hBrokenBarArr, na)
+            array.push(hLabelTimeArr, labelTime)
             if showHLLabels
                 lblH = label.new(labelX, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
                 array.push(hLabelArr, lblH)
@@ -285,6 +294,7 @@ if lables and newPeriod and isIntraday
             array.push(lBrokenArr,    false)
             array.push(lCreatedArr,   bar_index)
             array.push(lBrokenBarArr, na)
+            array.push(lLabelTimeArr, labelTime)
             if showHLLabels
                 lblL = label.new(labelX, lowLevel, labelTxtL, style=label.style_none, textcolor=hlLabelColor)
                 array.push(lLabelArr, lblL)
@@ -317,6 +327,8 @@ if lables and newPeriod and isIntraday
             slLabelX = labelPosition == "Right" ? bar_index : lineX1
             highLabel := label.new(slLabelX, highLevel, labelTxtH, style=label.style_none, textcolor=hlLabelColor)
             lowLabel  := label.new(slLabelX, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
+            highLabelTime := labelTime
+            lowLabelTime  := labelTime
 
 // Per-bar updates: move Right-side labels with the chart edge, and prune
 // broken-and-aged-out segments when hideBrokenAfter > 0.
@@ -351,6 +363,7 @@ if lables and hideBroken and isIntraday and hideBrokenAfter > 0
             array.remove(hBrokenArr, i)
             array.remove(hBrokenBarArr, i)
             array.remove(hCreatedArr, i)
+            array.remove(hLabelTimeArr, i)
             if array.size(hLabelArr) > i
                 lbl = array.get(hLabelArr, i)
                 if not na(lbl)
@@ -367,12 +380,35 @@ if lables and hideBroken and isIntraday and hideBrokenAfter > 0
             array.remove(lBrokenArr, j)
             array.remove(lBrokenBarArr, j)
             array.remove(lCreatedArr, j)
+            array.remove(lLabelTimeArr, j)
             if array.size(lLabelArr) > j
                 lbl = array.get(lLabelArr, j)
                 if not na(lbl)
                     label.delete(lbl)
                 array.remove(lLabelArr, j)
         j -= 1
+
+// Per-bar refresh of label text to keep "X days ago" current.
+daysAgoSuffix(t) => na(t) ? "" : " (" + str.tostring(math.max(0, math.round((time - t) / 86400000))) + "d)"
+if lables and showHLLabels and showDaysAgo and isIntraday
+    if hideBroken
+        if array.size(hLabelArr) > 0
+            for i = 0 to array.size(hLabelArr) - 1
+                lbl = array.get(hLabelArr, i)
+                lt  = array.size(hLabelTimeArr) > i ? array.get(hLabelTimeArr, i) : na
+                if not na(lbl) and not na(lt)
+                    label.set_text(lbl, "H " + str.format_time(lt, dateFmt, syminfo.timezone) + daysAgoSuffix(lt))
+        if array.size(lLabelArr) > 0
+            for j = 0 to array.size(lLabelArr) - 1
+                lbl = array.get(lLabelArr, j)
+                lt  = array.size(lLabelTimeArr) > j ? array.get(lLabelTimeArr, j) : na
+                if not na(lbl) and not na(lt)
+                    label.set_text(lbl, "L " + str.format_time(lt, dateFmt, syminfo.timezone) + daysAgoSuffix(lt))
+    else
+        if not na(highLabel) and not na(highLabelTime)
+            label.set_text(highLabel, "H " + str.format_time(highLabelTime, dateFmt, syminfo.timezone) + daysAgoSuffix(highLabelTime))
+        if not na(lowLabel) and not na(lowLabelTime)
+            label.set_text(lowLabel,  "L " + str.format_time(lowLabelTime,  dateFmt, syminfo.timezone) + daysAgoSuffix(lowLabelTime))
 
 // =============================================================================
 // SESSION SHADING
