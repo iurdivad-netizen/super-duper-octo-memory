@@ -1,0 +1,53 @@
+//@version=5
+indicator("UNDETECTED FX - No Trade Zone Levels", overlay=true, max_lines_count=500)
+
+// -------- INPUTS --------
+// 250 pips ≈ 25 dollar op jouw XAU-feed
+step       = input.float(25.0, "Afstand tussen herhalingen (in prijs)", group="Levels")
+level1     = input.float(4050.0, "Eerste lijn niveau",  group="Levels")
+level2     = input.float(4060.0, "Tweede lijn niveau",  group="Levels")
+maxLevel   = input.float(4500.0, "Hoogste level",       group="Levels")
+minLevel   = input.float(3500.0, "Laagste level",       group="Levels")
+
+lineColor  = input.color(color.new(color.black, 0), "Kleur lijnen",         group="Style")
+zoneColor  = input.color(color.new(color.red, 80),  "Kleur no-trade zone",  group="Style")
+lineWidth  = input.int(2, "Lijn dikte", minval=1, maxval=5,                 group="Style")
+
+// -------- LEVEL COUNT --------
+// Gebruik de laagste van de twee gekozen lijnen als anker en herhaal naar boven én naar beneden
+anchor1 = level1
+anchor2 = level2
+
+// Hoeveel herhalingen passen er tussen min en max?
+totalRange   = maxLevel - minLevel
+repeatsCalc  = math.floor(totalRange / step) + 1
+repeatCount  = math.min(repeatsCalc, 200)
+
+// Bepaal startindex zodat de eerste herhaling op of net onder minLevel valt
+startOffset  = math.floor((minLevel - math.min(anchor1, anchor2)) / step)
+
+// -------- ARRAYS --------
+var line[] line1s = array.new_line()
+var line[] line2s = array.new_line()
+var linefill[] fills = array.new_linefill()
+
+// -------- INIT: alles één keer tekenen --------
+if barstate.isfirst
+    for i = 0 to repeatCount - 1
+        float offset = (startOffset + i) * step
+        float lvl1   = anchor1 + offset
+        float lvl2   = anchor2 + offset
+
+        if lvl1 <= maxLevel and lvl2 <= maxLevel and lvl1 >= minLevel and lvl2 >= minLevel
+            // Twee horizontale lijnen die de no-trade zone begrenzen
+            l1 = line.new(0, lvl1, 1, lvl1, xloc=xloc.bar_index, extend=extend.both, color=lineColor, width=lineWidth)
+            l2 = line.new(0, lvl2, 1, lvl2, xloc=xloc.bar_index, extend=extend.both, color=lineColor, width=lineWidth)
+
+            // Vulling tussen de twee lijnen = no-trade zone
+            f = linefill.new(l1, l2, color=zoneColor)
+
+            array.push(line1s, l1)
+            array.push(line2s, l2)
+            array.push(fills, f)
+
+// Geen update nodig: lijnen staan vast op prijs en hebben extend.both
