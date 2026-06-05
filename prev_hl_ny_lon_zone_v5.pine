@@ -60,6 +60,9 @@ hideBrokenAfter = input.int(0, title="Auto-Hide Broken Segments After (bars, 0=o
      tooltip="Plot-Unbroken mode only. Once a line is taken out it becomes a frozen segment. Set N > 0 to automatically delete that segment N bars after it was broken — reduces clutter on long histories. 0 keeps every broken segment forever.")
 showDaysAgo    = input.bool(false, title="Show Days Ago in Label", group=grpHL,
      tooltip="Append the elapsed calendar days since the labeled period to every H/L label, e.g. 'H May 28 (4d)'. Updates each bar so the count stays current.")
+greyOutHit     = input.bool(true, title="Grey Out Hit Lines", group=grpHL,
+     tooltip="When ON, the H/L line is recolored the moment price touches its level. In Plot-Unbroken mode this happens alongside the existing freeze. In single-line mode the line keeps extending but in the hit color so you can tell at a glance which levels have already been taken.")
+hitColor       = input.color(color.gray, title="Hit Line Color", group=grpHL)
 
 // Buffer bands
 bufferTicks    = input.int(100, title="Buffer Distance (mintick units)", minval=0, group=grpHL)
@@ -191,8 +194,10 @@ var array<label> lLabelArr     = array.new<label>()
 var array<int>   lCreatedArr   = array.new<int>()
 var array<int>   lBrokenBarArr = array.new<int>()
 var array<int>   lLabelTimeArr = array.new<int>()
-var int highLabelTime = na
-var int lowLabelTime  = na
+var int  highLabelTime = na
+var int  lowLabelTime  = na
+var bool highLineHit   = false
+var bool lowLineHit    = false
 
 isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily)
 
@@ -228,6 +233,8 @@ if lables and hideBroken and isIntraday
                     capX = math.max(bar_index, line.get_x1(ln) + minBarsVisible)
                     line.set_x2(ln, capX)
                     line.set_extend(ln, extend.none)
+                    if greyOutHit
+                        line.set_color(ln, hitColor)
                     array.set(hBrokenArr, i, true)
                     array.set(hBrokenBarArr, i, bar_index)
                     if labelPosition == "Right" and array.size(hLabelArr) > i
@@ -242,6 +249,8 @@ if lables and hideBroken and isIntraday
                     capX = math.max(bar_index, line.get_x1(ln) + minBarsVisible)
                     line.set_x2(ln, capX)
                     line.set_extend(ln, extend.none)
+                    if greyOutHit
+                        line.set_color(ln, hitColor)
                     array.set(lBrokenArr, j, true)
                     array.set(lBrokenBarArr, j, bar_index)
                     if labelPosition == "Right" and array.size(lLabelArr) > j
@@ -307,8 +316,10 @@ if lables and newPeriod and isIntraday
             line.set_extend(lowLine, extend.none)
         if not na(highLevel)
             highLine := line.new(lineX1, highLevel, bar_index, highLevel, width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+            highLineHit := false
         if not na(lowLevel)
             lowLine  := line.new(lineX1, lowLevel,  bar_index, lowLevel,  width=hlWidth, extend=extend.right, color=hlColor, style=hlStyle)
+            lowLineHit := false
         if showBuffer
             if not na(highLineH)
                 line.set_x2(highLineH, bar_index)
@@ -329,6 +340,20 @@ if lables and newPeriod and isIntraday
             lowLabel  := label.new(slLabelX, lowLevel,  labelTxtL, style=label.style_none, textcolor=hlLabelColor)
             highLabelTime := labelTime
             lowLabelTime  := labelTime
+
+// Single-line mode: recolor the active H/L lines to hitColor the moment
+// price touches their level. The lines keep extending — only the color
+// changes — so you can see at a glance whether the current period has
+// already swept the prior period's H or L.
+if lables and greyOutHit and not hideBroken and isIntraday
+    if not na(highLine) and not highLineHit and not na(highLevel)
+        if highBreakSrc > highLevel + breakBufferPrice
+            highLineHit := true
+            line.set_color(highLine, hitColor)
+    if not na(lowLine) and not lowLineHit and not na(lowLevel)
+        if lowBreakSrc < lowLevel - breakBufferPrice
+            lowLineHit := true
+            line.set_color(lowLine, hitColor)
 
 // Per-bar updates: move Right-side labels with the chart edge, and prune
 // broken-and-aged-out segments when hideBrokenAfter > 0.
