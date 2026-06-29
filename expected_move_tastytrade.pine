@@ -116,6 +116,9 @@ float  i_mult2      = input.float(2.0, "  ↳ second band multiplier (σ)",
 // Inputs · Label & style
 // ──────────────────────────────────────────────────────────────────────────────
 bool   i_showLabel  = input.bool(true, "Show 'valid as of' label", group = "Label")
+bool   i_priceTags  = input.bool(true, "Show price at each band edge",
+     tooltip = "Prints the price of the upper/lower band (and σ2 band when enabled) at the right end of the lines.",
+     group = "Label")
 string i_asOf       = input.string("", "Value read on (free text)",
      tooltip = "Optional note shown in the label, e.g. the date/time you read the value off tastytrade. Stale values are easy to miss otherwise.",
      group = "Label")
@@ -201,6 +204,37 @@ if barstate.islast
 // ──────────────────────────────────────────────────────────────────────────────
 // "Valid as of" label
 // ──────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Price tags at the right end of each band
+// ──────────────────────────────────────────────────────────────────────────────
+var label pt_u1 = na
+var label pt_l1 = na
+var label pt_u2 = na
+var label pt_l2 = na
+f_priceTag(_x, _y, _col) =>
+    label.new(_x, _y, str.tostring(_y, format.mintick), xloc.bar_index, yloc.price,
+         color.new(color.white, 100), label.style_label_left, _col, size.small)
+if barstate.islast
+    if not na(pt_u1)
+        label.delete(pt_u1)
+        pt_u1 := na
+    if not na(pt_l1)
+        label.delete(pt_l1)
+        pt_l1 := na
+    if not na(pt_u2)
+        label.delete(pt_u2)
+        pt_u2 := na
+    if not na(pt_l2)
+        label.delete(pt_l2)
+        pt_l2 := na
+    if i_priceTags and bandOn and not na(anchorPrice)
+        int rX = last_bar_index + projOff
+        pt_u1 := f_priceTag(rX, anchorPrice + em1, i_bandColor)
+        pt_l1 := f_priceTag(rX, anchorPrice - em1, i_bandColor)
+        if i_band2On
+            pt_u2 := f_priceTag(rX, anchorPrice + em2, i_band2Color)
+            pt_l2 := f_priceTag(rX, anchorPrice - em2, i_band2Color)
+
 f_pct(v) => str.tostring(v / anchorPrice * 100.0, "#.##") + "%"
 
 if i_showLabel and barstate.islast
