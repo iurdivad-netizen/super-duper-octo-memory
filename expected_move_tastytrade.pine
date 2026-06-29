@@ -129,13 +129,25 @@ int    i_qWidth     = input.int(1, "Level line width", minval = 1, maxval = 3, g
 // ──────────────────────────────────────────────────────────────────────────────
 // Inputs · Label & style
 // ──────────────────────────────────────────────────────────────────────────────
-bool   i_showLabel  = input.bool(true, "Show 'valid as of' label", group = "Label")
+bool   i_showLabel  = input.bool(true, "Show info box", group = "Info box")
+string i_infoMode   = input.string("Follow price", "Placement",
+     options = ["Follow price", "Corner"],
+     tooltip = "Follow price: the box sits at the band edge on the last bar. Corner: the box is pinned to a fixed corner of the chart.",
+     group = "Info box")
+string i_infoPos    = input.string("Top Right", "  ↳ corner",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"],
+     tooltip = "Used when Placement = Corner.",
+     group = "Info box")
+string i_infoSize   = input.string("Normal", "Text size",
+     options = ["Tiny", "Small", "Normal", "Large"], group = "Info box")
+color  i_labelColor = input.color(color.new(color.gray, 20), "Background color", group = "Info box")
+color  i_labelText  = input.color(color.white, "Text color", group = "Info box")
+string i_asOf       = input.string("", "Value read on (free text)",
+     tooltip = "Optional note shown in the info box, e.g. the date/time you read the value off tastytrade. Stale values are easy to miss otherwise.",
+     group = "Info box")
 bool   i_priceTags  = input.bool(true, "Show price at each band edge",
      tooltip = "Prints the price of the upper/lower band (and σ2 band when enabled) at the right end of the lines.",
-     group = "Label")
-string i_asOf       = input.string("", "Value read on (free text)",
-     tooltip = "Optional note shown in the label, e.g. the date/time you read the value off tastytrade. Stale values are easy to miss otherwise.",
-     group = "Label")
+     group = "Band price tags")
 
 color  i_bandColor  = input.color(#26a69a, "Band color", group = "Style")
 int    i_bandWidth  = input.int(2, "Band line width", minval = 1, maxval = 5, group = "Style")
@@ -146,8 +158,6 @@ bool   i_shadeFut   = input.bool(true, "Shade future (no-price) zone",
      group = "Future zone")
 color  i_futZone1   = input.color(color.new(#26a69a, 78), "σ1 zone fill", group = "Future zone")
 color  i_futZone2   = input.color(color.new(#26a69a, 88), "σ2 zone fill", group = "Future zone")
-color  i_labelColor = input.color(color.new(color.gray, 20), "Label background", group = "Style")
-color  i_labelText  = input.color(color.white, "Label text color", group = "Style")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Expected move → points of the underlying
@@ -263,25 +273,43 @@ if barstate.islast
             pt_l2 := f_priceTag(rX, anchorPrice - em2, i_band2Color)
 
 f_pct(v) => str.tostring(v / anchorPrice * 100.0, "#.##") + "%"
+f_size(s) => s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : size.normal
+f_pos(p)  => p == "Top Right"    ? position.top_right    :
+     p == "Top Left"     ? position.top_left     :
+     p == "Bottom Right" ? position.bottom_right :
+     p == "Bottom Left"  ? position.bottom_left  :
+     p == "Middle Right" ? position.middle_right : position.middle_left
 
-if i_showLabel and barstate.islast
-    srcTxt = i_source == "Points"
-         ? "EM " + str.tostring(i_emPoints, "#.##") + " pts @ " + str.tostring(i_srcDTE) + " DTE"
-         : "ATM IV " + str.tostring(i_ivPct, "#.##") + "%"
-    lockTxt = lockMode ? "\nLocked: " + str.format_time(i_lockTime, "yyyy-MM-dd HH:mm", "GMT") : ""
-    txt = if lockMode and na(anchorPrice)
-        "Expected Move (tastytrade)\n" + srcTxt +
-             "\nWaiting for lock date…" + lockTxt
-    else
-        "Expected Move (tastytrade)\n" +
-             srcTxt + lockTxt + "\n" +
-             "Horizon: " + str.tostring(i_dte) + " DTE   ×" + str.tostring(i_mult, "#.##") + "σ\n" +
-             "Anchor: " + str.tostring(anchorPrice, format.mintick) + "\n" +
-             "Move: ±" + str.tostring(em1, "#.##") + " pts  (±" + f_pct(em1) + ")\n" +
-             "Range: " + str.tostring(anchorPrice - em1, format.mintick) + " – " + str.tostring(anchorPrice + em1, format.mintick) +
-             (str.length(i_asOf) > 0 ? "\nValid as of: " + i_asOf : "")
-    labelY = not na(upper1) ? upper1 : not na(anchorPrice) ? anchorPrice : close
-    var label lbl = label.new(bar_index, labelY, txt, xloc.bar_index, yloc.price,
-         i_labelColor, label.style_label_down, i_labelText, size.normal, text.align_left)
-    label.set_xy(lbl, bar_index + projOff, labelY)
-    label.set_text(lbl, txt)
+var label infoLbl = na
+var table infoTbl = na
+if barstate.islast
+    if not na(infoLbl)
+        label.delete(infoLbl)
+        infoLbl := na
+    if not na(infoTbl)
+        table.delete(infoTbl)
+        infoTbl := na
+    if i_showLabel
+        srcTxt = i_source == "Points"
+             ? "EM " + str.tostring(i_emPoints, "#.##") + " pts @ " + str.tostring(i_srcDTE) + " DTE"
+             : "ATM IV " + str.tostring(i_ivPct, "#.##") + "%"
+        lockTxt = lockMode ? "\nLocked: " + str.format_time(i_lockTime, "yyyy-MM-dd HH:mm", "GMT") : ""
+        txt = if lockMode and na(anchorPrice)
+            "Expected Move (tastytrade)\n" + srcTxt +
+                 "\nWaiting for lock date…" + lockTxt
+        else
+            "Expected Move (tastytrade)\n" +
+                 srcTxt + lockTxt + "\n" +
+                 "Horizon: " + str.tostring(i_dte) + " DTE   ×" + str.tostring(i_mult, "#.##") + "σ\n" +
+                 "Anchor: " + str.tostring(anchorPrice, format.mintick) + "\n" +
+                 "Move: ±" + str.tostring(em1, "#.##") + " pts  (±" + f_pct(em1) + ")\n" +
+                 "Range: " + str.tostring(anchorPrice - em1, format.mintick) + " – " + str.tostring(anchorPrice + em1, format.mintick) +
+                 (str.length(i_asOf) > 0 ? "\nValid as of: " + i_asOf : "")
+        if i_infoMode == "Corner"
+            infoTbl := table.new(f_pos(i_infoPos), 1, 1, border_width = 0)
+            table.cell(infoTbl, 0, 0, txt, text_color = i_labelText, bgcolor = i_labelColor,
+                 text_size = f_size(i_infoSize), text_halign = text.align_left)
+        else
+            labelY = not na(upper1) ? upper1 : not na(anchorPrice) ? anchorPrice : close
+            infoLbl := label.new(last_bar_index + projOff, labelY, txt, xloc.bar_index, yloc.price,
+                 i_labelColor, label.style_label_down, i_labelText, f_size(i_infoSize), text.align_left)
