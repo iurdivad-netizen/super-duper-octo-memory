@@ -114,8 +114,11 @@ float  i_mult2      = input.float(2.0, "  ↳ second band multiplier (σ)",
 
 // ── Quarter levels ──
 bool   i_quarters   = input.bool(false, "Show 25 / 50 / 75% levels",
-     tooltip = "Plots intermediate guide lines at 25%, 50% and 75% of the expected-move range on each side of the anchor.",
+     tooltip = "Master switch for the intermediate guide lines at 25%, 50% and 75% of the expected-move range on each side of the anchor. Toggle individual levels below to cut clutter.",
      group = "Quarter levels")
+bool   i_q25        = input.bool(true, "  ↳ 25% level", group = "Quarter levels")
+bool   i_q50        = input.bool(true, "  ↳ 50% level", group = "Quarter levels")
+bool   i_q75        = input.bool(true, "  ↳ 75% level", group = "Quarter levels")
 string i_qScope     = input.string("σ1", "Levels relative to",
      options = ["σ1", "σ2"],
      tooltip = "Whether the 25/50/75% levels are fractions of the σ1 band or the σ2 band.",
@@ -197,13 +200,13 @@ plot(i_band2On ? lower2 : na, "Lower (σ2)", i_band2Color, linewidth = i_bandWid
 // ──────────────────────────────────────────────────────────────────────────────
 qEm   = i_qScope == "σ2" ? em2 : em1
 qOn   = i_quarters and bandOn and (i_qScope == "σ1" or i_band2On)
-qLvl(frac) => qOn ? anchorPrice + frac * qEm : na
-plot(qLvl( 0.75), "75% up",   i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
-plot(qLvl( 0.50), "50% up",   i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
-plot(qLvl( 0.25), "25% up",   i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
-plot(qLvl(-0.25), "25% down", i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
-plot(qLvl(-0.50), "50% down", i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
-plot(qLvl(-0.75), "75% down", i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
+qLvl(frac, show) => qOn and show ? anchorPrice + frac * qEm : na
+plot(qLvl( 0.75, i_q75), "75% up",   i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
+plot(qLvl( 0.50, i_q50), "50% up",   i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
+plot(qLvl( 0.25, i_q25), "25% up",   i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
+plot(qLvl(-0.25, i_q25), "25% down", i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
+plot(qLvl(-0.50, i_q50), "50% down", i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
+plot(qLvl(-0.75, i_q75), "75% down", i_qColor, linewidth = i_qWidth, style = plot.style_linebr, offset = projOff)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Future (no-price) projection zone — box over the empty area to the right
