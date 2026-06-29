@@ -89,7 +89,7 @@ bool   i_projectFwd = input.bool(true, "Project bands forward by the horizon",
      group = "Anchor")
 
 // ── Lock to date ──
-int    i_lockTime   = input.time(timestamp("GMT", 2026, 1, 1, 0, 0), "Lock date/time",
+int    i_lockTime   = input.time(timestamp(2026, 1, 1, 0, 0), "Lock date/time",
      tooltip = "Used when Anchor = Locked date. The bands start here and run forward. The anchor price is captured from the first bar at/after this moment (unless overridden above).",
      group = "Anchor")
 string i_lockSrc    = input.string("Open", "  ↳ price captured on lock day",
