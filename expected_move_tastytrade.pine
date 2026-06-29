@@ -148,6 +148,9 @@ string i_asOf       = input.string("", "Value read on (free text)",
 bool   i_priceTags  = input.bool(true, "Show price at each band edge",
      tooltip = "Prints the price of the upper/lower band (and σ2 band when enabled) at the right end of the lines.",
      group = "Band price tags")
+bool   i_qTags      = input.bool(false, "Show price at 25 / 50 / 75% levels",
+     tooltip = "Adds price labels to whichever quarter levels are visible. Requires the quarter levels to be enabled.",
+     group = "Band price tags")
 
 color  i_bandColor  = input.color(#26a69a, "Band color", group = "Style")
 int    i_bandWidth  = input.int(2, "Band line width", minval = 1, maxval = 5, group = "Style")
@@ -271,6 +274,24 @@ if barstate.islast
         if i_band2On
             pt_u2 := f_priceTag(rX, anchorPrice + em2, i_band2Color)
             pt_l2 := f_priceTag(rX, anchorPrice - em2, i_band2Color)
+
+// price tags for the visible quarter levels
+var array<label> qTags = array.new<label>()
+if barstate.islast
+    for lb in qTags
+        label.delete(lb)
+    array.clear(qTags)
+    if i_qTags and qOn and not na(anchorPrice)
+        int rX = last_bar_index + projOff
+        if i_q75
+            array.push(qTags, f_priceTag(rX, anchorPrice + 0.75 * qEm, i_qColor))
+            array.push(qTags, f_priceTag(rX, anchorPrice - 0.75 * qEm, i_qColor))
+        if i_q50
+            array.push(qTags, f_priceTag(rX, anchorPrice + 0.50 * qEm, i_qColor))
+            array.push(qTags, f_priceTag(rX, anchorPrice - 0.50 * qEm, i_qColor))
+        if i_q25
+            array.push(qTags, f_priceTag(rX, anchorPrice + 0.25 * qEm, i_qColor))
+            array.push(qTags, f_priceTag(rX, anchorPrice - 0.25 * qEm, i_qColor))
 
 f_pct(v) => str.tostring(v / anchorPrice * 100.0, "#.##") + "%"
 f_size(s) => s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : size.normal
