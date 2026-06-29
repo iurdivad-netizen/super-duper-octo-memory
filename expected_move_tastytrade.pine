@@ -1,0 +1,161 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © iurdivad
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EXPECTED MOVE (tastytrade)  —  manual-feed expected-move bands
+// ──────────────────────────────────────────────────────────────────────────────
+// Plots tastytrade's expected move as upper/lower bands around an anchor price.
+//
+// WHY MANUAL INPUT:
+//   Pine Script runs in TradingView's sandbox and cannot call external APIs, so
+//   it cannot pull from tastytrade directly. tastytrade derives the expected
+//   move from the live option chain (≈ the ATM straddle for an expiration). You
+//   read that value off tastytrade and paste it here; this indicator handles the
+//   N-day (DTE) scaling and draws the bands. Sibling indicator
+//   `spx_expected_move_vix.pine` derives the move from VIX because VIX *is* a
+//   TradingView feed — tastytrade is not.
+//
+// TWO WAYS TO FEED IT (input "Expected move source"):
+//   • "Points"  — paste tastytrade's expected move directly in points of the
+//                 underlying (e.g. ±72). Tell it which expiration that value is
+//                 for (Source DTE) and the indicator rescales it to your Target
+//                 DTE by √(targetDTE / sourceDTE).
+//   • "ATM IV %"— paste the at-the-money implied volatility (e.g. 18.5). The
+//                 move is computed as  EM = price × IV × √(DTE / 365).
+//
+// EXPECTED MOVE SCALES WITH √TIME, so an EM for one horizon is converted to any
+// other horizon by the square-root-of-time rule. A 1σ move (~68% of outcomes)
+// is the default; raise the multiplier or enable the 2nd band for a 2σ (~95%)
+// envelope.
+//
+// A "valid as of" label is drawn at the last bar so a stale pasted value is
+// obvious. Re-read tastytrade and update the inputs when it drifts.
+
+//@version=5
+
+indicator(title = "Expected Move (tastytrade)", shorttitle = "Exp Move (TT)", overlay = true)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs · Expected move
+// ──────────────────────────────────────────────────────────────────────────────
+string i_source     = input.string("Points", "Expected move source",
+     options = ["Points", "ATM IV %"],
+     tooltip = "Points: paste tastytrade's expected move in points. ATM IV %: paste the at-the-money implied volatility and let the indicator compute the move.",
+     group = "Expected move")
+
+float  i_emPoints   = input.float(50.0, "  ↳ Expected move (points)",
+     minval = 0.0, step = 1.0,
+     tooltip = "Used when source = Points. The ± expected move tastytrade shows, in points of the underlying.",
+     group = "Expected move")
+int    i_srcDTE     = input.int(1, "  ↳ that value's expiration (Source DTE)",
+     minval = 1,
+     tooltip = "Days-to-expiration of the tastytrade value you pasted above. The move is rescaled from this horizon to the Target DTE by √(target / source). Set equal to Target DTE to plot the pasted value as-is.",
+     group = "Expected move")
+
+float  i_ivPct      = input.float(18.0, "  ↳ ATM implied volatility (%)",
+     minval = 0.0, step = 0.5,
+     tooltip = "Used when source = ATM IV %. Annualized at-the-money IV in percent, e.g. 18.5.",
+     group = "Expected move")
+
+int    i_dte        = input.int(1, "Target horizon (DTE, days)",
+     minval = 1,
+     tooltip = "The N days you want the expected move for. Points mode rescales the pasted value to this horizon; IV mode computes EM = price × IV × √(DTE/365).",
+     group = "Expected move")
+
+float  i_mult       = input.float(1.0, "Band multiplier (σ)",
+     minval = 0.1, step = 0.1,
+     tooltip = "1.0 = one standard deviation (~68% of outcomes), tastytrade's default expected move. 2.0 = ~95%.",
+     group = "Expected move")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs · Anchor
+// ──────────────────────────────────────────────────────────────────────────────
+string i_anchorMode = input.string("Chart price", "Anchor",
+     options = ["Chart price", "Fixed entry price"],
+     tooltip = "Chart price: bands re-center on the current close each bar. Fixed entry price: bands stay flat around a price you specify (e.g. the underlying price at the moment you read tastytrade).",
+     group = "Anchor")
+float  i_entryPrice = input.float(0.0, "  ↳ Fixed entry price",
+     minval = 0.0, step = 0.25,
+     tooltip = "Used when Anchor = Fixed entry price. The underlying price the expected move was quoted against.",
+     group = "Anchor")
+bool   i_projectFwd = input.bool(true, "Project bands forward by the horizon",
+     tooltip = "Shifts the bands right by Target DTE bars so the envelope sits over the bar the move resolves on. Visual only.",
+     group = "Anchor")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs · Second band
+// ──────────────────────────────────────────────────────────────────────────────
+bool   i_band2On    = input.bool(false, "Show second band",
+     tooltip = "Draw an additional envelope at a different multiplier (e.g. 2σ).",
+     group = "Second band")
+float  i_mult2      = input.float(2.0, "  ↳ second band multiplier (σ)",
+     minval = 0.1, step = 0.1, group = "Second band")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Inputs · Label & style
+// ──────────────────────────────────────────────────────────────────────────────
+bool   i_showLabel  = input.bool(true, "Show 'valid as of' label", group = "Label")
+string i_asOf       = input.string("", "Value read on (free text)",
+     tooltip = "Optional note shown in the label, e.g. the date/time you read the value off tastytrade. Stale values are easy to miss otherwise.",
+     group = "Label")
+
+color  i_bandColor  = input.color(#26a69a, "Band color", group = "Style")
+int    i_bandWidth  = input.int(2, "Band line width", minval = 1, maxval = 5, group = "Style")
+int    i_fillTransp = input.int(90, "Range fill transparency", minval = 0, maxval = 100, group = "Style")
+color  i_band2Color = input.color(color.new(#26a69a, 40), "Second band color", group = "Style")
+color  i_labelColor = input.color(color.new(color.gray, 20), "Label background", group = "Style")
+color  i_labelText  = input.color(color.white, "Label text color", group = "Style")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Expected move → points of the underlying
+// ──────────────────────────────────────────────────────────────────────────────
+anchorPrice = i_anchorMode == "Fixed entry price" and i_entryPrice > 0 ? i_entryPrice : close
+
+// base 1σ move at the target horizon, in points
+emBase = if i_source == "Points"
+    i_emPoints * math.sqrt(i_dte / math.max(i_srcDTE, 1))
+else
+    anchorPrice * (i_ivPct / 100.0) * math.sqrt(i_dte / 365.0)
+
+em1 = emBase * i_mult
+em2 = emBase * i_mult2
+
+upper1 = anchorPrice + em1
+lower1 = anchorPrice - em1
+upper2 = anchorPrice + em2
+lower2 = anchorPrice - em2
+
+int projOff = i_projectFwd ? i_dte : 0
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Plots
+// ──────────────────────────────────────────────────────────────────────────────
+p1u = plot(upper1, "Upper (σ1)", i_bandColor, linewidth = i_bandWidth, offset = projOff)
+p1l = plot(lower1, "Lower (σ1)", i_bandColor, linewidth = i_bandWidth, offset = projOff)
+fill(p1u, p1l, color = color.new(i_bandColor, i_fillTransp))
+
+plot(i_band2On ? upper2 : na, "Upper (σ2)", i_band2Color, linewidth = i_bandWidth,
+     style = plot.style_linebr, offset = projOff)
+plot(i_band2On ? lower2 : na, "Lower (σ2)", i_band2Color, linewidth = i_bandWidth,
+     style = plot.style_linebr, offset = projOff)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// "Valid as of" label
+// ──────────────────────────────────────────────────────────────────────────────
+f_pct(v) => str.tostring(v / anchorPrice * 100.0, "#.##") + "%"
+
+if i_showLabel and barstate.islast
+    srcTxt = i_source == "Points"
+         ? "EM " + str.tostring(i_emPoints, "#.##") + " pts @ " + str.tostring(i_srcDTE) + " DTE"
+         : "ATM IV " + str.tostring(i_ivPct, "#.##") + "%"
+    txt = "Expected Move (tastytrade)\n" +
+         srcTxt + "\n" +
+         "Horizon: " + str.tostring(i_dte) + " DTE   ×" + str.tostring(i_mult, "#.##") + "σ\n" +
+         "Anchor: " + str.tostring(anchorPrice, format.mintick) + "\n" +
+         "Move: ±" + str.tostring(em1, "#.##") + " pts  (±" + f_pct(em1) + ")\n" +
+         "Range: " + str.tostring(lower1, format.mintick) + " – " + str.tostring(upper1, format.mintick) +
+         (str.length(i_asOf) > 0 ? "\nValid as of: " + i_asOf : "")
+    var label lbl = label.new(bar_index, upper1, txt, xloc.bar_index, yloc.price,
+         i_labelColor, label.style_label_down, i_labelText, size.normal, text.align_left)
+    label.set_xy(lbl, bar_index + projOff, upper1)
+    label.set_text(lbl, txt)
