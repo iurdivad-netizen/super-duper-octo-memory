@@ -87,6 +87,12 @@ float  i_entryPrice = input.float(0.0, "  ↳ Fixed / lock entry price (0 = auto
 bool   i_projectFwd = input.bool(true, "Project bands forward by the horizon",
      tooltip = "Shifts the bands right by Target DTE bars so the envelope sits over the bar the move resolves on. Visual only.",
      group = "Anchor")
+bool   i_extendOn   = input.bool(false, "Extend bands into the future",
+     tooltip = "Push the bands out beyond the last/current bar by a fixed number of bars (in addition to any horizon projection). Best with a Fixed or Locked anchor so the extended lines stay flat.",
+     group = "Anchor")
+int    i_extendBars = input.int(20, "  ↳ by X bars", minval = 1,
+     tooltip = "How many bars past the last bar to extend the bands when the toggle above is on.",
+     group = "Anchor")
 
 // ── Lock to date ──
 int    i_lockTime   = input.time(timestamp("2026-01-01T00:00:00"), "Lock date/time",
@@ -153,7 +159,7 @@ lower1 = bandOn ? anchorPrice - em1 : na
 upper2 = bandOn ? anchorPrice + em2 : na
 lower2 = bandOn ? anchorPrice - em2 : na
 
-int projOff = i_projectFwd ? i_dte : 0
+int projOff = (i_projectFwd ? i_dte : 0) + (i_extendOn ? i_extendBars : 0)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Plots
