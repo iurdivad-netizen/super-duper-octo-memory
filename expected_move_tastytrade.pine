@@ -124,6 +124,11 @@ color  i_bandColor  = input.color(#26a69a, "Band color", group = "Style")
 int    i_bandWidth  = input.int(2, "Band line width", minval = 1, maxval = 5, group = "Style")
 int    i_fillTransp = input.int(90, "Range fill transparency", minval = 0, maxval = 100, group = "Style")
 color  i_band2Color = input.color(color.new(#26a69a, 40), "Second band color", group = "Style")
+bool   i_shadeFut   = input.bool(true, "Shade future (no-price) zone",
+     tooltip = "Fills the projected expected-move range over the empty area to the right of the last bar. Needs the horizon projection and/or future extension to be on so the zone has width.",
+     group = "Future zone")
+color  i_futZone1   = input.color(color.new(#26a69a, 78), "σ1 zone fill", group = "Future zone")
+color  i_futZone2   = input.color(color.new(#26a69a, 88), "σ2 zone fill", group = "Future zone")
 color  i_labelColor = input.color(color.new(color.gray, 20), "Label background", group = "Style")
 color  i_labelText  = input.color(color.white, "Label text color", group = "Style")
 
@@ -172,6 +177,26 @@ plot(i_band2On ? upper2 : na, "Upper (σ2)", i_band2Color, linewidth = i_bandWid
      style = plot.style_linebr, offset = projOff)
 plot(i_band2On ? lower2 : na, "Lower (σ2)", i_band2Color, linewidth = i_bandWidth,
      style = plot.style_linebr, offset = projOff)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Future (no-price) projection zone — box over the empty area to the right
+// ──────────────────────────────────────────────────────────────────────────────
+var box fz1 = na
+var box fz2 = na
+if barstate.islast
+    if not na(fz1)
+        box.delete(fz1)
+        fz1 := na
+    if not na(fz2)
+        box.delete(fz2)
+        fz2 := na
+    if i_shadeFut and bandOn and not na(anchorPrice) and projOff > 0
+        int rX = last_bar_index + projOff
+        if i_band2On
+            fz2 := box.new(last_bar_index, anchorPrice + em2, rX, anchorPrice - em2,
+                 border_width = 0, bgcolor = i_futZone2)
+        fz1 := box.new(last_bar_index, anchorPrice + em1, rX, anchorPrice - em1,
+             border_width = 0, bgcolor = i_futZone1)
 
 // ──────────────────────────────────────────────────────────────────────────────
 // "Valid as of" label
