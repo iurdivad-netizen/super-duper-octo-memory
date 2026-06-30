@@ -34,6 +34,14 @@
 //   to pin the expected-move range to the day you read tastytrade. Set a fixed
 //   entry price to override the auto-captured anchor.
 //
+// CFD / CROSS-SYMBOL (Anchor unaffected, see "CFD / cross-symbol scaling"):
+//   To run this on a feed that trades at a different level than the source
+//   (e.g. a broker SPX CFD vs CBOE cash SPX), enable "Scale move to this
+//   chart's price" and set the Reference symbol (e.g. CBOE:SPX). The pasted
+//   Points are converted to a % of the reference and re-applied to this
+//   chart's price, so the band WIDTH and range fit the CFD. ATM IV mode is
+//   already price-relative, so it adapts to the CFD with no reference needed.
+//
 // A "valid as of" label is drawn at the last bar so a stale pasted value is
 // obvious. Re-read tastytrade and update the inputs when it drifts.
 
@@ -104,6 +112,16 @@ string i_lockSrc    = input.string("Open", "  ↳ price captured on lock day",
      group = "Anchor")
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Inputs · CFD / cross-symbol scaling
+// ──────────────────────────────────────────────────────────────────────────────
+bool   i_scaleChart = input.bool(false, "Scale move to this chart's price (CFD)",
+     tooltip = "Apply the indicator on a chart that trades at a DIFFERENT level than the expected-move source — e.g. a broker SPX CFD vs CBOE cash SPX. The move is expressed as a % of the reference price and re-applied to this chart's price, so the band width matches this feed. ATM IV mode is already chart-relative; this mainly affects Points mode.",
+     group = "CFD / cross-symbol")
+string i_refSym     = input.symbol("", "Reference symbol",
+     tooltip = "The instrument the pasted Points value was quoted against, e.g. CBOE:SPX. Its price converts the absolute points to a percentage. Leave blank to use this chart's own symbol. Ignored in ATM IV mode.",
+     group = "CFD / cross-symbol")
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Inputs · Second band
 // ──────────────────────────────────────────────────────────────────────────────
 bool   i_band2On    = input.bool(false, "Show second band",
@@ -168,23 +186,36 @@ color  i_futZone2   = input.color(color.new(#26a69a, 88), "σ2 zone fill", group
 lockMode  = i_anchorMode == "Locked date"
 afterLock = time >= i_lockTime
 
-// Capture the anchor price on the first bar at/after the lock moment, hold it.
+// Reference price for the expected-move source (e.g. CBOE:SPX) — used to turn
+// pasted Points into a % when this chart (a CFD) trades at a different level.
+refTicker = i_refSym == "" ? syminfo.tickerid : i_refSym
+refRaw    = request.security(refTicker, timeframe.period, close, ignore_invalid_symbol = true)
+refClose  = na(refRaw) ? close : refRaw
+
+// Capture the anchor (and reference) price on the first bar at/after the lock
+// moment, hold them.
 lockSrcVal = i_lockSrc == "Close" ? close : i_lockSrc == "HL2" ? hl2 : open
 var float lockedAnchor = na
+var float lockedRef    = na
 if lockMode and na(lockedAnchor) and afterLock
     lockedAnchor := i_entryPrice > 0 ? i_entryPrice : lockSrcVal
+    lockedRef    := refClose
 
 anchorPrice = lockMode ? lockedAnchor :
      i_anchorMode == "Fixed entry price" and i_entryPrice > 0 ? i_entryPrice : close
+refAtAnchor = lockMode ? lockedRef : refClose
 
 // Bands only exist from the lock day forward (and once the anchor is captured).
 bandOn = not lockMode or (afterLock and not na(lockedAnchor))
 
-// base 1σ move at the target horizon, in points
-emBase = if i_source == "Points"
-    i_emPoints * math.sqrt(i_dte / math.max(i_srcDTE, 1))
-else
-    nz(anchorPrice) * (i_ivPct / 100.0) * math.sqrt(i_dte / 365.0)
+// 1σ move as a FRACTION of price, then re-applied to this chart's anchor.
+//   Points : fraction = points / (reference price when scaling, else chart price)
+//   ATM IV : fraction = IV × √(DTE/365)   — already price-relative
+basePx = i_scaleChart ? nz(refAtAnchor, anchorPrice) : anchorPrice
+emFrac = i_source == "Points"
+     ? (i_emPoints * math.sqrt(i_dte / math.max(i_srcDTE, 1))) / nz(basePx, anchorPrice)
+     : (i_ivPct / 100.0) * math.sqrt(i_dte / 365.0)
+emBase = nz(anchorPrice) * emFrac
 
 em1 = emBase * i_mult
 em2 = emBase * i_mult2
@@ -315,6 +346,10 @@ if barstate.islast
              ? "EM " + str.tostring(i_emPoints, "#.##") + " pts @ " + str.tostring(i_srcDTE) + " DTE"
              : "ATM IV " + str.tostring(i_ivPct, "#.##") + "%"
         lockTxt = lockMode ? "\nLocked: " + str.format_time(i_lockTime, "yyyy-MM-dd HH:mm", "GMT") : ""
+        refTxt = i_scaleChart and not na(refAtAnchor) and refAtAnchor != anchorPrice
+             ? "\nRef " + (i_refSym == "" ? syminfo.ticker : i_refSym) + ": " + str.tostring(refAtAnchor, format.mintick) +
+                  "  (basis " + str.tostring(anchorPrice - refAtAnchor, "#.##") + ")"
+             : ""
         txt = if lockMode and na(anchorPrice)
             "Expected Move (tastytrade)\n" + srcTxt +
                  "\nWaiting for lock date…" + lockTxt
@@ -322,7 +357,7 @@ if barstate.islast
             "Expected Move (tastytrade)\n" +
                  srcTxt + lockTxt + "\n" +
                  "Horizon: " + str.tostring(i_dte) + " DTE   ×" + str.tostring(i_mult, "#.##") + "σ\n" +
-                 "Anchor: " + str.tostring(anchorPrice, format.mintick) + "\n" +
+                 "Anchor: " + str.tostring(anchorPrice, format.mintick) + refTxt + "\n" +
                  "Move: ±" + str.tostring(em1, "#.##") + " pts  (±" + f_pct(em1) + ")\n" +
                  "Range: " + str.tostring(anchorPrice - em1, format.mintick) + " – " + str.tostring(anchorPrice + em1, format.mintick) +
                  (str.length(i_asOf) > 0 ? "\nValid as of: " + i_asOf : "")
