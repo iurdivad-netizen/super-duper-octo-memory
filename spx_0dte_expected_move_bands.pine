@@ -1,0 +1,179 @@
+// =============================================================================
+// SPX 0DTE Historical Expected Move Bands (Improved)
+// -----------------------------------------------------------------------------
+// Plots the 0DTE ±Nσ expected-move band anchored to the PRIOR day's SPX close,
+// derived from the PRIOR day's VIX close using the VIX-annualization formula:
+//
+//     Expected Move (pts) = SpotPrice × (VIX / 100) × sqrt(1 / 252)
+//
+// Both the price anchor and the VIX read are locked to the previous session's
+// close so the band is fully known at the open — no future-leakage.
+//
+// Improvements over the baseline:
+//   * User-selectable sigma multiplier (1σ / 2σ / 3σ) — matches the reference
+//     doc's "extreme tail" (2σ) and "black swan" (3σ) tiers.
+//   * Directional breach detection: upside vs downside get separate colors,
+//     latches, and alertcondition() hooks (mirrors the Python's
+//     Upside_Overshoot / Downside_Overshoot split).
+//   * Right-edge labels showing the numeric bound values, so the levels are
+//     legible without hovering.
+//   * Intraday timeframe guard — the breach test is meaningless on Daily+ TFs.
+//   * Symbol resolution defaults to "SP:SPX" (the TradingView standard) with
+//     an input override; "CBOE:SPX" is not the standard vendor ticker.
+//
+// Empirical hit-rate expectation (reference doc §1): SPX stays inside the 1σ
+// band ~72–78% of sessions — higher than the Gaussian 68.2% due to the
+// Volatility Risk Premium (VRP). Historical breaches skew toward small
+// overshoots with occasional macro-event outliers.
+//
+// Caveats:
+//   * Monday Gap Effect — bounds are built from Friday's close/VIX so weekend
+//     news can gap price past the band before options open Monday.
+//   * Friday Delta — index rebalancing flow on Fri afternoons can push
+//     realized range past the annualized VIX-derived expectation.
+// =============================================================================
+
+//@version=5
+
+indicator("SPX 0DTE Historical Expected Move Bands (Improved)",
+     overlay=true,
+     max_labels_count=500)
+
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+// Sigma multiplier — 1.0 = the standard 1σ implied move band, 2.0 = the
+// "extreme tail" threshold (empirically breached in ~5–8% of sessions),
+// 3.0 = the "black swan" threshold (~1–2% of sessions).
+f_sigma = input.float(1.0, "Sigma multiplier (Nσ)",
+     minval=0.25, maxval=5.0, step=0.25,
+     tooltip="1.0 = standard implied move. 2.0 = extreme tail. 3.0 = black swan (per reference doc §1).")
+
+// Symbol overrides. Defaults are the TradingView-standard tickers.
+i_spx_sym = input.symbol("SP:SPX",   "SPX symbol",
+     tooltip="Prior-session close anchor. Use SP:SPX unless your feed requires otherwise.")
+i_vix_sym = input.symbol("CBOE:VIX", "VIX symbol",
+     tooltip="Prior-session VIX close, used to derive the annualized sigma.")
+
+// Behavioural toggles.
+i_show_labels = input.bool(true,  "Show right-edge value labels",
+     tooltip="Prints the numeric bound values at the current bar so you can read them off the chart.")
+i_bg_tint     = input.bool(true,  "Tint session background on breach")
+i_alerts_on   = input.bool(true,  "Enable alertcondition() hooks",
+     tooltip="Exposes 'Upside breach', 'Downside breach', and 'Any breach' as alert triggers in TradingView's alert dialog.")
+
+// Colour palette.
+c_upper = input.color(color.new(color.red,   30), "Upper bound colour", group="Style")
+c_lower = input.color(color.new(color.green, 30), "Lower bound colour", group="Style")
+c_anchr = input.color(color.new(color.gray,  50), "Prior close anchor colour", group="Style")
+c_up_br = input.color(color.new(color.orange, 90), "Upside breach tint",   group="Style")
+c_dn_br = input.color(color.new(color.fuchsia, 90), "Downside breach tint", group="Style")
+
+
+// -----------------------------------------------------------------------------
+// PRIOR-SESSION ANCHORS
+// -----------------------------------------------------------------------------
+// close[1] + lookahead_on is the canonical Pine v5 no-repaint idiom for
+// "previous completed daily bar's close". It resolves stably on intraday bars
+// and never rewrites history.
+prev_close = request.security(i_spx_sym, "D", close[1], lookahead=barmerge.lookahead_on)
+prev_vix   = request.security(i_vix_sym, "D", close[1], lookahead=barmerge.lookahead_on)
+
+
+// -----------------------------------------------------------------------------
+// VIX-ANNUALIZATION MATH
+// -----------------------------------------------------------------------------
+// (VIX/100) turns the VIX from a % into a decimal annualized sigma; sqrt(1/252)
+// de-annualizes it to a single trading session (log-normal / Brownian scaling).
+// Multiplying by f_sigma widens the band to a chosen Nσ threshold.
+daily_em_pts = prev_close * (prev_vix / 100.0) * math.sqrt(1.0 / 252.0) * f_sigma
+
+upper_bound = prev_close + daily_em_pts
+lower_bound = prev_close - daily_em_pts
+
+
+// -----------------------------------------------------------------------------
+// PLOTS
+// -----------------------------------------------------------------------------
+// stepline is important: the band is piece-wise constant per session and only
+// changes when the prior-close / prior-VIX inputs roll over at the daily
+// boundary. A regular line would draw diagonals through the roll and imply
+// continuous intraday movement that isn't there.
+plot(upper_bound, color=c_upper, style=plot.style_stepline, linewidth=2, title="0DTE Upper Bound")
+plot(prev_close,  color=c_anchr, style=plot.style_stepline, linewidth=1, title="Prior Day Close Anchor")
+plot(lower_bound, color=c_lower, style=plot.style_stepline, linewidth=2, title="0DTE Lower Bound")
+
+
+// -----------------------------------------------------------------------------
+// RIGHT-EDGE VALUE LABELS
+// -----------------------------------------------------------------------------
+// A single `var label` per level, moved to the current bar each tick with the
+// numeric bound value. Cheap (three labels total) and avoids the hover dance
+// on step-line plots.
+var label lbl_up = na
+var label lbl_pc = na
+var label lbl_dn = na
+
+if i_show_labels and barstate.islast
+    if na(lbl_up)
+        lbl_up := label.new(bar_index, upper_bound, "", style=label.style_label_left, textcolor=color.white, color=color.new(color.red,   40))
+        lbl_pc := label.new(bar_index, prev_close,  "", style=label.style_label_left, textcolor=color.white, color=color.new(color.gray,  40))
+        lbl_dn := label.new(bar_index, lower_bound, "", style=label.style_label_left, textcolor=color.white, color=color.new(color.green, 40))
+    label.set_xy(lbl_up, bar_index, upper_bound)
+    label.set_xy(lbl_pc, bar_index, prev_close)
+    label.set_xy(lbl_dn, bar_index, lower_bound)
+    label.set_text(lbl_up, "Upper " + str.tostring(upper_bound, format.mintick) + "  (+" + str.tostring(daily_em_pts, "#.##") + ")")
+    label.set_text(lbl_pc, "Anchor " + str.tostring(prev_close,  format.mintick))
+    label.set_text(lbl_dn, "Lower " + str.tostring(lower_bound, format.mintick) + "  (-" + str.tostring(daily_em_pts, "#.##") + ")")
+
+
+// -----------------------------------------------------------------------------
+// DIRECTIONAL BREACH TRACKER
+// -----------------------------------------------------------------------------
+// Two separate one-way latches so upside and downside breaches can be scored
+// and coloured independently (matches the Python's Upside_Overshoot /
+// Downside_Overshoot). A session can breach both sides on the same day; the
+// tint priority resolves that below.
+var bool  up_breach  = false
+var bool  dn_breach  = false
+var color session_bg = color.new(color.blue, 100)   // 100 transp = invisible
+
+// ta.change(time("D")) is TRUE on the first bar of each new daily session.
+// That's our reset point.
+if ta.change(time("D"))
+    up_breach  := false
+    dn_breach  := false
+    session_bg := color.new(color.blue, 100)
+
+// Only meaningful on intraday timeframes — on Daily+ the "bar" IS the session,
+// so testing high/low vs today's own-derived band is degenerate.
+if timeframe.isintraday
+    // Upside latch — fires once when today's high first exceeds upper_bound.
+    if (high > upper_bound) and not up_breach
+        up_breach := true
+        if i_bg_tint
+            session_bg := c_up_br
+    // Downside latch — fires once when today's low first breaks lower_bound.
+    if (low < lower_bound) and not dn_breach
+        dn_breach := true
+        // If both sides breach in one session, the more-recent event wins the
+        // tint. Blend both by picking a distinct "two-sided" colour if you
+        // prefer; here we keep it simple and let downside overwrite.
+        if i_bg_tint
+            session_bg := c_dn_br
+
+bgcolor(i_bg_tint ? session_bg : na, title="Breach Session Highlight")
+
+
+// -----------------------------------------------------------------------------
+// ALERT CONDITIONS
+// -----------------------------------------------------------------------------
+// Fire on the exact bar the breach occurs (not on every subsequent bar of the
+// session) — cross-conditions rather than steady-state comparisons.
+up_cross = ta.crossover(high, upper_bound)
+dn_cross = ta.crossunder(low,  lower_bound)
+
+alertcondition(i_alerts_on and up_cross,               title="Upside breach",   message="SPX 0DTE upper bound breached")
+alertcondition(i_alerts_on and dn_cross,               title="Downside breach", message="SPX 0DTE lower bound breached")
+alertcondition(i_alerts_on and (up_cross or dn_cross), title="Any breach",      message="SPX 0DTE expected-move band breached")
