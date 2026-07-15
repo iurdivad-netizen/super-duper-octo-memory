@@ -26,6 +26,22 @@ plotCross    = input.bool(true,  title="Show Engulfing Bar", group=grpGen)
 pp_period    = input.string("Day", title="Period", options=["Day", "Week", "Month", "Year"], group=grpGen)
 higherTF     = pp_period == "Day" ? "D" : pp_period == "Week" ? "W" : pp_period == "Month" ? "M" : "Y"
 
+midnightAnchor = input.string("Exchange", title="Midnight Anchor",
+     options=["Exchange", "UTC", "New York", "London", "Tokyo", "Sydney", "Chicago", "Frankfurt", "Custom"], group=grpGen,
+     tooltip="Which timezone's midnight defines the start of a period for the previous-period H/L. Exchange (default) uses the symbol's native timezone (syminfo.timezone). Others use their local calendar boundary — e.g. New York for FX day-open at 17:00 ET-adjacent behaviour, or Tokyo for a Sydney/Tokyo-anchored session view. Only affects the Calendar detection mode; HTF Security mode is bound to the exchange's daily bar and cannot be shifted.")
+customMidnightTz = input.string("Etc/UTC", title="Custom Midnight Timezone", group=grpGen,
+     tooltip="Only used when Midnight Anchor is set to Custom. Enter an IANA timezone name such as 'America/New_York', 'Europe/London', 'Asia/Tokyo', 'Australia/Sydney', 'Etc/UTC', or a fixed offset like 'GMT-5'.")
+
+midnightTz = midnightAnchor == "Exchange"  ? syminfo.timezone :
+             midnightAnchor == "UTC"       ? "Etc/UTC" :
+             midnightAnchor == "New York"  ? "America/New_York" :
+             midnightAnchor == "London"    ? "Europe/London" :
+             midnightAnchor == "Tokyo"     ? "Asia/Tokyo" :
+             midnightAnchor == "Sydney"    ? "Australia/Sydney" :
+             midnightAnchor == "Chicago"   ? "America/Chicago" :
+             midnightAnchor == "Frankfurt" ? "Europe/Berlin" :
+                                             customMidnightTz
+
 // =============================================================================
 // HIGH / LOW LINE STYLE
 // =============================================================================
@@ -126,12 +142,13 @@ prevTimeHTF  = request.security(syminfo.tickerid, higherTF, time[1],  lookahead=
 // Calendar-based period detection and manual H/L tracking. Operates on the
 // chart bars directly so the new-period transition cannot be lost to security
 // lookahead repainting or forex weekend gaps.
-isWeekend = dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday
+tzDow     = dayofweek(time, midnightTz)
+isWeekend = tzDow == dayofweek.saturday or tzDow == dayofweek.sunday
 skipDay   = pp_period == "Day" and tradingDaysOnly and isWeekend
-calNewPeriod = pp_period == "Day"   ? (ta.change(dayofmonth) != 0 and not skipDay) :
-               pp_period == "Week"  ? ta.change(weekofyear) != 0 :
-               pp_period == "Month" ? ta.change(month) != 0 :
-                                      ta.change(year) != 0
+calNewPeriod = pp_period == "Day"   ? (ta.change(dayofmonth(time, midnightTz)) != 0 and not skipDay) :
+               pp_period == "Week"  ? ta.change(weekofyear(time, midnightTz)) != 0 :
+               pp_period == "Month" ? ta.change(month(time, midnightTz)) != 0 :
+                                      ta.change(year(time, midnightTz)) != 0
 var float curPeriodHigh    = na
 var float curPeriodLow     = na
 var float trackedPrevH     = na
@@ -204,8 +221,10 @@ isIntraday = not (timeframe.ismonthly or timeframe.isweekly or timeframe.isdaily
 highBreakSrc = breakSrcOpt == "Close" ? close : high
 lowBreakSrc  = breakSrcOpt == "Close" ? close : low
 
-// Date label for the previous-period H/L
-labelDateStr = str.format_time(labelTime, dateFmt, syminfo.timezone)
+// Date label for the previous-period H/L. Formatted in the same timezone as
+// the midnight anchor so the labeled date matches the boundary that was
+// actually used to slice the period.
+labelDateStr = str.format_time(labelTime, dateFmt, midnightTz)
 labelTxtH    = "H " + labelDateStr
 labelTxtL    = "L " + labelDateStr
 
@@ -422,18 +441,18 @@ if lables and showHLLabels and showDaysAgo and isIntraday
                 lbl = array.get(hLabelArr, i)
                 lt  = array.size(hLabelTimeArr) > i ? array.get(hLabelTimeArr, i) : na
                 if not na(lbl) and not na(lt)
-                    label.set_text(lbl, "H " + str.format_time(lt, dateFmt, syminfo.timezone) + daysAgoSuffix(lt))
+                    label.set_text(lbl, "H " + str.format_time(lt, dateFmt, midnightTz) + daysAgoSuffix(lt))
         if array.size(lLabelArr) > 0
             for j = 0 to array.size(lLabelArr) - 1
                 lbl = array.get(lLabelArr, j)
                 lt  = array.size(lLabelTimeArr) > j ? array.get(lLabelTimeArr, j) : na
                 if not na(lbl) and not na(lt)
-                    label.set_text(lbl, "L " + str.format_time(lt, dateFmt, syminfo.timezone) + daysAgoSuffix(lt))
+                    label.set_text(lbl, "L " + str.format_time(lt, dateFmt, midnightTz) + daysAgoSuffix(lt))
     else
         if not na(highLabel) and not na(highLabelTime)
-            label.set_text(highLabel, "H " + str.format_time(highLabelTime, dateFmt, syminfo.timezone) + daysAgoSuffix(highLabelTime))
+            label.set_text(highLabel, "H " + str.format_time(highLabelTime, dateFmt, midnightTz) + daysAgoSuffix(highLabelTime))
         if not na(lowLabel) and not na(lowLabelTime)
-            label.set_text(lowLabel,  "L " + str.format_time(lowLabelTime,  dateFmt, syminfo.timezone) + daysAgoSuffix(lowLabelTime))
+            label.set_text(lowLabel,  "L " + str.format_time(lowLabelTime,  dateFmt, midnightTz) + daysAgoSuffix(lowLabelTime))
 
 // =============================================================================
 // SESSION SHADING
