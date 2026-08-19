@@ -1,0 +1,545 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// Open-Range-Breakout (ORB) strategy — extended Stop-Loss / Take-Profit engine
+//
+// Based on the original "Strategy: ORB" script, with the SL/TP logic rewritten:
+//   * 9 stop-loss placement modes (was: hard-coded swing ± ATR)
+//   * 8 take-profit modes (was: fixed R:R only)
+//   * Partial take-profit, break-even move, 4 trailing-stop modes, time stop
+//   * Real bracket orders (strategy.exit) instead of close-only exits
+//   * Risk-based position sizing driven by the actual stop distance
+//
+// No license. Free and Open Source.
+// ─────────────────────────────────────────────────────────────────────────────
+
+strategy("Strategy: ORB+ (SL/TP Engine)", shorttitle="ORB+", overlay=true,
+     currency=currency.NONE, initial_capital=100000,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=false,
+     commission_type=strategy.commission.percent, commission_value=0.0, slippage=0,
+     max_labels_count=500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GROUPS
+// ═════════════════════════════════════════════════════════════════════════════
+grpORB   = "ORB settings"
+grpEntry = "Entry filters"
+grpSL    = "Stop Loss"
+grpTP    = "Take Profit"
+grpMgmt  = "Trade Management"
+grpSize  = "Position Sizing"
+grpTrend = "Trend Settings"
+grpDisp  = "Display"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MODE CONSTANTS
+// ═════════════════════════════════════════════════════════════════════════════
+SL_SWING  = "Swing High/Low +/- ATR"
+SL_ATR    = "ATR from Entry"
+SL_ORBOPP = "ORB Opposite Side"
+SL_ORBMID = "ORB Midpoint"
+SL_PCT    = "Percent of Entry"
+SL_TICKS  = "Fixed Points"
+SL_ORBPCT = "Percent of ORB Range"
+SL_PREV   = "Previous Bar Extreme"
+SL_VWAP   = "VWAP"
+
+TP_RR     = "Risk:Reward"
+TP_ORB    = "ORB Range Multiple"
+TP_ATR    = "ATR Multiple"
+TP_PCT    = "Percent of Entry"
+TP_TICKS  = "Fixed Points"
+TP_PDHL   = "Prev Day High/Low"
+TP_VWAP   = "VWAP"
+TP_NONE   = "None (trail / EOD only)"
+
+TR_NONE   = "None"
+TR_ATR    = "ATR (Chandelier)"
+TR_PCT    = "Percent of Extreme"
+TR_SWING  = "Swing Structure"
+TR_STEP   = "Step by R"
+
+SZ_FIXED  = "Fixed Lot"
+SZ_RISK   = "Risk % of Equity"
+
+DIR_BOTH  = "Both"
+DIR_LONG  = "Long Only"
+DIR_SHORT = "Short Only"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — ORB window
+// ═════════════════════════════════════════════════════════════════════════════
+sessionInput = input.session(defval="0915-0930", title="Opening Range Session", group=grpORB,
+     tooltip="Exchange timezone. The high/low of this window forms the opening range.")
+useMinutes   = input.bool(defval=false, title="Use 'Range Minutes' instead of the session end", group=grpORB,
+     tooltip="ON: the range starts at the session start and lasts 'Range Minutes'.\nOFF: the range is exactly the session string above.")
+period       = input.int(defval=15, title="Range Minutes", minval=1, group=grpORB,
+     tooltip="Length of the opening range in minutes. Only used when the option above is ON.")
+requireDone  = input.bool(defval=true, title="Only trade after the range is complete", group=grpORB,
+     tooltip="Prevents 'breakouts' of a range that is still forming. Turn off to reproduce the original behaviour.")
+hide         = input.bool(defval=false, title="Hide ORB Range", group=grpORB)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — Entry filters
+// ═════════════════════════════════════════════════════════════════════════════
+dirMode      = input.string(defval=DIR_BOTH, title="Trade Direction", options=[DIR_BOTH, DIR_LONG, DIR_SHORT], group=grpEntry)
+usePdhPdl    = input.bool(defval=true, title="Also trade PDH / PDL breaks", group=grpEntry,
+     tooltip="Original behaviour: a cross of the previous day high/low is a valid signal on its own.")
+maxTradesDay = input.int(defval=2, title="Max Trades per Day", minval=1, maxval=10, group=grpEntry)
+useTrendFilt = input.bool(defval=false, title="Require price on the right side of the trend EMA", group=grpEntry)
+
+ignoreMementumVolume = input.bool(defval=false, title="Ignore Momentum & Volume", group=grpEntry,
+     tooltip="Ignore the RSI and volume filters when looking for trades.")
+rsiLen       = input.int(defval=14, title="Momentum Period (RSI)", minval=1, group=grpEntry)
+rsiBullish   = input.int(defval=50, step=1, title="Bullish Momentum", group=grpEntry)
+rsiBearish   = input.int(defval=50, step=1, title="Bearish Momentum", group=grpEntry)
+volAvg       = input.int(defval=20, step=1, title="Volume Average Period", minval=1, group=grpEntry)
+volThreshold = input.float(defval=1, step=0.1, title="Volume Strength", group=grpEntry,
+     tooltip="Multiplier: current bar volume vs the average volume of the last N bars.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — Stop Loss
+// ═════════════════════════════════════════════════════════════════════════════
+slMode      = input.string(defval=SL_SWING, title="Stop Loss Mode",
+     options=[SL_SWING, SL_ATR, SL_ORBOPP, SL_ORBMID, SL_PCT, SL_TICKS, SL_ORBPCT, SL_PREV, SL_VWAP], group=grpSL,
+     tooltip="Swing +/- ATR : lowest low / highest high of N bars, padded by ATR (original behaviour)\n" +
+             "ATR from Entry : entry -/+ ATR x multiplier\n" +
+             "ORB Opposite Side : long stops under the ORB low, short stops above the ORB high\n" +
+             "ORB Midpoint : stop at the middle of the opening range\n" +
+             "Percent of Entry : fixed % risk\n" +
+             "Fixed Points : fixed distance in ticks/points\n" +
+             "Percent of ORB Range : risk scaled to how wide the range is\n" +
+             "Previous Bar Extreme : low/high of the signal bar\n" +
+             "VWAP : session VWAP as the invalidation level")
+slAtrLen    = input.int(defval=14, title="ATR Period", minval=1, group=grpSL)
+slAtrMult   = input.float(defval=1.0, step=0.1, title="ATR Multiplier", minval=0.1, group=grpSL)
+slSwingLen  = input.int(defval=7, title="Swing Lookback (bars)", minval=2, group=grpSL)
+slPct       = input.float(defval=0.5, step=0.05, title="Stop: Percent of Entry (%)", minval=0.01, group=grpSL)
+slTicks     = input.float(defval=100, step=1, title="Stop: Fixed Points (ticks)", minval=1, group=grpSL)
+slOrbPct    = input.float(defval=50, step=5, title="Stop: Percent of ORB Range (%)", minval=1, group=grpSL)
+slBufTicks  = input.float(defval=0, step=1, title="Extra SL Buffer (ticks)", minval=0, group=grpSL,
+     tooltip="Pushed beyond the computed level to survive stop hunts / spread.")
+maxSlAtr    = input.float(defval=0, step=0.5, title="Skip trade if SL wider than (x ATR, 0 = off)", minval=0, group=grpSL)
+showSLLines = input.bool(defval=true, title="Plot live SL / TP levels", group=grpSL)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — Take Profit
+// ═════════════════════════════════════════════════════════════════════════════
+tpMode      = input.string(defval=TP_RR, title="Take Profit Mode",
+     options=[TP_RR, TP_ORB, TP_ATR, TP_PCT, TP_TICKS, TP_PDHL, TP_VWAP, TP_NONE], group=grpTP,
+     tooltip="Risk:Reward : entry +/- risk x ratio (original behaviour)\n" +
+             "ORB Range Multiple : range projected from the broken boundary\n" +
+             "ATR Multiple / Percent / Fixed Points : volatility or fixed distance targets\n" +
+             "Prev Day High/Low : take profit into the previous day extreme\n" +
+             "VWAP : mean-reversion target\n" +
+             "None : no fixed target, rely on the trailing stop / EOD exit")
+rrRatio     = input.float(defval=2.0, step=0.1, title="Risk:Reward", minval=0.1, group=grpTP)
+tpOrbMult   = input.float(defval=1.0, step=0.1, title="TP: ORB Range Multiple", minval=0.1, group=grpTP)
+tpAtrMult   = input.float(defval=3.0, step=0.1, title="TP: ATR Multiple", minval=0.1, group=grpTP)
+tpPct       = input.float(defval=1.0, step=0.05, title="TP: Percent of Entry (%)", minval=0.01, group=grpTP)
+tpTicks     = input.float(defval=200, step=1, title="TP: Fixed Points (ticks)", minval=1, group=grpTP)
+
+usePartial  = input.bool(defval=false, title="Scale out at a first target", group=grpTP)
+partialPct  = input.float(defval=50, step=5, title="Partial size (% of position)", minval=1, maxval=99, group=grpTP)
+partialRR   = input.float(defval=1.0, step=0.1, title="Partial target (R multiple)", minval=0.1, group=grpTP)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — Trade management
+// ═════════════════════════════════════════════════════════════════════════════
+beEnable    = input.bool(defval=false, title="Move stop to break-even", group=grpMgmt)
+beTriggerR  = input.float(defval=1.0, step=0.1, title="Break-even trigger (R multiple)", minval=0.1, group=grpMgmt)
+beOffTicks  = input.float(defval=0, step=1, title="Break-even offset (ticks)", group=grpMgmt,
+     tooltip="Positive values lock in a small profit instead of a flat break-even.")
+beAfterPart = input.bool(defval=true, title="Move to break-even after the partial fills", group=grpMgmt)
+
+trailMode   = input.string(defval=TR_NONE, title="Trailing Stop Mode", options=[TR_NONE, TR_ATR, TR_PCT, TR_SWING, TR_STEP], group=grpMgmt,
+     tooltip="ATR (Chandelier) : highest high since entry - ATR x mult\n" +
+             "Percent of Extreme : trail a fixed % below the running high\n" +
+             "Swing Structure : trail behind the last N-bar swing\n" +
+             "Step by R : ratchet the stop up one risk unit at a time")
+trailStartR = input.float(defval=0, step=0.1, title="Start trailing after (R multiple, 0 = immediately)", minval=0, group=grpMgmt)
+trailAtrMult= input.float(defval=2.0, step=0.1, title="Trail: ATR Multiplier", minval=0.1, group=grpMgmt)
+trailPct    = input.float(defval=1.0, step=0.05, title="Trail: Percent (%)", minval=0.01, group=grpMgmt)
+trailSwing  = input.int(defval=5, title="Trail: Swing Lookback (bars)", minval=2, group=grpMgmt)
+
+maxBarsHold = input.int(defval=0, title="Time stop: close after N bars (0 = off)", minval=0, group=grpMgmt)
+mktAlwaysOn = input.bool(defval=true, title="Market never closes (Crypto, Forex, Commodity)", group=grpMgmt,
+     tooltip="When ON the end-of-day flat is skipped.")
+endOfDay    = input.int(defval=1500, title="Flatten at (HHMM, exchange time)", group=grpMgmt)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — Sizing / trend / display
+// ═════════════════════════════════════════════════════════════════════════════
+sizeMode    = input.string(defval=SZ_FIXED, title="Position Sizing", options=[SZ_FIXED, SZ_RISK], group=grpSize)
+lotSize     = input.float(defval=1, step=1, title="Lot Size (fixed)", minval=0, group=grpSize)
+riskPctEq   = input.float(defval=1.0, step=0.1, title="Risk per trade (% of equity)", minval=0.01, group=grpSize)
+roundQty    = input.bool(defval=true, title="Round quantity down to whole units", group=grpSize)
+
+trendPeriod = input.int(defval=200, step=1, title="Trend Period", minval=1, group=grpTrend)
+hideTrend   = input.bool(defval=false, title="Hide the trend line", group=grpTrend)
+
+hidePDHCL   = input.bool(defval=false, title="Hide PDH / PDC / PDL & VWAP", group=grpDisp)
+hideTable   = input.bool(defval=false, title="Hide the Summary Table", group=grpDisp)
+hideLabels  = input.bool(defval=false, title="Hide the level labels", group=grpDisp)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE STATE (declared before the helper functions that read it)
+// ═════════════════════════════════════════════════════════════════════════════
+var int   tradeDir    = 0        // 1 long, -1 short, 0 flat
+var int   pendingDir  = 0        // direction of an entry order that has not filled yet
+var int   pendingBar  = na       // bar the entry order was submitted on
+var float entryPx     = na
+var float stopLvl     = na
+var float tpLvl       = na
+var float tp1Lvl      = na
+var float riskUnit    = na
+var float initQty     = na
+var bool  beDone      = false
+var bool  partialDone = false
+var int   barsHeld    = 0
+var float runUpHigh   = na
+var float runDnLow    = na
+var int   tradesToday = 0
+
+// Anchors captured on the signal bar so every level is computed from the same snapshot
+var float aAtr     = na
+var float aSwingLo = na
+var float aSwingHi = na
+var float aOrbHi   = na
+var float aOrbLo   = na
+var float aVwap    = na
+var float aDh      = na
+var float aDl      = na
+var float aPrevLo  = na
+var float aPrevHi  = na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Fallback stop: ATR from entry. Used whenever the selected mode yields an
+// unusable level (na, or on the wrong side of the entry).
+fallbackStop(int dir, float entry) =>
+    dir == 1 ? entry - aAtr * slAtrMult : entry + aAtr * slAtrMult
+
+calcStop(int dir, float entry) =>
+    float oRange = aOrbHi - aOrbLo
+    float raw = switch slMode
+        SL_SWING  => dir == 1 ? aSwingLo - aAtr * slAtrMult : aSwingHi + aAtr * slAtrMult
+        SL_ATR    => dir == 1 ? entry - aAtr * slAtrMult    : entry + aAtr * slAtrMult
+        SL_ORBOPP => dir == 1 ? aOrbLo : aOrbHi
+        SL_ORBMID => (aOrbHi + aOrbLo) / 2
+        SL_PCT    => dir == 1 ? entry * (1 - slPct / 100) : entry * (1 + slPct / 100)
+        SL_TICKS  => dir == 1 ? entry - slTicks * syminfo.mintick : entry + slTicks * syminfo.mintick
+        SL_ORBPCT => dir == 1 ? entry - oRange * slOrbPct / 100 : entry + oRange * slOrbPct / 100
+        SL_PREV   => dir == 1 ? aPrevLo : aPrevHi
+        SL_VWAP   => aVwap
+        => fallbackStop(dir, entry)
+    // A stop that is missing or on the wrong side of price is not a stop.
+    bool bad = na(raw) or (dir == 1 and raw >= entry) or (dir == -1 and raw <= entry)
+    float lvl = bad ? fallbackStop(dir, entry) : raw
+    float buf = slBufTicks * syminfo.mintick
+    dir == 1 ? lvl - buf : lvl + buf
+
+calcTp(int dir, float entry, float stop) =>
+    float risk     = math.abs(entry - stop)
+    float oRange = aOrbHi - aOrbLo
+    float rrTp     = dir == 1 ? entry + risk * rrRatio : entry - risk * rrRatio
+    float raw = switch tpMode
+        TP_RR    => rrTp
+        TP_ORB   => dir == 1 ? aOrbHi + oRange * tpOrbMult : aOrbLo - oRange * tpOrbMult
+        TP_ATR   => dir == 1 ? entry + aAtr * tpAtrMult : entry - aAtr * tpAtrMult
+        TP_PCT   => dir == 1 ? entry * (1 + tpPct / 100) : entry * (1 - tpPct / 100)
+        TP_TICKS => dir == 1 ? entry + tpTicks * syminfo.mintick : entry - tpTicks * syminfo.mintick
+        TP_PDHL  => dir == 1 ? aDh : aDl
+        TP_VWAP  => aVwap
+        TP_NONE  => float(na)
+        => rrTp
+    // Level-based targets (PDH/PDL, VWAP) can already be behind price -> fall back to R:R.
+    bool bad = tpMode != TP_NONE and (na(raw) or (dir == 1 and raw <= entry) or (dir == -1 and raw >= entry))
+    bad ? rrTp : raw
+
+calcQty(float entry, float stop) =>
+    float q = lotSize
+    if sizeMode == SZ_RISK
+        float riskCash = strategy.equity * riskPctEq / 100.0
+        float perUnit  = math.abs(entry - stop) * syminfo.pointvalue
+        q := perUnit > 0 ? riskCash / perUnit : lotSize
+        q := roundQty ? math.max(math.floor(q), 1) : q
+    q
+
+// One label per call site, redrawn on the last bar only.
+annotate(string txt, float val, bool show) =>
+    var label lbl = na
+    if barstate.islast
+        label.delete(lbl)
+        lbl := show and not na(val) ? label.new(bar_index, val, txt, style=label.style_label_left,
+             size=size.tiny, color=color.new(color.gray, 70), textcolor=color.white, tooltip=txt) : na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SESSION / OPENING RANGE
+// ═════════════════════════════════════════════════════════════════════════════
+tSess     = time(timeframe.period, sessionInput + ":1234567")
+inSessRaw = not na(tSess)
+sessFirst = inSessRaw and not inSessRaw[1]
+
+// Minutes-based window: starts with the session, ends 'period' minutes later.
+var int  rangeEndTime = na
+var bool inRangeMin   = false
+if sessFirst
+    rangeEndTime := time + period * 60 * 1000
+    inRangeMin   := true
+if inRangeMin and not na(rangeEndTime) and time >= rangeEndTime
+    inRangeMin := false
+
+inSession   = useMinutes ? inRangeMin : inSessRaw
+isFirst     = inSession and not inSession[1]
+isEndSess   = inSession[1] and not inSession
+newDay      = timeframe.change("D")
+
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbDone = false
+
+if isFirst
+    orbHigh := high
+    orbLow  := low
+    orbDone := false
+if inSession
+    orbHigh := math.max(nz(orbHigh, high), high)
+    orbLow  := math.min(nz(orbLow, low), low)
+if isEndSess
+    orbDone := true
+if newDay and not inSession
+    orbDone := false
+
+orbRange = orbHigh - orbLow
+rangeOk  = not na(orbHigh) and not na(orbLow) and (orbDone or not requireDone)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// REFERENCE LEVELS & INDICATORS  (all ta.* calls at global scope)
+// ═════════════════════════════════════════════════════════════════════════════
+[dh, dl, dc] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]],
+     barmerge.gaps_off, barmerge.lookahead_on)
+
+vwapVal   = ta.vwap(close)
+atr       = ta.atr(slAtrLen)
+swingHigh = ta.highest(high, slSwingLen)
+swingLow  = ta.lowest(low, slSwingLen)
+trailHi   = ta.highest(high, trailSwing)
+trailLo   = ta.lowest(low, trailSwing)
+rsi       = ta.rsi(close, rsiLen)
+ema       = ta.ema(close, trendPeriod)
+volMean   = ta.sma(volume, volAvg)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SIGNALS
+// ═════════════════════════════════════════════════════════════════════════════
+// Volume filter: compare volume to *average volume* (the original compared raw
+// volume to a price-based VWMA, which is not a like-for-like comparison).
+// Symbols without real volume data (indices, some CFDs) pass instead of being blocked.
+volOk    = na(volume) or na(volMean) or volume <= 0 ? true : volume > volMean * volThreshold
+momUpOk  = ignoreMementumVolume ? true : (rsi > rsiBullish and volOk)
+momDnOk  = ignoreMementumVolume ? true : (rsi < rsiBearish and volOk)
+
+trendUpOk = not useTrendFilt or close > ema
+trendDnOk = not useTrendFilt or close < ema
+
+curHM    = hour * 100 + minute
+sessOpen = mktAlwaysOn or curHM < endOfDay
+
+breakUp = ta.crossover(close, orbHigh) or (usePdhPdl and ta.crossover(close, dh))
+breakDn = ta.crossunder(close, orbLow) or (usePdhPdl and ta.crossunder(close, dl))
+
+if newDay
+    tradesToday := 0
+
+canTrade = barstate.isconfirmed and rangeOk and sessOpen and tradesToday < maxTradesDay and strategy.position_size == 0 and pendingDir == 0
+
+longCond  = canTrade and dirMode != DIR_SHORT and breakUp and close > open and momUpOk and trendUpOk
+shortCond = canTrade and dirMode != DIR_LONG  and breakDn and close < open and momDnOk and trendDnOk
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT  (runs before entries so an exit and a new signal can share a bar)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// --- stale entry order: filled and closed within one bar, or never filled ----
+if pendingDir != 0 and strategy.position_size == 0 and not na(pendingBar) and bar_index > pendingBar
+    pendingDir := 0
+
+// --- position closed: reset state -------------------------------------------
+if strategy.position_size == 0 and tradeDir != 0
+    tradeDir    := 0
+    entryPx     := na
+    stopLvl     := na
+    tpLvl       := na
+    tp1Lvl      := na
+    riskUnit    := na
+    initQty     := na
+    beDone      := false
+    partialDone := false
+    barsHeld    := 0
+    runUpHigh   := na
+    runDnLow    := na
+
+// --- entry just filled: re-anchor every level to the real fill price ---------
+if pendingDir != 0 and strategy.position_size != 0 and tradeDir == 0
+    tradeDir   := pendingDir
+    pendingDir := 0
+    entryPx    := strategy.opentrades.entry_price(strategy.opentrades - 1)
+    stopLvl    := calcStop(tradeDir, entryPx)
+    tpLvl      := calcTp(tradeDir, entryPx, stopLvl)
+    riskUnit   := math.abs(entryPx - stopLvl)
+    tp1Lvl     := tradeDir == 1 ? entryPx + riskUnit * partialRR : entryPx - riskUnit * partialRR
+    initQty    := math.abs(strategy.position_size)
+    runUpHigh  := high
+    runDnLow   := low
+    barsHeld   := 0
+
+// --- live position: trail, break-even, partial detection, time stop ----------
+if tradeDir != 0 and strategy.position_size != 0
+    barsHeld  := barsHeld + 1
+    runUpHigh := math.max(nz(runUpHigh, high), high)
+    runDnLow  := math.min(nz(runDnLow, low), low)
+
+    // partial fill detection
+    if usePartial and not partialDone and math.abs(strategy.position_size) < initQty - 0.0000001
+        partialDone := true
+        strategy.cancel("ORB TP1")
+        if beAfterPart and not beDone
+            stopLvl := tradeDir == 1 ? entryPx + beOffTicks * syminfo.mintick : entryPx - beOffTicks * syminfo.mintick
+            beDone  := true
+
+    float rNow = nz(riskUnit, 0) > 0 ? (tradeDir == 1 ? (close - entryPx) / riskUnit : (entryPx - close) / riskUnit) : 0.0
+
+    // break-even
+    if beEnable and not beDone and rNow >= beTriggerR
+        stopLvl := tradeDir == 1 ? entryPx + beOffTicks * syminfo.mintick : entryPx - beOffTicks * syminfo.mintick
+        beDone  := true
+
+    // trailing stop — stops only ever ratchet in the direction of the trade
+    if trailMode != TR_NONE and rNow >= trailStartR
+        float cand = switch trailMode
+            TR_ATR   => tradeDir == 1 ? runUpHigh - atr * trailAtrMult : runDnLow + atr * trailAtrMult
+            TR_PCT   => tradeDir == 1 ? runUpHigh * (1 - trailPct / 100) : runDnLow * (1 + trailPct / 100)
+            TR_SWING => tradeDir == 1 ? trailLo : trailHi
+            TR_STEP  => tradeDir == 1 ? entryPx + math.max(math.floor(rNow) - 1, 0) * riskUnit : entryPx - math.max(math.floor(rNow) - 1, 0) * riskUnit
+            => float(na)
+        if not na(cand)
+            // never let the trail move the stop through the current price
+            cand := tradeDir == 1 ? math.min(cand, close - syminfo.mintick) : math.max(cand, close + syminfo.mintick)
+            stopLvl := tradeDir == 1 ? math.max(nz(stopLvl, cand), cand) : math.min(nz(stopLvl, cand), cand)
+
+    // refresh the bracket
+    if usePartial and not partialDone
+        strategy.exit("ORB TP1", from_entry=tradeDir == 1 ? "Long" : "Short", qty_percent=partialPct, stop=stopLvl, limit=tp1Lvl, comment_profit="TP1", comment_loss="SL")
+    strategy.exit("ORB Exit", from_entry=tradeDir == 1 ? "Long" : "Short", stop=stopLvl, limit=tpLvl, comment_profit="Target", comment_loss="Stop")
+
+    // time stop
+    if maxBarsHold > 0 and barsHeld >= maxBarsHold
+        strategy.close_all(comment="Time stop")
+
+// --- end of day flat ---------------------------------------------------------
+if not mktAlwaysOn and curHM >= endOfDay and strategy.position_size != 0
+    strategy.close_all(comment="EOD flat")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENTRIES
+// ═════════════════════════════════════════════════════════════════════════════
+if longCond or shortCond
+    int dir = longCond ? 1 : -1
+    // snapshot everything the SL/TP engine needs
+    aAtr     := atr
+    aSwingLo := swingLow
+    aSwingHi := swingHigh
+    aOrbHi   := orbHigh
+    aOrbLo   := orbLow
+    aVwap    := vwapVal
+    aDh      := dh
+    aDl      := dl
+    aPrevLo  := low
+    aPrevHi  := high
+
+    float provStop = calcStop(dir, close)
+    float provRisk = math.abs(close - provStop)
+    bool  riskOk   = maxSlAtr <= 0 or na(atr) or provRisk <= atr * maxSlAtr
+
+    if riskOk and provRisk > 0
+        float provTp  = calcTp(dir, close, provStop)
+        float provTp1 = dir == 1 ? close + provRisk * partialRR : close - provRisk * partialRR
+        float qty     = calcQty(close, provStop)
+        if qty > 0
+            string id = dir == 1 ? "Long" : "Short"
+            strategy.entry(id, dir == 1 ? strategy.long : strategy.short, qty, comment=dir == 1 ? "Enter Long" : "Enter Short")
+            // protective bracket is armed immediately; it is re-anchored on the fill bar
+            if usePartial
+                strategy.exit("ORB TP1", from_entry=id, qty_percent=partialPct, stop=provStop, limit=provTp1, comment_profit="TP1", comment_loss="SL")
+            strategy.exit("ORB Exit", from_entry=id, stop=provStop, limit=provTp, comment_profit="Target", comment_loss="Stop")
+            pendingDir  := dir
+            pendingBar  := bar_index
+            tradesToday := tradesToday + 1
+            alert((dir == 1 ? "Buy:" : "Sell:") + syminfo.ticker +
+                 " ,SL:" + str.tostring(provStop, format.mintick) +
+                 ", Target:" + (na(provTp) ? "trail" : str.tostring(provTp, format.mintick)) +
+                 ", Qty:" + str.tostring(qty), alert.freq_once_per_bar)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═════════════════════════════════════════════════════════════════════════════
+pOrbHi = plot(hide ? na : orbHigh, title="ORB High", style=plot.style_line, linewidth=2,
+     color=orbHigh[1] != orbHigh ? na : color.green)
+pOrbLo = plot(hide ? na : orbLow, title="ORB Low", style=plot.style_line, linewidth=2,
+     color=orbLow[1] != orbLow ? na : color.red)
+fill(pOrbHi, pOrbLo, color=hide ? na : color.new(color.blue, 92), title="ORB Range")
+annotate("ORB-H", orbHigh, not hide and not hideLabels)
+annotate("ORB-L", orbLow, not hide and not hideLabels)
+
+plot(hidePDHCL ? na : dh, title="Prev High", color=color.red, linewidth=2, trackprice=true, show_last=1)
+plot(hidePDHCL ? na : dl, title="Prev Low", color=color.green, linewidth=2, trackprice=true, show_last=1)
+plot(hidePDHCL ? na : dc, title="Prev Close", color=color.black, linewidth=2, trackprice=true, show_last=1)
+plot(hidePDHCL ? na : vwapVal, title="VWAP", color=color.fuchsia, linewidth=2, trackprice=true, show_last=1)
+annotate("PDH", dh, not hidePDHCL and not hideLabels)
+annotate("PDL", dl, not hidePDHCL and not hideLabels)
+annotate("PDC", dc, not hidePDHCL and not hideLabels)
+annotate("VWAP", vwapVal, not hidePDHCL and not hideLabels)
+
+plot(hideTrend ? na : ema, title="EMA Trend", linewidth=1, color=close > ema ? color.green : color.red)
+annotate("Trend", ema, not hideTrend and not hideLabels)
+
+// live bracket of the open position
+inTrade = tradeDir != 0 and strategy.position_size != 0
+plot(showSLLines and inTrade ? stopLvl : na, title="Active SL", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(showSLLines and inTrade ? tpLvl : na, title="Active TP", color=color.green, style=plot.style_linebr, linewidth=1)
+plot(showSLLines and inTrade and usePartial and not partialDone ? tp1Lvl : na, title="Active TP1", color=color.olive, style=plot.style_linebr, linewidth=1)
+
+plotshape(longCond, title="Breakout Up", text="BO", location=location.belowbar, style=shape.triangleup, color=color.green, textcolor=color.green)
+plotshape(shortCond, title="Breakout Down", text="BD", location=location.abovebar, style=shape.triangledown, color=color.red, textcolor=color.red)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SUMMARY TABLE
+// ═════════════════════════════════════════════════════════════════════════════
+var table sumTable = table.new(position.bottom_right, 2, 9, border_width=1)
+
+addRow(t, row, k, v) =>
+    table.cell(t, 0, row, k, text_halign=text.align_left, text_size=size.small, bgcolor=color.new(color.lime, 70))
+    table.cell(t, 1, row, v, text_halign=text.align_right, text_size=size.small, bgcolor=color.new(color.lime, 70))
+
+if not hideTable and barstate.islast
+    addRow(sumTable, 0, syminfo.ticker, orbDone ? "range set" : "forming")
+    addRow(sumTable, 1, "ORB Upper", str.tostring(orbHigh, format.mintick))
+    addRow(sumTable, 2, "ORB Lower", str.tostring(orbLow, format.mintick))
+    addRow(sumTable, 3, "ORB Range", str.tostring(orbRange, format.mintick))
+    addRow(sumTable, 4, "PDH / PDC / PDL", str.tostring(dh, format.mintick) + " / " + str.tostring(dc, format.mintick) + " / " + str.tostring(dl, format.mintick))
+    addRow(sumTable, 5, "VWAP", str.tostring(vwapVal, format.mintick))
+    addRow(sumTable, 6, "Position", inTrade ? (tradeDir == 1 ? "LONG" : "SHORT") + " @ " + str.tostring(entryPx, format.mintick) : "flat")
+    addRow(sumTable, 7, "SL / TP", inTrade ? str.tostring(stopLvl, format.mintick) + " / " + (na(tpLvl) ? "trail" : str.tostring(tpLvl, format.mintick)) : "-")
+    addRow(sumTable, 8, "Trades today", str.tostring(tradesToday) + " / " + str.tostring(maxTradesDay))
+
+// End-of-range alert, same payload as the original script
+if isEndSess
+    alert(syminfo.ticker + " :\n\nORB Upper: " + str.tostring(orbHigh, format.mintick) +
+         "\nORB Lower: " + str.tostring(orbLow, format.mintick) +
+         "\nPDH: " + str.tostring(dh, format.mintick) +
+         "\nPDC: " + str.tostring(dc, format.mintick) +
+         "\nPDL: " + str.tostring(dl, format.mintick) +
+         "\nVWAP: " + str.tostring(vwapVal, format.mintick), alert.freq_once_per_bar_close)
