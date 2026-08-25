@@ -151,36 +151,52 @@ Same chart, same settings, 2025-09-30 → 2026-08-25. "v1" is the first build,
 filter and fixing the cost model, "v3" after setting the MA location line to the
 fast/slow midpoint.
 
-| Row | v1 | v2 | v3 target | Original |
+Instrument: NQU2026, 15m.
+
+| Row | v1 | v2 | v3 | Original |
 |---|---|---|---|---|
-| No-Wick Setups | 803 | 303 | ~408 | 408 |
-| Confirmed Entries | 38 | 105 | | 126 |
-| Positive Exit Rate | 55.26% | 62.86% | | 63.49% |
-| Entries / Active Day | 1.06 | 1.13 | | 1.18 |
-| Estimated Costs | 4.16R | 2.09R | | 1.36R |
-| Gross Net Profit | 0.01R | 15.05R | | 11.11R |
+| No-Wick Setups | 803 | 303 | 444 | 408 |
+| Confirmed Entries | 38 | 105 | 136 | 126 |
+| setup → entry conversion | 4.7% | 34.7% | 30.6% | 30.9% |
+| Wins / Locked / Losses | 17/4/17 | 54/12/39 | 66/19/51 | 57/23/46 |
+| loss share of closed | 44.7% | 37.1% | 37.5% | 36.5% |
+| Positive Exit Rate | 55.26% | 62.86% | 62.50% | 63.49% |
+| Entries / Active Day | 1.06 | 1.13 | 1.19 | 1.18 |
+| Estimated Costs | 4.16R | 2.09R | 2.66R | 1.36R |
+| Gross Net Profit | 0.01R | 15.05R | 15.06R | 11.11R |
 
-### What the remaining gap says
-The cost row is a usable probe of the average stop distance, because slippage is
-charged as `2 × slipTicks × mintick / stopDistance`. Backing that out:
+v4 moves the location line from the fast/slow midpoint (55% of raw candles kept)
+to the slow SMA alone (~51%), aiming at the original's 408.
 
-* ours: `(2.09/105 − 0.0095) = 0.0104R` per trade → average stop ≈ **192 ticks**
-* original: `(1.36/126 − 0.0095) = 0.0013R` per trade → average stop ≈ **1540 ticks**
+### Average stop distance — the two indicators agree
+Worth recording because it corrects an earlier reading of these numbers. Two
+independent probes of the original's average stop distance, now that the
+instrument is known to be NQ (mintick 0.25):
 
-So the original's structural stops are roughly **8× wider** than ours on the same
-data. That single difference also explains the rest of the profile: wider stops
-take longer to travel 75% of the way to target, which is why the original shows
-more `Locked` exits (18.3% of closed trades against our 11.4%) and a lower TP
-win rate (45.2% against our 51.4%), and why its drawdown is larger in R.
+* **Locked exits.** Wins and losses are ±1R, so everything except a round number
+  in `Gross Net Profit` comes from the locked exits: `57 − 46 = 11`, reported as
+  `11.11R`, so 23 locked exits contributed `0.11R` — `0.0048R` each. A lock sits
+  1 tick beyond entry, so `1 tick / stop = 0.0048` → average stop ≈ **52 points**.
+  Ours measures ≈ 50 points. Effectively identical.
+* **The cost row** would imply ≈ 386 points, which is absurd on 15m NQ (1.3% of
+  price). So the original's `Estimated Costs` does *not* use the same slippage
+  convention as this file, and that row cannot be used to infer stop distance.
 
-The suspect is what counts as a swing. With `Swing Pivot Strength 1` I take
-every minor 1-bar pivot, so for a long the nearest pivot low under the level is
-often one or two bars back. A stop 8× wider implies the original qualifies
-swings at a higher structural degree — the phrase "Confirmed Pivots" in
-`Closest Swing Search (Confirmed Pivots)` may mean pivots confirmed by a
-structure break (the ones that produced BOS/CHOCH), not merely confirmed by the
-pivot lookback. Reading one stop level off each indicator's R/R tool on the same
-setup settles it, which is cheaper than guessing.
+Conclusion: structural stops match, and the cost row difference is a cosmetic
+accounting difference in how the original charges its 1 tick/side of slippage —
+its per-trade cost works out to ~$1.08 against our ~$1.96, and no combination of
+fees, tick value and stop distance on NQ reproduces $1.08 exactly. Ours is
+`fees × qty / $per1R + 2 × ticks × mintick / stop distance`, which is at least
+dimensionally sound.
+
+### What is genuinely left
+Losses land at 37.5% of closed trades against the original's 36.5%, and positive
+exits at 62.5% against 63.49% — so the same trades are ending positive. What
+differs is the split *within* the winners: the original locks 18.3% of closed
+trades where we lock 14%, and wins 45.2% where we win 48.5%. The original's
+breakeven move fires slightly more often than ours, or its target sits slightly
+further from the fill (measuring the R distance from the level rather than from
+the entry close would do exactly that). Not resolvable from a dashboard alone.
 
 ## Inputs still unknown
 
