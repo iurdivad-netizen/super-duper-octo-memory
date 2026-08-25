@@ -328,6 +328,8 @@ rib3       = ta.sma(close, i_ribBase * 3)
 rib4       = ta.sma(close, i_ribBase * 4)
 rib5       = ta.sma(close, i_ribBase * 5)
 [stLine, stDir] = ta.supertrend(i_stMult, i_stPeriod)
+lFastRise  = smaLFast > smaLFast[3]
+sFastFall  = smaSFast < smaSFast[3]
 pvtHi      = ta.pivothigh(i_swingStr, i_swingStr)
 pvtLo      = ta.pivotlow(i_swingStr, i_swingStr)
 
@@ -467,11 +469,12 @@ f_trendOK(int dir, float px) =>
             ok := false
             why := "Entry inside the MA ribbon"
     if ok and i_useMADir
-        dirOK = isLong ? rib1 > rib1[3] : rib1 < rib1[3]
-        sepOK = math.abs(px - rib1) >= i_maSep * atr and (isLong ? px > rib1 : px < rib1)
+        fastMA = isLong ? smaLFast : smaSFast
+        dirOK  = isLong ? lFastRise : sFastFall
+        sepOK  = math.abs(px - fastMA) >= i_maSep * atr and (isLong ? px > fastMA : px < fastMA)
         if not dirOK
             ok := false
-            why := "Ribbon slope against trade"
+            why := "Fast MA slope against trade"
         else if not sepOK
             ok := false
             why := "Entry too close to MA"
@@ -887,14 +890,13 @@ bearBody    = close < open
 // "No-Wick MA Location Filter" gates the LEVEL, so it is applied here, when the
 // level is created - not at entry. A level on the wrong side of its MAs never
 // becomes a setup at all.
-// The dividing line is the midpoint of the direction's fast and slow SMA, which
-// is what reproduces the original's setup count: of the same raw no-wick
-// candles, "beyond BOTH MAs" keeps ~38% and "beyond EITHER" ~62%, while the
-// original keeps ~51%.
-locLineLong  = (smaLFast + smaLSlow) / 2.0
-locLineShort = (smaSFast + smaSSlow) / 2.0
-locOKLong   = not i_useMALoc or low  > locLineLong
-locOKShort  = not i_useMALoc or high < locLineShort
+// The dividing line is the direction's SLOW SMA. Measured against the original
+// on the same data, of the same raw no-wick candles: "beyond BOTH MAs" keeps
+// ~38%, "beyond EITHER" ~62%, the midpoint of the two ~55%, and one MA alone
+// ~51% - which is where the original sits. The fast SMA earns its keep in the
+// direction + separation filter below.
+locOKLong   = not i_useMALoc or low  > smaLSlow
+locOKShort  = not i_useMALoc or high < smaSSlow
 mkLong      = i_longOn  and noLowerWick and (i_dirNoWick ? bullBody : true) and high > low and locOKLong
 mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and high > low and locOKShort
 
