@@ -23,14 +23,18 @@ statistics will not reproduce the original tick-for-tick.
 2. **Pull-away** — price must travel `Minimum Pull-Away Before Retest (ATR)`
    × ATR(14) away from the level before a touch counts as a retest. Without this
    a level that price never left would "retest" itself immediately.
-3. **Retest / arm** — first touch back at the level arms the setup and (in
-   `Freeze at Arming` mode) freezes the structural swing used for the stop.
-4. **Entry** — per `Entry Model`:
-   * `Touch (Immediate)` — filled at the level on the touch bar.
-   * `Confirmation Candle` — any bar from the arming bar up to expiry whose
-     close satisfies the enabled confirmations; filled at that close.
-   * `Confirmation + Level Hold` — as above, but the confirmation bar must be a
-     later bar that held the level (long: `low >= level`).
+3. **Retest / arm** — the first touch back at the level arms the setup.
+4. **Entry** — per `Entry Model` (all four options are the real dropdown list):
+   * `Confirmation Close` *(default)* — the first bar from the arming bar to
+     expiry whose close satisfies the enabled confirmations; filled at that close.
+   * `Armed Level Retest` — that confirmation close only **arms** a limit at the
+     level; the fill happens when a *later* bar trades back to the level, at the
+     level. This is the model `Show Armed Labels` is really for.
+   * `Rejection Close` — the bar must wick into the level and close back out of
+     it with the rejection wick ≥ 50% of the bar's range, plus the enabled
+     confirmations; filled at that close.
+   * `Immediate Level Touch` — filled at the level on the retest bar, no close
+     required.
 5. **Expiry** — `Maximum Candles to Retest` bars after the no-wick candle, the
    setup is dropped and `Last Rejection` reads `Expired after N candles`.
    Every setup therefore ends as an entry, a bad stop, or an expiry — which is
@@ -42,9 +46,18 @@ valid structural stop. The first failure is what `Last Rejection` shows, and
 `Show Rejection Diagnostics` prints it on the bar.
 
 ### Risk
-* Stop structure: recent swing pivot (`Swing Pivot Strength`, searched over the
-  last `Closest Swing Search` confirmed pivots, picked by `Swing Selection`),
-  or the no-wick candle, the signal candle, or the level itself.
+* Stop structure:
+  * `Recent Swing` — nearest qualifying confirmed pivot, searched over the last
+    `Closest Swing Search` pivots and picked by `Swing Selection`
+    (`Most Recent Swing` or `Closest Swing by Price`).
+  * `Recent CHOCH` — the swing the last change-of-character came from (for a
+    long: the swing low that preceded the bullish CHOCH break), falling back to
+    the recent swing when that is missing or not beyond entry.
+  * `No-Wick Candle` / `Signal Candle` — that candle's extreme.
+* `Swing Anchor Timing`: `Freeze at Setup` captures the swing on the no-wick
+  candle itself so it cannot drift while the setup waits; `Recalculate at Entry`
+  re-reads structure on the entry bar. A frozen swing that is no longer beyond
+  the entry price falls back to the live one.
 * `raw = |entry − structure| + Stop Offset ticks`, `stop = raw × Stop Multiple`,
   `target = raw × Target Multiple` → dashboard header shows the resulting R
   multiple (1R with the screenshot defaults).
@@ -113,18 +126,19 @@ and on exit. Create one alert on the indicator with **Any alert() function call*
 
 ## Inputs still unknown
 
-The screenshots stop after `Style → Bearish Color`, and a few dropdowns are
-truncated in the images. Where the option list was cut off I chose a set that
-fits the visible default:
+The four entry/risk dropdowns have now been confirmed from screenshots and are
+implemented verbatim. What is still open: the two numeric dropdowns, anything
+below `Recent CHOCH` in the Stop-Loss Structure list, and any group after
+`Style → Bearish Color`.
 
-| Input | Visible | Options used here |
+| Input | Status | Options used here |
 |---|---|---|
-| Entry Model | `Confirm…` | Touch (Immediate) / Confirmation Candle / Confirmation + Level Hold |
-| Stop-Loss Structure | `Recent …` | Recent Swing Pivot / No-Wick Candle Extreme / Signal Candle Extreme / No-Wick Level |
-| Swing Selection | `Most Re…` | Most Recent / Most Extreme / Closest to Entry |
-| Swing Anchor Timing | `Freeze …` | Freeze at Arming / Live at Entry |
-| Stop / Target Distance | `1` | 0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 2.5 / 3 |
-| Move Stop Beyond Breakeven At | `75%` | Off / 25% / 50% / 60% / 75% / 90% |
+| Entry Model | **confirmed** | Confirmation Close / Armed Level Retest / Rejection Close / Immediate Level Touch |
+| Swing Selection | **confirmed** | Most Recent Swing / Closest Swing by Price |
+| Swing Anchor Timing | **confirmed** | Freeze at Setup / Recalculate at Entry |
+| Stop-Loss Structure | partly — the screenshot shows `Recent Swing` and `Recent CHOCH`, the list may continue below the crop | Recent Swing / Recent CHOCH / No-Wick Candle / Signal Candle |
+| Stop / Target Distance | still unknown | 0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 2.5 / 3 |
+| Move Stop Beyond Breakeven At | still unknown | Off / 25% / 50% / 60% / 75% / 90% |
 
 If the missing screenshots show different option lists (or extra groups after
 `Style`), they can be swapped in without touching the engine.

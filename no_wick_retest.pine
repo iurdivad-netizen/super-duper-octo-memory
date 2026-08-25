@@ -60,21 +60,21 @@ G_COST  = "Dashboard Costs"
 G_STYLE = "Style"
 
 // mode constants -------------------------------------------------------------
-EM_TOUCH  = "Touch (Immediate)"
-EM_CONF   = "Confirmation Candle"
-EM_HOLD   = "Confirmation + Level Hold"
+EM_CONF   = "Confirmation Close"
+EM_RETEST = "Armed Level Retest"
+EM_REJECT = "Rejection Close"
+EM_TOUCH  = "Immediate Level Touch"
 
-SS_SWING  = "Recent Swing Pivot"
-SS_NOWICK = "No-Wick Candle Extreme"
-SS_SIGNAL = "Signal Candle Extreme"
-SS_LEVEL  = "No-Wick Level"
+SS_SWING  = "Recent Swing"
+SS_CHOCH  = "Recent CHOCH"
+SS_NOWICK = "No-Wick Candle"
+SS_SIGNAL = "Signal Candle"
 
-SW_RECENT = "Most Recent"
-SW_EXTREM = "Most Extreme"
-SW_CLOSE  = "Closest to Entry"
+SW_RECENT = "Most Recent Swing"
+SW_CLOSE  = "Closest Swing by Price"
 
-AN_FREEZE = "Freeze at Arming"
-AN_LIVE   = "Live at Entry"
+AN_FREEZE = "Freeze at Setup"
+AN_LIVE   = "Recalculate at Entry"
 
 // ═════════════════════════════════════════════════════════════════════════════
 // INPUTS — TIMEFRAME
@@ -110,10 +110,11 @@ i_diagKeep    = input.int(100, "Diagnostic Labels to Keep", minval = 1, maxval =
 // ═════════════════════════════════════════════════════════════════════════════
 // INPUTS — ENTRY MODEL
 // ═════════════════════════════════════════════════════════════════════════════
-i_entryModel = input.string(EM_CONF, "Entry Model", options = [EM_TOUCH, EM_CONF, EM_HOLD], group = G_MODEL,
-     tooltip = EM_TOUCH + ": fill at the level the moment it is retested.\n" +
-     EM_CONF + ": wait for a candle close that satisfies the confirmations below.\n" +
-     EM_HOLD + ": as above, but the confirmation candle must also hold the level (no close beyond it).")
+i_entryModel = input.string(EM_CONF, "Entry Model", options = [EM_CONF, EM_RETEST, EM_REJECT, EM_TOUCH], group = G_MODEL,
+     tooltip = EM_CONF + ": enter on the close of the first candle that satisfies the confirmations below.\n" +
+     EM_RETEST + ": that confirmation only ARMS the level - the fill is a limit at the level on a later candle.\n" +
+     EM_REJECT + ": the candle must wick into the level and close back out of it, wick >= half the range.\n" +
+     EM_TOUCH + ": fill at the level the moment it is retested, no candle close required.")
 i_pullAway   = input.float(0.15, "Minimum Pull-Away Before Retest (ATR)", minval = 0.0, step = 0.05, group = G_MODEL,
      tooltip = "Price must travel this far away from the level before a touch counts as a retest.")
 i_showArmed  = input.bool(false, "Show Armed Labels", group = G_MODEL)
@@ -191,11 +192,16 @@ i_msBearClr  = input.color(#EF5350, "Bearish Structure Color", group = G_MS)
 // ═════════════════════════════════════════════════════════════════════════════
 i_swingStr    = input.int(1, "Swing Pivot Strength", minval = 1, maxval = 20, group = G_RISK,
      tooltip = "Bars either side of a pivot. 1 = every minor swing.")
-i_slStruct    = input.string(SS_SWING, "Stop-Loss Structure", options = [SS_SWING, SS_NOWICK, SS_SIGNAL, SS_LEVEL], group = G_RISK)
-i_swingSel    = input.string(SW_RECENT, "Swing Selection", options = [SW_RECENT, SW_EXTREM, SW_CLOSE], group = G_RISK)
+i_slStruct    = input.string(SS_SWING, "Stop-Loss Structure", options = [SS_SWING, SS_CHOCH, SS_NOWICK, SS_SIGNAL],
+     group = G_RISK,
+     tooltip = SS_SWING + ": nearest qualifying confirmed swing pivot.\n" +
+     SS_CHOCH + ": the swing that the last change-of-character came from.\n" +
+     SS_NOWICK + " / " + SS_SIGNAL + ": the extreme of that candle.")
+i_swingSel    = input.string(SW_RECENT, "Swing Selection", options = [SW_RECENT, SW_CLOSE], group = G_RISK,
+     tooltip = SW_RECENT + ": newest qualifying pivot.\n" + SW_CLOSE + ": the qualifying pivot nearest to entry.")
 i_anchor      = input.string(AN_FREEZE, "Swing Anchor Timing", options = [AN_FREEZE, AN_LIVE], group = G_RISK,
-     tooltip = AN_FREEZE + ": the structure is captured when the setup arms and cannot drift.\n" +
-     AN_LIVE + ": the structure is re-read on the entry bar.")
+     tooltip = AN_FREEZE + ": structure is captured on the no-wick candle and cannot drift.\n" +
+     AN_LIVE + ": structure is re-read on the entry bar.")
 i_swingSearch = input.int(6, "Closest Swing Search (Confirmed Pivots)", minval = 1, maxval = 50, group = G_RISK)
 i_stopOffset  = input.int(5, "Stop Offset (Ticks)", minval = 0, group = G_RISK)
 i_stopMult    = input.string("1", "Stop Distance (Structure Multiple)",
@@ -284,6 +290,8 @@ type Setup
     bool  pulled   = false
     bool  armed    = false
     int   armedBar = 0
+    bool  cfmd     = false
+    int   cfmdBar  = 0
     float frozenSw = na
     line  ln       = na
 
@@ -329,6 +337,8 @@ var float lastPL   = na
 var bool  phBroken = true
 var bool  plBroken = true
 var int   structBias = 0                  // 1 bull, -1 bear, 0 undefined
+var float chochLo    = na                 // swing the last bullish CHOCH came from
+var float chochHi    = na                 // swing the last bearish CHOCH came from
 
 var array<Setup> setups = array.new<Setup>()
 var array<Trade> trades = array.new<Trade>()
@@ -398,8 +408,6 @@ f_pickSwing(bool isLong, float ref) =>
             if ok
                 if na(best)
                     best := p
-                else if i_swingSel == SW_EXTREM
-                    best := isLong ? math.min(best, p) : math.max(best, p)
                 else if i_swingSel == SW_CLOSE
                     best := isLong ? math.max(best, p) : math.min(best, p)
     best
@@ -544,6 +552,8 @@ if newBar
         phBroken := true
         isChoch = structBias == -1
         structBias := 1
+        if isChoch
+            chochLo := lastPL
         if i_showStruct and ((isChoch and i_showCHOCH) or (not isChoch and i_showBOS))
             msArr.push(label.new(bar_index, high, isChoch ? "CHoCH" : "BOS",
                  style = label.style_label_down, color = color.new(i_msBullClr, 20),
@@ -554,6 +564,8 @@ if newBar
         plBroken := true
         isChochDn = structBias == 1
         structBias := -1
+        if isChochDn
+            chochHi := lastPH
         if i_showStruct and ((isChochDn and i_showCHOCH) or (not isChochDn and i_showBOS))
             msArr.push(label.new(bar_index, low, isChochDn ? "CHoCH" : "BOS",
                  style = label.style_label_up, color = color.new(i_msBearClr, 20),
@@ -675,8 +687,7 @@ if newBar and tfMatch and setups.size() > 0
                 if touched
                     s.armed    := true
                     s.armedBar := bar_index
-                    s.frozenSw := f_pickSwing(isLong, s.level)
-                    if i_showArmed
+                    if i_showArmed and i_entryModel != EM_RETEST
                         diagArr.push(label.new(bar_index, isLong ? low : high, "ARMED",
                              style = isLong ? label.style_label_up : label.style_label_down,
                              color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny))
@@ -684,42 +695,84 @@ if newBar and tfMatch and setups.size() > 0
 
             // ── entry evaluation ────────────────────────────────────────────
             if s.armed and not dropIt
-                touchBar  = i_entryModel == EM_TOUCH and s.armedBar == bar_index
-                holdOK    = s.armedBar < bar_index and (isLong ? low >= s.level : high <= s.level)
-                candidate = i_entryModel == EM_TOUCH ? touchBar : i_entryModel == EM_HOLD ? holdOK : true
+                [confOK, confWhy] = f_confirmOK(s.dir, s.level)
+                rng     = high - low
+                wickLen = isLong ? math.min(open, close) - low : high - math.max(open, close)
+                intoLvl = isLong ? low <= s.level : high >= s.level
+                backOut = isLong ? close > s.level : close < s.level
+                rejOK   = rng > 0 and intoLvl and backOut and wickLen >= 0.5 * rng
 
-                if candidate
-                    entryPx = i_entryModel == EM_TOUCH ? s.level : close
-                    [confOK, confWhy]   = f_confirmOK(s.dir, s.level)
+                bool   trigger = false
+                float  entryPx = na
+                string rej     = ""
+
+                if i_entryModel == EM_TOUCH
+                    // fill at the level on the retest itself
+                    if s.armedBar == bar_index
+                        trigger := true
+                        entryPx := s.level
+                else if i_entryModel == EM_CONF
+                    // first close that satisfies the confirmations
+                    if confOK
+                        trigger := true
+                        entryPx := close
+                    else
+                        rej := confWhy
+                else if i_entryModel == EM_REJECT
+                    // wick into the level, close back out of it
+                    if rejOK and confOK
+                        trigger := true
+                        entryPx := close
+                    else
+                        rej := rejOK ? confWhy : "No rejection candle at level"
+                else
+                    // EM_RETEST: the confirmation only arms a limit at the level
+                    if not s.cfmd
+                        if confOK
+                            s.cfmd    := true
+                            s.cfmdBar := bar_index
+                            if i_showArmed
+                                diagArr.push(label.new(bar_index, isLong ? low : high, "ARMED",
+                                     style = isLong ? label.style_label_up : label.style_label_down,
+                                     color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny))
+                                f_trimLabels(diagArr, i_diagKeep)
+                        else
+                            rej := confWhy
+                    else if bar_index > s.cfmdBar and intoLvl
+                        trigger := true
+                        entryPx := s.level
+
+                if trigger
                     [blocked, blockWhy] = f_sessBlocked(s.dir, time)
                     [trOK, trWhy]       = f_trendOK(s.dir, s.level, entryPx)
-                    dayOK   = f_dayOK(time)
+                    dayOK    = f_dayOK(time)
                     freeSlot = i_overlap or trades.size() == 0
 
                     // structural stop
+                    live = f_pickSwing(isLong, entryPx)
                     float structPx = na
                     if i_slStruct == SS_SWING
-                        live = f_pickSwing(isLong, entryPx)
                         structPx := i_anchor == AN_FREEZE and not na(s.frozenSw) ? s.frozenSw : live
-                        if not na(structPx) and (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                            structPx := live
+                    else if i_slStruct == SS_CHOCH
+                        structPx := isLong ? chochLo : chochHi
+                        if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
                             structPx := live
                     else if i_slStruct == SS_NOWICK
                         structPx := isLong ? s.lo : s.hi
-                    else if i_slStruct == SS_SIGNAL
-                        structPx := isLong ? low : high
                     else
-                        structPx := s.level
+                        structPx := isLong ? low : high
 
                     rawDist  = na(structPx) ? na : math.abs(entryPx - structPx) + i_stopOffset * syminfo.mintick
                     stopDist = na(rawDist) ? na : rawDist * stopMult
                     tgtDist  = na(rawDist) ? na : rawDist * tgtMult
-                    stopOK   = not na(stopDist) and stopDist > 0 and
-                         (i_slStruct != SS_SWING or (isLong ? structPx < entryPx : structPx > entryPx))
+                    needBeyond = i_slStruct == SS_SWING or i_slStruct == SS_CHOCH
+                    structOK = not na(structPx) and
+                         (not needBeyond or (isLong ? structPx < entryPx : structPx > entryPx))
+                    stopOK   = structOK and not na(stopDist) and stopDist > 0
 
-                    string rej = ""
-                    if i_entryModel != EM_TOUCH and not confOK
-                        rej := confWhy
-                    else if not dayOK
+                    if not dayOK
                         rej := "Day filter"
                     else if blocked
                         rej := blockWhy
@@ -729,19 +782,10 @@ if newBar and tfMatch and setups.size() > 0
                         rej := "Trade already open"
                     else if not stopOK
                         rej := "No valid structure for stop"
+                        nBadStop := nBadStop + 1
+                        dropIt   := true
 
-                    if rej != ""
-                        lastReject := rej
-                        if not stopOK and dayOK and not blocked and trOK and freeSlot and
-                             (i_entryModel == EM_TOUCH or confOK)
-                            nBadStop := nBadStop + 1
-                            dropIt := true
-                        if i_showRejects
-                            diagArr.push(label.new(bar_index, isLong ? low : high, rej,
-                                 style = isLong ? label.style_label_up : label.style_label_down,
-                                 color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny))
-                            f_trimLabels(diagArr, i_diagKeep)
-                    else
+                    if rej == ""
                         // ── ENTRY ───────────────────────────────────────────
                         stopPx = entryPx - s.dir * stopDist
                         tgtPx  = entryPx + s.dir * tgtDist
@@ -783,6 +827,14 @@ if newBar and tfMatch and setups.size() > 0
 
                         dropIt := true
 
+                if rej != ""
+                    lastReject := rej
+                    if i_showRejects
+                        diagArr.push(label.new(bar_index, isLong ? low : high, rej,
+                             style = isLong ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny))
+                        f_trimLabels(diagArr, i_diagKeep)
+
         // ── expiry ─────────────────────────────────────────────────────────
         if not dropIt and age >= i_maxCandles
             dropIt     := true
@@ -814,7 +866,8 @@ mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and 
 
 if newBar and tfMatch
     if mkLong
-        st = Setup.new(dir = 1, level = low, atr0 = atr, hi = high, lo = low, bar0 = bar_index)
+        st = Setup.new(dir = 1, level = low, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
+             frozenSw = f_pickSwing(true, low))
         if i_showLevels
             st.ln := line.new(bar_index, low, bar_index + 1, low, color = color.new(i_bullClr, 25),
                  style = line.style_dotted, width = 1)
@@ -825,7 +878,8 @@ if newBar and tfMatch
                  style = label.style_arrowup, color = i_bullClr, size = i_arrowSize))
             f_trimLabels(arrowsArr, i_arrowKeep)
     if mkShort
-        st = Setup.new(dir = -1, level = high, atr0 = atr, hi = high, lo = low, bar0 = bar_index)
+        st = Setup.new(dir = -1, level = high, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
+             frozenSw = f_pickSwing(false, high))
         if i_showLevels
             st.ln := line.new(bar_index, high, bar_index + 1, high, color = color.new(i_bearClr, 25),
                  style = line.style_dotted, width = 1)
