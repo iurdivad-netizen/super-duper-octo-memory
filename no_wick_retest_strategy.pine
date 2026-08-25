@@ -1,0 +1,1304 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// NO WICK RETEST — STRATEGY
+//
+// strategy() port of `no_wick_retest.pine` (see DEV_NOTES_no_wick_retest.md).
+// The signal engine is identical: no-wick candle -> pull-away -> retest ->
+// entry model + confirmations + session/day/trend filters -> structural stop,
+// structure-multiple target, and a stop that jumps beyond breakeven once price
+// has travelled a chosen % of the way to target.
+//
+// What is different from the indicator, and why:
+//
+//   1. REAL ORDERS. Entries go through strategy.entry(), brackets through
+//      strategy.exit(). The broker emulator decides the fills, so the Strategy
+//      Tester, the equity curve and the List of Trades are all populated.
+//
+//   2. TWO ORDER TYPES, chosen by the entry model — not by an input.
+//        Confirmation Close / Rejection Close -> MARKET on the signal bar.
+//          `process_orders_on_close = true`, so the fill is that bar's close:
+//          exactly the price the indicator books.
+//        Immediate Level Touch / Armed Level Retest -> RESTING LIMIT at the
+//          no-wick level. The indicator books these at the level but only
+//          notices at the bar close; a real limit fills intrabar at the level,
+//          which is what the model actually describes. The order is re-checked
+//          against the filters on every bar and cancelled if they turn against
+//          it or the setup expires.
+//
+//   3. POSITION SIZING. The indicator scores everything in R and never needs a
+//      quantity. A strategy does: fixed contracts, a cash risk budget, or a %
+//      of equity, all solved against the trade's own structural stop distance.
+//
+//   4. COSTS ARE REAL. Commission and slippage come from the strategy
+//      declaration (override them in Properties), so they land inside the fill
+//      prices and the realized P&L instead of being modelled on the dashboard.
+//      The dashboard's cost row now reports commission actually charged.
+//
+//   5. "LOCKED" SURVIVES. The third outcome the Strategy Tester has no concept
+//      of is still tracked here: a trade stopped out on the post-breakeven
+//      profit lock is a Locked exit, not a win and not a loss.
+//
+// Pine strategies hold ONE net position, so simultaneous longs and shorts are
+// impossible. With "Allow Overlapping Trades" on, same-direction adds stack up
+// to a cap and an opposing signal is either skipped or reverses the position —
+// see "Opposite Signal Handling".
+//
+// Everything still runs on CONFIRMED bars only, so no signal repaints.
+//
+// No license. Free and open source.
+// ─────────────────────────────────────────────────────────────────────────────
+
+strategy("NO WICK RETEST — Strategy", shorttitle = "NWR-S", overlay = true,
+     currency = currency.NONE, initial_capital = 100000,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     pyramiding = 20,
+     calc_on_every_tick = false, process_orders_on_close = true,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.95,
+     slippage = 1,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
+     max_bars_back = 5000)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GROUPS
+// ═════════════════════════════════════════════════════════════════════════════
+G_TF    = "Timeframe"
+G_SETUP = "No-Wick Setup"
+G_DIAG  = "Diagnostics"
+G_MODEL = "Entry Model"
+G_CONF  = "Entry Confirmations"
+G_SESS  = "Session Filters"
+G_DAY   = "Day Filters"
+G_TREND = "Trend Filters"
+G_MS    = "Market Structure"
+G_RISK  = "Risk Management"
+G_ORD   = "Orders & Position Sizing"
+G_AUTO  = "Automation"
+G_DISP  = "Display"
+G_DASH  = "Dashboard"
+G_PROP  = "Prop Risk"
+G_STYLE = "Style"
+
+// mode constants -------------------------------------------------------------
+EM_CONF   = "Confirmation Close"
+EM_RETEST = "Armed Level Retest"
+EM_REJECT = "Rejection Close"
+EM_TOUCH  = "Immediate Level Touch"
+
+SS_SWING  = "Recent Swing"
+SS_CHOCH  = "Recent CHOCH"
+
+SW_RECENT = "Most Recent Swing"
+SW_CLOSE  = "Closest Swing by Price"
+
+AN_FREEZE = "Freeze at Setup"
+AN_LIVE   = "Recalculate at Entry"
+
+SZ_FIXED  = "Fixed Contracts"
+SZ_CASH   = "Risk $ per Trade"
+SZ_PCT    = "Risk % of Equity"
+
+OPP_SKIP  = "Skip the signal"
+OPP_REV   = "Reverse the position"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — TIMEFRAME
+// ═════════════════════════════════════════════════════════════════════════════
+i_sigTF = input.timeframe("15", "Signal / Execution Timeframe", group = G_TF,
+     tooltip = "The engine only runs when the chart timeframe matches this value. " +
+     "Put the chart on this timeframe; the dashboard tells you when they differ.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — NO-WICK SETUP
+// ═════════════════════════════════════════════════════════════════════════════
+i_longOn     = input.bool(true,  "Enable Long Setups",  group = G_SETUP)
+i_shortOn    = input.bool(true,  "Enable Short Setups", group = G_SETUP)
+i_dirNoWick  = input.bool(true,  "Require Directional No-Wick Candle", group = G_SETUP,
+     tooltip = "ON: a long level must come from a bullish no-lower-wick candle (and vice versa).\n" +
+     "OFF: any candle without the relevant wick creates a level.")
+i_maxCandles = input.int(10, "Maximum Candles to Retest", minval = 1, maxval = 200, group = G_SETUP,
+     tooltip = "Bars after the no-wick candle in which the retest AND the entry must complete. " +
+     "A resting limit order is cancelled when this expires.")
+i_showLevels = input.bool(true,  "Show Active No-Wick Levels", group = G_SETUP)
+i_showArrows = input.bool(true,  "Show No-Wick Arrows", group = G_SETUP)
+i_arrowSize  = input.string("small", "No-Wick Arrow Size", options = ["tiny", "small", "normal", "large"], group = G_SETUP)
+i_arrowKeep  = input.int(200, "No-Wick Arrows to Keep", minval = 1, maxval = 450, group = G_SETUP)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DIAGNOSTICS
+// ═════════════════════════════════════════════════════════════════════════════
+i_showRejects = input.bool(false, "Show Rejection Diagnostics", group = G_DIAG,
+     tooltip = "Prints why an armed setup did not convert into an order on that bar.")
+i_showExpired = input.bool(false, "Show Expired Setup Labels", group = G_DIAG)
+i_diagKeep    = input.int(100, "Diagnostic Labels to Keep", minval = 1, maxval = 450, group = G_DIAG)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — ENTRY MODEL
+// ═════════════════════════════════════════════════════════════════════════════
+i_entryModel = input.string(EM_CONF, "Entry Model", options = [EM_CONF, EM_RETEST, EM_REJECT, EM_TOUCH], group = G_MODEL,
+     tooltip = EM_CONF + ": MARKET order on the close of the first candle that satisfies the confirmations below.\n" +
+     EM_RETEST + ": that confirmation only ARMS the level - a limit order then rests at the level.\n" +
+     EM_REJECT + ": MARKET order when a candle wicks into the level and closes back out of it, wick >= half the range.\n" +
+     EM_TOUCH + ": a limit rests at the level from the moment price has pulled away, filled intrabar on the retest.")
+i_pullAway   = input.float(0.15, "Minimum Pull-Away Before Retest (ATR)", minval = 0.0, step = 0.05, group = G_MODEL,
+     tooltip = "Price must travel this far away from the level before a touch counts as a retest.")
+i_showArmed  = input.bool(false, "Show Armed Labels", group = G_MODEL)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — ENTRY CONFIRMATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+i_cfBack     = input.bool(true,  "Require Close Back Through No-Wick Level", group = G_CONF,
+     tooltip = "Long: the confirmation candle must close above the level.")
+i_cfCandle   = input.bool(true,  "Require Bull/Bear Confirmation Candle", group = G_CONF,
+     tooltip = "Long: close > open.")
+i_cfPrev     = input.bool(true,  "Require Close Beyond Previous Candle", group = G_CONF,
+     tooltip = "Long: close > previous candle high.")
+i_cfChoch    = input.bool(false, "Require Matching CHOCH Bias", group = G_CONF,
+     tooltip = "Only take longs while market structure is bullish (last break was to the upside).")
+i_overlap    = input.bool(false, "Allow Overlapping Trades", group = G_CONF,
+     tooltip = "OFF: a new order is skipped while another trade is open OR a limit order is still resting.\n" +
+     "ON: same-direction trades stack up to 'Maximum Concurrent Trades'.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — SESSION FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+i_sessTZ    = input.string("America/New_York", "Session Filter Timezone", group = G_SESS)
+i_blkNYOpen = input.bool(false, "Block New York Open Entries (9:30-10:00 AM)", group = G_SESS)
+i_blkNYPMS  = input.bool(true,  "Block NY PM Short Entries Only (12-4 PM)",   group = G_SESS,
+     tooltip = "Blocks short entries only, between 12:00 and 16:00 in the timezone above.")
+i_blkNYLate = input.bool(true,  "Block Late New York Entries (2-4 PM)",       group = G_SESS)
+i_blkAsia   = input.bool(true,  "Block Early Asia Entries (6-8 PM)",          group = G_SESS)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DAY FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+i_mon = input.bool(true,  "Trade Monday",         group = G_DAY)
+i_tue = input.bool(true,  "Trade Tuesday",        group = G_DAY)
+i_wed = input.bool(true,  "Trade Wednesday",      group = G_DAY)
+i_thu = input.bool(true,  "Trade Thursday",       group = G_DAY)
+i_fri = input.bool(true,  "Trade Friday",         group = G_DAY)
+i_sun = input.bool(false, "Trade Sunday Evening", group = G_DAY)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — TREND FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+i_useMALoc  = input.bool(true, "Use No-Wick MA Location Filter", group = G_TREND,
+     tooltip = "Long levels must sit above the long slow SMA, short levels below the short slow SMA.")
+i_sFast     = input.int(20,  "Short Fast SMA Length", minval = 1, group = G_TREND)
+i_sSlow     = input.int(100, "Short Slow SMA Length", minval = 1, group = G_TREND)
+i_lFast     = input.int(20,  "Long Fast SMA Length",  minval = 1, group = G_TREND)
+i_lSlow     = input.int(100, "Long Slow SMA Length",  minval = 1, group = G_TREND)
+i_useRibbon = input.bool(true,  "Use MA Ribbon Filter", group = G_TREND,
+     tooltip = "The entry price must be clear of the whole 5-MA ribbon.")
+i_useMADir  = input.bool(false, "Use MA Direction + Separation Filter", group = G_TREND,
+     tooltip = "The direction's fast MA must be sloping with the trade AND price must be far enough from it.")
+i_maSep     = input.float(0.15, "Minimum Entry-to-MA Separation (ATR)", minval = 0.0, step = 0.05, group = G_TREND)
+i_showRib   = input.bool(false, "Show MA Ribbon on Chart", group = G_TREND)
+i_ribBase   = input.int(20, "Ribbon Base Length", minval = 1, group = G_TREND,
+     tooltip = "Ribbon uses base x1 ... base x5.")
+
+i_useST     = input.bool(false, "Use Supertrend Filter",   group = G_TREND)
+i_showST    = input.bool(false, "Show Supertrend on Chart", group = G_TREND)
+i_stMult    = input.float(3.0, "Supertrend Multiplier", minval = 0.1, step = 0.1, group = G_TREND)
+i_stPeriod  = input.int(10, "Supertrend Period", minval = 1, group = G_TREND)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — MARKET STRUCTURE
+// ═════════════════════════════════════════════════════════════════════════════
+i_showStruct = input.bool(false, "Show BOS / CHOCH Labels", group = G_MS)
+i_showBOS    = input.bool(false, "Show BOS Labels",   group = G_MS)
+i_showCHOCH  = input.bool(false, "Show CHOCH Labels", group = G_MS)
+i_msSize     = input.string("tiny", "Structure Label Size", options = ["tiny", "small", "normal", "large"], group = G_MS)
+i_msKeep     = input.int(150, "Structure Labels to Keep", minval = 1, maxval = 450, group = G_MS)
+i_msBullClr  = input.color(#26A69A, "Bullish Structure Color", group = G_MS)
+i_msBearClr  = input.color(#EF5350, "Bearish Structure Color", group = G_MS)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — RISK MANAGEMENT
+// ═════════════════════════════════════════════════════════════════════════════
+i_swingStr    = input.int(1, "Swing Pivot Strength", minval = 1, maxval = 20, group = G_RISK,
+     tooltip = "Bars either side of a pivot. 1 = every minor swing.")
+i_slStruct    = input.string(SS_SWING, "Stop-Loss Structure", options = [SS_SWING, SS_CHOCH], group = G_RISK,
+     tooltip = SS_SWING + ": nearest qualifying confirmed swing pivot.\n" +
+     SS_CHOCH + ": the swing the last change-of-character came from. Falls back to " + SS_SWING +
+     " when there is no usable CHOCH swing.")
+i_swingSel    = input.string(SW_RECENT, "Swing Selection", options = [SW_RECENT, SW_CLOSE], group = G_RISK,
+     tooltip = SW_RECENT + ": newest qualifying pivot.\n" + SW_CLOSE + ": the qualifying pivot nearest to entry.")
+i_anchor      = input.string(AN_FREEZE, "Swing Anchor Timing", options = [AN_FREEZE, AN_LIVE], group = G_RISK,
+     tooltip = AN_FREEZE + ": structure is captured on the no-wick candle and cannot drift.\n" +
+     AN_LIVE + ": structure is re-read on the bar the order is placed.")
+i_swingSearch = input.int(6, "Closest Swing Search (Confirmed Pivots)", minval = 1, maxval = 50, group = G_RISK)
+i_stopOffset  = input.int(5, "Stop Offset (Ticks)", minval = 0, group = G_RISK)
+i_stopMult    = input.string("1", "Stop Distance (Structure Multiple)",
+     options = ["0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "2.75", "3"], group = G_RISK)
+i_tgtMult     = input.string("1", "Target Distance (Structure Multiple)",
+     options = ["0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "2.75", "3"], group = G_RISK)
+i_bePct       = input.string("75%", "Move Stop Beyond Breakeven At",
+     options = ["Off", "25%", "50%", "75%", "85%", "90%"], group = G_RISK,
+     tooltip = "Percentage of the distance from entry to target that price must travel " +
+     "before the stop jumps beyond breakeven.")
+i_lockTicks   = input.int(1, "Profit Lock Beyond Entry (Ticks)", minval = 0, group = G_RISK)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — ORDERS & POSITION SIZING
+// ═════════════════════════════════════════════════════════════════════════════
+i_sizeMode = input.string(SZ_FIXED, "Position Sizing", options = [SZ_FIXED, SZ_CASH, SZ_PCT], group = G_ORD,
+     tooltip = SZ_FIXED + ": always 'Order Quantity' contracts.\n" +
+     SZ_CASH + ": contracts = risk budget / (stop distance x point value).\n" +
+     SZ_PCT + ": same, with the budget taken from current equity.")
+i_qty      = input.int(1, "Order Quantity (Fixed)", minval = 1, group = G_ORD)
+i_riskCash = input.float(100, "Risk Budget per Trade ($)", minval = 1, step = 5, group = G_ORD)
+i_riskPct  = input.float(0.5, "Risk per Trade (% of Equity)", minval = 0.01, maxval = 100, step = 0.05, group = G_ORD)
+i_minQty   = input.int(1,  "Minimum Contracts", minval = 1, group = G_ORD)
+i_maxQty   = input.int(20, "Maximum Contracts", minval = 1, group = G_ORD)
+i_maxOpen  = input.int(3, "Maximum Concurrent Trades", minval = 1, maxval = 20, group = G_ORD,
+     tooltip = "Only relevant with 'Allow Overlapping Trades' on. Counts resting orders as well as open trades.")
+i_oppMode  = input.string(OPP_SKIP, "Opposite Signal Handling", options = [OPP_SKIP, OPP_REV], group = G_ORD,
+     tooltip = "A Pine strategy holds one net position, so a long and a short cannot coexist. " +
+     "This only bites with 'Allow Overlapping Trades' on - otherwise the one-trade rule already blocks it.")
+i_cancelOnFilter = input.bool(true, "Cancel Resting Orders When Filters Turn", group = G_ORD,
+     tooltip = "ON: a limit order waiting at the level is pulled as soon as the session / day / trend filters " +
+     "stop allowing the trade. OFF: once placed, it waits until it fills or the setup expires.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — AUTOMATION
+// ═════════════════════════════════════════════════════════════════════════════
+i_ghost    = input.bool(true, "Enable Ghost JSON Webhook Alerts", group = G_AUTO,
+     tooltip = "Attaches a JSON payload to every order (readable as {{strategy.order.alert_message}}) " +
+     "and fires alert() on entry, profit lock and exit. Create ONE alert on this strategy with " +
+     "'Any alert() function call', or with 'Order fills only' to use the attached payload.")
+i_alertBE  = input.bool(true, "Send Breakeven / Profit-Lock Alert", group = G_AUTO)
+i_alertEx  = input.bool(true, "Send TP / SL Exit Alerts", group = G_AUTO)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DISPLAY
+// ═════════════════════════════════════════════════════════════════════════════
+i_showRR   = input.bool(true, "Show Risk/Reward Tools", group = G_DISP)
+i_rrWidth  = input.int(5, "R/R Tool Width (Signal Candles)", minval = 1, maxval = 100, group = G_DISP)
+i_toolKeep = input.int(10, "Recent Trade Markers / Tools", minval = 1, maxval = 100, group = G_DISP)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DASHBOARD / PROP RISK / STYLE
+// ═════════════════════════════════════════════════════════════════════════════
+i_showDash = input.bool(true, "Show Performance Dashboard", group = G_DASH)
+i_dashPos  = input.string("top_right", "Dashboard Position",
+     options = ["top_left", "top_center", "top_right", "middle_left", "middle_right",
+                 "bottom_left", "bottom_center", "bottom_right"], group = G_DASH)
+i_dashBg   = input.color(color.new(#1E222D, 10), "Table Background", group = G_DASH)
+i_perfTZ   = input.string("America/New_York", "Performance Timezone", group = G_DASH)
+
+i_propDD   = input.float(1000, "Account Max Drawdown ($)", minval = 0, step = 50, group = G_PROP)
+
+i_bullClr  = input.color(#26A69A, "Bullish Color", group = G_STYLE)
+i_bearClr  = input.color(#EF5350, "Bearish Color", group = G_STYLE)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DERIVED SETTINGS
+// ═════════════════════════════════════════════════════════════════════════════
+stopMult   = nz(str.tonumber(i_stopMult), 1.0)
+tgtMult    = nz(str.tonumber(i_tgtMult),  1.0)
+beEnabled  = i_bePct != "Off"
+bePct      = beEnabled ? nz(str.tonumber(str.replace(i_bePct, "%", "", 0)), 75.0) / 100.0 : na
+rMultiple  = stopMult > 0 ? tgtMult / stopMult : na
+
+// Both level-based entry models rest a limit order at the no-wick level; the two
+// close-based models send a market order that fills at the signal bar's close.
+useLimit   = i_entryModel == EM_TOUCH or i_entryModel == EM_RETEST
+
+sigSec     = timeframe.in_seconds(i_sigTF)
+chartSec   = timeframe.in_seconds(timeframe.period)
+tfMatch    = sigSec == chartSec
+newBar     = barstate.isconfirmed
+
+dashPos = switch i_dashPos
+    "top_left"      => position.top_left
+    "top_center"    => position.top_center
+    "top_right"     => position.top_right
+    "middle_left"   => position.middle_left
+    "middle_right"  => position.middle_right
+    "bottom_left"   => position.bottom_left
+    "bottom_center" => position.bottom_center
+    => position.bottom_right
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═════════════════════════════════════════════════════════════════════════════
+type Setup
+    int   dir      = 0
+    float level    = na
+    float atr0     = na
+    float hi       = na
+    float lo       = na
+    int   bar0     = 0
+    bool  pulled   = false
+    bool  armed    = false
+    int   armedBar = 0
+    bool  cfmd     = false
+    int   cfmdBar  = 0
+    float frozenSw = na
+    float frozenCh = na
+    line  ln       = na
+
+type Trade
+    int    id       = 0
+    string eid      = ""       // strategy.entry id
+    string xid      = ""       // strategy.exit id
+    int    dir      = 0
+    float  entry    = na       // planned entry (limit level, or signal-bar close)
+    float  stop     = na
+    float  initStop = na
+    float  target   = na
+    float  rDist    = na
+    int    qty      = 0
+    int    placedBar = 0
+    int    expireBar = 0
+    bool   resting  = false
+    int    entryBar = 0
+    int    entryTm  = 0
+    int    bucket   = 2
+    bool   locked   = false
+    box    bxTP     = na
+    box    bxSL     = na
+    line   lnE      = na
+    label  lbT      = na
+    label  lbS      = na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CORE SERIES  (all ta.* calls unconditional / global)
+// ═════════════════════════════════════════════════════════════════════════════
+atr        = ta.atr(14)
+smaSFast   = ta.sma(close, i_sFast)
+smaSSlow   = ta.sma(close, i_sSlow)
+smaLFast   = ta.sma(close, i_lFast)
+smaLSlow   = ta.sma(close, i_lSlow)
+rib1       = ta.sma(close, i_ribBase)
+rib2       = ta.sma(close, i_ribBase * 2)
+rib3       = ta.sma(close, i_ribBase * 3)
+rib4       = ta.sma(close, i_ribBase * 4)
+rib5       = ta.sma(close, i_ribBase * 5)
+[stLine, stDir] = ta.supertrend(i_stMult, i_stPeriod)
+lFastRise  = smaLFast > smaLFast[3]
+sFastFall  = smaSFast < smaSFast[3]
+pvtHi      = ta.pivothigh(i_swingStr, i_swingStr)
+pvtLo      = ta.pivotlow(i_swingStr, i_swingStr)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STATE
+// ═════════════════════════════════════════════════════════════════════════════
+var array<float> phPrice = array.new<float>()
+var array<float> plPrice = array.new<float>()
+var float lastPH   = na
+var float lastPL   = na
+var bool  phBroken = true
+var bool  plBroken = true
+var int   structBias = 0                  // 1 bull, -1 bear, 0 undefined
+var float chochLo    = na                 // swing the last bullish CHOCH came from
+var float chochHi    = na                 // swing the last bearish CHOCH came from
+
+var array<Setup> setups  = array.new<Setup>()
+var array<Trade> pending = array.new<Trade>()   // limit orders waiting at the level
+var array<Trade> trades  = array.new<Trade>()   // filled, still open
+
+var array<label> arrowsArr = array.new<label>()
+var array<label> diagArr   = array.new<label>()
+var array<label> msArr     = array.new<label>()
+var array<box>   toolArr   = array.new<box>()
+var array<line>  toolLnArr = array.new<line>()
+var array<label> toolLbArr = array.new<label>()
+var array<label> markArr   = array.new<label>()
+
+// statistics
+var int   nSetups    = 0
+var int   nOrders    = 0
+var int   nEntries   = 0
+var int   nCancelled = 0
+var int   nExpired   = 0
+var int   nBadStop   = 0
+var int   nWin       = 0
+var int   nLock      = 0
+var int   nLoss      = 0
+var int   nManual    = 0
+var float grossWinR  = 0.0
+var float grossLosR  = 0.0
+var float netR       = 0.0
+var float commR      = 0.0
+var float eqPeakR    = 0.0
+var float maxDDR     = 0.0
+var float cashSum    = 0.0
+var float cashPeak   = 0.0
+var float cashDD     = 0.0
+var int   lossStreak = 0
+var int   worstLoss  = 0
+var int   activeDays = 0
+var int   lastDayId  = 0
+var int   tradeSeq   = 0
+var int   doneClosed = 0                  // strategy.closedtrades already scored
+
+var int   nLongW    = 0
+var int   nLongLk   = 0
+var int   nLongL    = 0
+var float longNetR  = 0.0
+var int   nShrtW    = 0
+var int   nShrtLk   = 0
+var int   nShrtL    = 0
+var float shortNetR = 0.0
+var int   nAM    = 0
+var float amNetR = 0.0
+var int   nPM    = 0
+var float pmNetR = 0.0
+var int   nON    = 0
+var float onNetR = 0.0
+
+var string lastReject = "—"
+var int    firstTm    = na
+var int    lastTm     = na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPERS  (pure, top-level)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// pick a structural swing beyond the reference price, honouring Swing Selection
+f_pickSwing(bool isLong, float ref) =>
+    float best = na
+    cnt = isLong ? plPrice.size() : phPrice.size()
+    n   = math.min(i_swingSearch, cnt)
+    if n > 0
+        for k = 0 to n - 1
+            idx = cnt - 1 - k
+            float p = na
+            if isLong
+                p := plPrice.get(idx)
+            else
+                p := phPrice.get(idx)
+            ok = isLong ? p < ref - syminfo.mintick : p > ref + syminfo.mintick
+            if ok
+                if na(best)
+                    best := p
+                else if i_swingSel == SW_CLOSE
+                    best := isLong ? math.max(best, p) : math.min(best, p)
+    best
+
+// minutes since midnight in the session-filter timezone
+f_mod(int t) =>
+    hour(t, i_sessTZ) * 60 + minute(t, i_sessTZ)
+
+// day filter
+f_dayOK(int t) =>
+    dow = dayofweek(t, i_sessTZ)
+    switch dow
+        dayofweek.monday    => i_mon
+        dayofweek.tuesday   => i_tue
+        dayofweek.wednesday => i_wed
+        dayofweek.thursday  => i_thu
+        dayofweek.friday    => i_fri
+        dayofweek.sunday    => i_sun
+        => false
+
+// session filter -> [blocked, reason]
+f_sessBlocked(int dir, int t) =>
+    m = f_mod(t)
+    bool blocked = false
+    string why = ""
+    if i_blkNYOpen and m >= 570 and m < 600
+        blocked := true
+        why := "NY open block (9:30-10:00)"
+    else if i_blkNYLate and m >= 840 and m < 960
+        blocked := true
+        why := "Late NY block (2-4 PM)"
+    else if i_blkAsia and m >= 1080 and m < 1200
+        blocked := true
+        why := "Early Asia block (6-8 PM)"
+    else if i_blkNYPMS and dir == -1 and m >= 720 and m < 960
+        blocked := true
+        why := "NY PM short block (12-4 PM)"
+    [blocked, why]
+
+// trend filters applied when the order is placed (the MA location filter runs at
+// setup creation)
+f_trendOK(int dir, float px) =>
+    bool ok = true
+    string why = ""
+    isLong = dir == 1
+    if i_useRibbon
+        ribHi = math.max(math.max(math.max(math.max(rib1, rib2), rib3), rib4), rib5)
+        ribLo = math.min(math.min(math.min(math.min(rib1, rib2), rib3), rib4), rib5)
+        ribOK = isLong ? px > ribHi : px < ribLo
+        if not ribOK
+            ok := false
+            why := "Entry inside the MA ribbon"
+    if ok and i_useMADir
+        fastMA = isLong ? smaLFast : smaSFast
+        dirOK  = isLong ? lFastRise : sFastFall
+        sepOK  = math.abs(px - fastMA) >= i_maSep * atr and (isLong ? px > fastMA : px < fastMA)
+        if not dirOK
+            ok := false
+            why := "Fast MA slope against trade"
+        else if not sepOK
+            ok := false
+            why := "Entry too close to MA"
+    if ok and i_useST
+        stOK = isLong ? stDir == -1 : stDir == 1
+        if not stOK
+            ok := false
+            why := "Supertrend against trade"
+    [ok, why]
+
+// entry confirmations -> [ok, reason]
+f_confirmOK(int dir, float level) =>
+    bool ok = true
+    string why = ""
+    isLong = dir == 1
+    if i_cfBack
+        c = isLong ? close > level : close < level
+        if not c
+            ok := false
+            why := "No close back through level"
+    if ok and i_cfCandle
+        c = isLong ? close > open : close < open
+        if not c
+            ok := false
+            why := "No confirmation candle"
+    if ok and i_cfPrev
+        c = isLong ? close > high[1] : close < low[1]
+        if not c
+            ok := false
+            why := "No close beyond previous candle"
+    if ok and i_cfChoch
+        c = isLong ? structBias == 1 : structBias == -1
+        if not c
+            ok := false
+            why := "CHOCH bias mismatch"
+    [ok, why]
+
+// contracts for a given structural stop distance
+f_qty(float stopDist) =>
+    int q = i_qty
+    if i_sizeMode != SZ_FIXED
+        budget  = i_sizeMode == SZ_CASH ? i_riskCash : strategy.equity * i_riskPct / 100.0
+        perUnit = stopDist * syminfo.pointvalue
+        q := perUnit > 0 ? int(math.floor(budget / perUnit)) : 0
+        if q > 0
+            q := math.max(q, i_minQty)
+        q := math.min(q, i_maxQty)
+    q
+
+// FIFO drawing pools ---------------------------------------------------------
+f_trimLabels(array<label> a, int keep) =>
+    while a.size() > keep
+        label.delete(a.shift())
+    a.size()
+
+f_trimLines(array<line> a, int keep) =>
+    while a.size() > keep
+        line.delete(a.shift())
+    a.size()
+
+f_trimBoxes(array<box> a, int keep) =>
+    while a.size() > keep
+        box.delete(a.shift())
+    a.size()
+
+// Ghost JSON payload ---------------------------------------------------------
+f_json(string action, string side, int qty, float px, float sl, float tp, int id, string note) =>
+    '{"ticker":"' + syminfo.ticker + '","exchange":"' + syminfo.prefix +
+     '","strategy":"NO_WICK_RETEST","action":"' + action +
+     '","side":"' + side +
+     '","quantity":' + str.tostring(qty) +
+     ',"price":' + (na(px) ? "null" : str.tostring(px, format.mintick)) +
+     ',"stop":' + (na(sl) ? "null" : str.tostring(sl, format.mintick)) +
+     ',"target":' + (na(tp) ? "null" : str.tostring(tp, format.mintick)) +
+     ',"tradeId":"NWR-' + str.tostring(id) +
+     '","timeframe":"' + timeframe.period +
+     '","note":"' + note +
+     '","time":"' + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", "UTC") + '"}'
+
+// R/R tool for a filled trade (arrays are references, so this can be a function)
+f_drawTools(Trade t) =>
+    if i_showRR
+        isLong = t.dir == 1
+        clr    = isLong ? i_bullClr : i_bearClr
+        rEnd   = t.entryBar + i_rrWidth
+        t.bxTP := box.new(t.entryBar, math.max(t.entry, t.target), rEnd,
+             math.min(t.entry, t.target), border_color = color.new(i_bullClr, 45),
+             bgcolor = color.new(i_bullClr, 80))
+        t.bxSL := box.new(t.entryBar, math.max(t.entry, t.stop), rEnd,
+             math.min(t.entry, t.stop), border_color = color.new(i_bearClr, 45),
+             bgcolor = color.new(i_bearClr, 80))
+        t.lnE := line.new(t.entryBar, t.entry, rEnd, t.entry,
+             color = color.new(color.white, 15), style = line.style_dashed, width = 1)
+        t.lbT := label.new(rEnd, t.target, "TP " + str.tostring(t.target, format.mintick),
+             style = label.style_label_left, color = color.new(i_bullClr, 15),
+             textcolor = color.white, size = size.tiny)
+        t.lbS := label.new(rEnd, t.stop, "SL " + str.tostring(t.stop, format.mintick),
+             style = label.style_label_left, color = color.new(i_bearClr, 15),
+             textcolor = color.white, size = size.tiny)
+        toolArr.push(t.bxTP)
+        toolArr.push(t.bxSL)
+        toolLnArr.push(t.lnE)
+        toolLbArr.push(t.lbT)
+        toolLbArr.push(t.lbS)
+        f_trimBoxes(toolArr, i_toolKeep * 2)
+        f_trimLines(toolLnArr, i_toolKeep)
+        f_trimLabels(toolLbArr, i_toolKeep * 2)
+        markArr.push(label.new(t.entryBar, na, isLong ? "▲" : "▼",
+             yloc = isLong ? yloc.belowbar : yloc.abovebar,
+             style = label.style_none, textcolor = clr, size = size.small))
+        f_trimLabels(markArr, i_toolKeep)
+    t.id
+
+// find a registry slot by entry-order id (-1 when absent)
+f_findTrade(array<Trade> a, string eid) =>
+    int idx = -1
+    if a.size() > 0
+        for j = 0 to a.size() - 1
+            if idx == -1 and a.get(j).eid == eid
+                idx := j
+    idx
+
+// index of the open trade carrying this entry id (-1 when absent)
+f_findOpen(string eid) =>
+    int idx = -1
+    if strategy.opentrades > 0
+        for k = 0 to strategy.opentrades - 1
+            if idx == -1 and strategy.opentrades.entry_id(k) == eid
+                idx := k
+    idx
+
+// is any registered order / position pointing the other way?
+f_opposite(int dir) =>
+    bool opp = false
+    if trades.size() > 0
+        for j = 0 to trades.size() - 1
+            if trades.get(j).dir != dir
+                opp := true
+    if pending.size() > 0
+        for j = 0 to pending.size() - 1
+            if pending.get(j).dir != dir
+                opp := true
+    opp
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE  (pivot book + BOS / CHOCH)
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar
+    if not na(pvtHi)
+        lastPH   := pvtHi
+        phBroken := false
+        phPrice.push(pvtHi)
+        if phPrice.size() > 60
+            phPrice.shift()
+    if not na(pvtLo)
+        lastPL   := pvtLo
+        plBroken := false
+        plPrice.push(pvtLo)
+        if plPrice.size() > 60
+            plPrice.shift()
+
+    if not na(lastPH) and not phBroken and close > lastPH
+        phBroken := true
+        isChoch = structBias == -1
+        structBias := 1
+        if isChoch
+            chochLo := lastPL
+        if i_showStruct and ((isChoch and i_showCHOCH) or (not isChoch and i_showBOS))
+            msArr.push(label.new(bar_index, high, isChoch ? "CHoCH" : "BOS",
+                 style = label.style_label_down, color = color.new(i_msBullClr, 20),
+                 textcolor = color.white, size = i_msSize))
+            f_trimLabels(msArr, i_msKeep)
+
+    if not na(lastPL) and not plBroken and close < lastPL
+        plBroken := true
+        isChochDn = structBias == 1
+        structBias := -1
+        if isChochDn
+            chochHi := lastPH
+        if i_showStruct and ((isChochDn and i_showCHOCH) or (not isChochDn and i_showBOS))
+            msArr.push(label.new(bar_index, low, isChochDn ? "CHoCH" : "BOS",
+                 style = label.style_label_up, color = color.new(i_msBearClr, 20),
+                 textcolor = color.white, size = i_msSize))
+            f_trimLabels(msArr, i_msKeep)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. SCORE CLOSED TRADES
+//
+// The broker emulator owns the fills, so the statistics are read back out of
+// strategy.closedtrades rather than simulated. Every closed trade is matched to
+// its registry record by entry-order id, which is unique per signal.
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and strategy.closedtrades > doneClosed
+    for n = doneClosed to strategy.closedtrades - 1
+        string ceid = strategy.closedtrades.entry_id(n)
+        int    oi   = f_findTrade(trades, ceid)
+        int    pi   = oi == -1 ? f_findTrade(pending, ceid) : -1
+        if oi >= 0 or pi >= 0
+            Trade t = na
+            if oi >= 0
+                t := trades.get(oi)
+            else
+                t := pending.get(pi)
+
+            eP = strategy.closedtrades.entry_price(n)
+            xP = strategy.closedtrades.exit_price(n)
+            sz = strategy.closedtrades.size(n)
+            cm = strategy.closedtrades.commission(n)
+            qc = math.abs(sz)
+
+            // a trade that filled and closed inside the same bar never appears
+            // in strategy.opentrades, so finish registering it here
+            if pi >= 0
+                t.entry    := eP
+                t.entryBar := strategy.closedtrades.entry_bar_index(n)
+                t.qty      := int(qc)
+                t.resting  := false
+                nEntries   := nEntries + 1
+                dayId0 = year(t.entryTm, i_perfTZ) * 10000 + month(t.entryTm, i_perfTZ) * 100 +
+                     dayofmonth(t.entryTm, i_perfTZ)
+                if dayId0 != lastDayId
+                    lastDayId  := dayId0
+                    activeDays := activeDays + 1
+                f_drawTools(t)
+                pending.remove(pi)
+
+            cash1R = t.rDist * syminfo.pointvalue * qc
+            grossR = t.rDist > 0 ? t.dir * (xP - eP) / t.rDist : 0.0
+            cR     = cash1R > 0 ? cm / cash1R : 0.0
+            tradeR = grossR - cR
+            cashPL = (xP - eP) * sz * syminfo.pointvalue - cm
+
+            // TP / LOCK / SL only mean anything when our own bracket did the
+            // exiting; anything else (a reversal, a manual flat) is booked apart
+            isBracket = strategy.closedtrades.exit_id(n) == t.xid
+            tpHit     = t.dir * (xP - t.target) >= -syminfo.mintick * 0.5
+            string exitType = not isBracket ? "MAN" : tpHit ? "TP" : t.locked ? "LOCK" : "SL"
+
+            commR    := commR + cR
+            netR     := netR + tradeR
+            cashSum  := cashSum + cashPL
+            cashPeak := math.max(cashPeak, cashSum)
+            cashDD   := math.max(cashDD, cashPeak - cashSum)
+            if grossR > 0
+                grossWinR := grossWinR + grossR
+            else
+                grossLosR := grossLosR - grossR
+            eqPeakR := math.max(eqPeakR, netR)
+            maxDDR  := math.max(maxDDR, eqPeakR - netR)
+
+            if exitType == "TP"
+                nWin := nWin + 1
+                lossStreak := 0
+            else if exitType == "LOCK"
+                nLock := nLock + 1
+                lossStreak := 0
+            else if exitType == "SL"
+                nLoss := nLoss + 1
+                lossStreak := lossStreak + 1
+                worstLoss := math.max(worstLoss, lossStreak)
+            else
+                nManual := nManual + 1
+                if tradeR <= 0
+                    lossStreak := lossStreak + 1
+                    worstLoss := math.max(worstLoss, lossStreak)
+                else
+                    lossStreak := 0
+
+            if t.dir == 1
+                longNetR := longNetR + tradeR
+                nLongW   := nLongW  + (exitType == "TP"   ? 1 : 0)
+                nLongLk  := nLongLk + (exitType == "LOCK" ? 1 : 0)
+                nLongL   := nLongL  + (exitType == "SL"   ? 1 : 0)
+            else
+                shortNetR := shortNetR + tradeR
+                nShrtW    := nShrtW  + (exitType == "TP"   ? 1 : 0)
+                nShrtLk   := nShrtLk + (exitType == "LOCK" ? 1 : 0)
+                nShrtL    := nShrtL  + (exitType == "SL"   ? 1 : 0)
+
+            if t.bucket == 0
+                nAM    := nAM + 1
+                amNetR := amNetR + tradeR
+            else if t.bucket == 1
+                nPM    := nPM + 1
+                pmNetR := pmNetR + tradeR
+            else
+                nON    := nON + 1
+                onNetR := onNetR + tradeR
+
+            if i_ghost and i_alertEx
+                alert(f_json("exit", t.dir == 1 ? "long" : "short", t.qty, xP, na, na, t.id,
+                     exitType == "TP" ? "target hit" : exitType == "LOCK" ? "profit lock hit" :
+                     exitType == "SL" ? "stop hit" : "position closed"),
+                     alert.freq_once_per_bar_close)
+
+            if oi >= 0
+                trades.remove(oi)
+    doneClosed := strategy.closedtrades
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. REGISTER FILLS
+//
+// A resting order becomes a trade the moment the emulator reports it open. The
+// bracket was already sitting on the planned price; it is re-issued here against
+// the price the fill actually happened at, so slippage and gaps do not distort
+// the stop distance.
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and pending.size() > 0
+    for i = pending.size() - 1 to 0
+        p  = pending.get(i)
+        oi = f_findOpen(p.eid)
+        if oi >= 0
+            fillPx  = strategy.opentrades.entry_price(oi)
+            fillBar = strategy.opentrades.entry_bar_index(oi)
+            back    = math.max(0, math.min(bar_index - fillBar, 500))
+            fillTm  = time[back]
+            m       = f_mod(fillTm)
+
+            p.entry    := fillPx
+            p.entryBar := fillBar
+            p.entryTm  := fillTm
+            p.qty      := int(math.abs(strategy.opentrades.size(oi)))
+            p.resting  := false
+            p.bucket   := m >= 570 and m < 720 ? 0 : m >= 720 and m < 960 ? 1 : 2
+            p.stop     := fillPx - p.dir * p.rDist
+            p.initStop := p.stop
+            p.target   := fillPx + p.dir * p.rDist * rMultiple
+            strategy.exit(p.xid, p.eid, stop = p.stop, limit = p.target,
+                 comment_profit = "TP", comment_loss = "SL",
+                 alert_message = i_ghost ? f_json("exit", p.dir == 1 ? "long" : "short", p.qty,
+                 na, p.stop, p.target, p.id, "bracket") : "")
+
+            nEntries := nEntries + 1
+            dayId = year(fillTm, i_perfTZ) * 10000 + month(fillTm, i_perfTZ) * 100 + dayofmonth(fillTm, i_perfTZ)
+            if dayId != lastDayId
+                lastDayId  := dayId
+                activeDays := activeDays + 1
+
+            f_drawTools(p)
+            if i_ghost
+                alert(f_json("entry", p.dir == 1 ? "long" : "short", p.qty, fillPx, p.stop, p.target,
+                     p.id, "no-wick retest"), alert.freq_once_per_bar_close)
+
+            trades.push(p)
+            pending.remove(i)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. CANCEL RESTING ORDERS  (setup expiry, or the filters turning against them)
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and pending.size() > 0
+    for i = pending.size() - 1 to 0
+        p = pending.get(i)
+        if p.resting
+            expired = bar_index >= p.expireBar
+            bool filterOut = false
+            if i_cancelOnFilter and not expired
+                [blk, _bw]  = f_sessBlocked(p.dir, time)
+                [trOK, _tw] = f_trendOK(p.dir, p.entry)
+                filterOut := blk or not trOK or not f_dayOK(time)
+            if expired or filterOut
+                strategy.cancel(p.eid)
+                strategy.cancel(p.xid)
+                nCancelled := nCancelled + 1
+                lastReject := expired ? "Resting order expired" : "Resting order pulled by filter"
+                if i_showExpired
+                    diagArr.push(label.new(bar_index, p.dir == 1 ? low : high,
+                         expired ? "ORDER EXPIRED" : "ORDER PULLED",
+                         style = p.dir == 1 ? label.style_label_up : label.style_label_down,
+                         color = color.new(color.orange, 40), textcolor = color.white, size = size.tiny))
+                    f_trimLabels(diagArr, i_diagKeep)
+                pending.remove(i)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. MANAGE OPEN TRADES  (R/R tool, breakeven / profit lock)
+//
+// The emulator has already processed this bar's fills by the time the script
+// runs, so testing the lock trigger here keeps the indicator's ordering: a bar
+// that reaches both the stop and the lock trigger is a stop-out.
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and trades.size() > 0
+    for i = trades.size() - 1 to 0
+        t = trades.get(i)
+        if i_showRR and not na(t.bxTP)
+            rEnd = math.max(bar_index, t.entryBar + i_rrWidth)
+            box.set_right(t.bxTP, rEnd)
+            box.set_right(t.bxSL, rEnd)
+            line.set_x2(t.lnE, rEnd)
+            label.set_x(t.lbT, rEnd)
+            label.set_x(t.lbS, rEnd)
+        if t.entryBar != bar_index and beEnabled and not t.locked
+            trig = t.entry + t.dir * bePct * math.abs(t.target - t.entry)
+            hit  = t.dir == 1 ? high >= trig : low <= trig
+            if hit
+                t.locked := true
+                t.stop   := t.entry + t.dir * i_lockTicks * syminfo.mintick
+                strategy.exit(t.xid, t.eid, stop = t.stop, limit = t.target,
+                     comment_profit = "TP", comment_loss = "LOCK",
+                     alert_message = i_ghost ? f_json("modify", t.dir == 1 ? "long" : "short", t.qty,
+                     t.entry, t.stop, t.target, t.id, "profit lock") : "")
+                if i_showRR and not na(t.lbS)
+                    label.set_text(t.lbS, "SL/BE " + str.tostring(t.stop, format.mintick))
+                    label.set_y(t.lbS, t.stop)
+                if i_ghost and i_alertBE
+                    alert(f_json("modify", t.dir == 1 ? "long" : "short", t.qty, t.entry, t.stop,
+                         t.target, t.id, "profit lock"), alert.freq_once_per_bar_close)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. SETUP LIFECYCLE  (pull-away -> retest / arm -> confirmations -> ORDER)
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and tfMatch and setups.size() > 0
+    for i = setups.size() - 1 to 0
+        s      = setups.get(i)
+        bool   dropIt = false
+        age    = bar_index - s.bar0
+        isLong = s.dir == 1
+
+        if i_showLevels and not na(s.ln)
+            line.set_x2(s.ln, bar_index + 1)
+
+        if age >= 1
+            // ── pull-away ────────────────────────────────────────────────────
+            if not s.pulled
+                away = isLong ? high - s.level : s.level - low
+                if away >= i_pullAway * s.atr0
+                    s.pulled := true
+
+            // ── retest / arming ─────────────────────────────────────────────
+            // EM_TOUCH does not need this: its limit order IS the retest.
+            if s.pulled and not s.armed and i_entryModel != EM_TOUCH
+                touched = isLong ? low <= s.level : high >= s.level
+                if touched
+                    s.armed    := true
+                    s.armedBar := bar_index
+                    if i_showArmed and i_entryModel != EM_RETEST
+                        diagArr.push(label.new(bar_index, isLong ? low : high, "ARMED",
+                             style = isLong ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny))
+                        f_trimLabels(diagArr, i_diagKeep)
+
+            // ── order evaluation ────────────────────────────────────────────
+            if s.pulled
+                rng     = high - low
+                wickLen = isLong ? math.min(open, close) - low : high - math.max(open, close)
+                intoLvl = isLong ? low <= s.level : high >= s.level
+                backOut = isLong ? close > s.level : close < s.level
+                rejOK   = rng > 0 and intoLvl and backOut and wickLen >= 0.5 * rng
+
+                bool   trigger = false
+                float  entryPx = na
+                string rej     = ""
+
+                if i_entryModel == EM_TOUCH
+                    // a limit rests at the level from here on; the emulator
+                    // fills it intrabar the moment price trades back
+                    trigger := true
+                    entryPx := s.level
+                else if s.armed
+                    [confOK, confWhy] = f_confirmOK(s.dir, s.level)
+                    if i_entryModel == EM_CONF
+                        if confOK
+                            trigger := true
+                            entryPx := close
+                        else
+                            rej := confWhy
+                    else if i_entryModel == EM_REJECT
+                        if rejOK and confOK
+                            trigger := true
+                            entryPx := close
+                        else
+                            rej := rejOK ? confWhy : "No rejection candle at level"
+                    else
+                        // EM_RETEST: the confirmation only arms a limit at the level
+                        if not s.cfmd
+                            if confOK
+                                s.cfmd    := true
+                                s.cfmdBar := bar_index
+                                if i_showArmed
+                                    diagArr.push(label.new(bar_index, isLong ? low : high, "ARMED",
+                                         style = isLong ? label.style_label_up : label.style_label_down,
+                                         color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny))
+                                    f_trimLabels(diagArr, i_diagKeep)
+                            else
+                                rej := confWhy
+                        if s.cfmd
+                            trigger := true
+                            entryPx := s.level
+
+                if trigger
+                    [blocked, blockWhy] = f_sessBlocked(s.dir, time)
+                    [trOK, trWhy]       = f_trendOK(s.dir, entryPx)
+                    dayOK    = f_dayOK(time)
+                    slots    = pending.size() + trades.size()
+                    freeSlot = i_overlap ? slots < i_maxOpen : slots == 0
+                    oppOpen  = f_opposite(s.dir)
+
+                    // structural stop
+                    live    = f_pickSwing(isLong, entryPx)
+                    liveCh  = isLong ? chochLo : chochHi
+                    frozen  = i_slStruct == SS_CHOCH ? s.frozenCh : s.frozenSw
+                    float structPx = i_anchor == AN_FREEZE ? frozen : i_slStruct == SS_CHOCH ? liveCh : live
+                    // fall back: CHOCH -> live CHOCH -> nearest swing
+                    if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        structPx := i_slStruct == SS_CHOCH ? liveCh : live
+                    if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        structPx := live
+
+                    rawDist  = na(structPx) ? na : math.abs(entryPx - structPx) + i_stopOffset * syminfo.mintick
+                    stopDist = na(rawDist) ? na : rawDist * stopMult
+                    tgtDist  = na(rawDist) ? na : rawDist * tgtMult
+                    structOK = not na(structPx) and (isLong ? structPx < entryPx : structPx > entryPx)
+                    stopOK   = structOK and not na(stopDist) and stopDist > 0
+                    oqty     = stopOK ? f_qty(stopDist) : 0
+
+                    if not dayOK
+                        rej := "Day filter"
+                    else if blocked
+                        rej := blockWhy
+                    else if not trOK
+                        rej := trWhy
+                    else if not freeSlot
+                        rej := i_overlap ? "Concurrent trade cap" : "Trade already open"
+                    else if oppOpen and i_oppMode == OPP_SKIP
+                        rej := "Opposite position open"
+                    else if not stopOK
+                        rej := "No valid structure for stop"
+                        nBadStop := nBadStop + 1
+                        dropIt   := true
+                    else if oqty <= 0
+                        rej := "Position size rounds to zero"
+                        dropIt   := true
+
+                    if rej == ""
+                        // ── ORDER ───────────────────────────────────────────
+                        if oppOpen and i_oppMode == OPP_REV
+                            if pending.size() > 0
+                                for k = pending.size() - 1 to 0
+                                    pk = pending.get(k)
+                                    strategy.cancel(pk.eid)
+                                    strategy.cancel(pk.xid)
+                                    pending.remove(k)
+                            strategy.close_all(comment = "REVERSE")
+
+                        stopPx = entryPx - s.dir * stopDist
+                        tgtPx  = entryPx + s.dir * tgtDist
+                        m      = f_mod(time)
+
+                        tradeSeq := tradeSeq + 1
+                        string eid = "NWR" + str.tostring(tradeSeq)
+                        string xid = "X"   + str.tostring(tradeSeq)
+                        bool  isLimit = useLimit
+                        string side = isLong ? "long" : "short"
+
+                        strategy.entry(eid, isLong ? strategy.long : strategy.short, qty = oqty,
+                             limit = isLimit ? entryPx : na,
+                             comment = (isLong ? "L" : "S") + str.tostring(tradeSeq),
+                             alert_message = i_ghost ? f_json("entry", side, oqty, entryPx, stopPx,
+                             tgtPx, tradeSeq, isLimit ? "no-wick limit at level" : "no-wick retest") : "")
+                        strategy.exit(xid, eid, stop = stopPx, limit = tgtPx,
+                             comment_profit = "TP", comment_loss = "SL",
+                             alert_message = i_ghost ? f_json("exit", side, oqty, na, stopPx, tgtPx,
+                             tradeSeq, "bracket") : "")
+
+                        tr = Trade.new(id = tradeSeq, eid = eid, xid = xid, dir = s.dir,
+                             entry = entryPx, stop = stopPx, initStop = stopPx, target = tgtPx,
+                             rDist = stopDist, qty = oqty, placedBar = bar_index,
+                             expireBar = s.bar0 + i_maxCandles, resting = isLimit,
+                             entryBar = bar_index, entryTm = time,
+                             bucket = m >= 570 and m < 720 ? 0 : m >= 720 and m < 960 ? 1 : 2)
+                        pending.push(tr)
+                        nOrders := nOrders + 1
+                        dropIt  := true
+
+                if rej != ""
+                    lastReject := rej
+                    if i_showRejects
+                        diagArr.push(label.new(bar_index, isLong ? low : high, rej,
+                             style = isLong ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny))
+                        f_trimLabels(diagArr, i_diagKeep)
+
+        // ── expiry ─────────────────────────────────────────────────────────
+        if not dropIt and age >= i_maxCandles
+            dropIt     := true
+            nExpired   := nExpired + 1
+            lastReject := "Expired after " + str.tostring(i_maxCandles) + " candles"
+            if i_showExpired
+                diagArr.push(label.new(bar_index, isLong ? low : high,
+                     "EXPIRED " + str.tostring(i_maxCandles),
+                     style = isLong ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.orange, 40), textcolor = color.white, size = size.tiny))
+                f_trimLabels(diagArr, i_diagKeep)
+
+        if dropIt
+            if not na(s.ln)
+                line.delete(s.ln)
+            setups.remove(i)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. NO-WICK CANDLE DETECTION  (runs after the lifecycle: a level cannot be
+// retested by its own candle)
+// ═════════════════════════════════════════════════════════════════════════════
+tol         = syminfo.mintick * 0.5
+noLowerWick = (open - low)  < tol
+noUpperWick = (high - open) < tol
+bullBody    = close > open
+bearBody    = close < open
+// "No-Wick MA Location Filter" gates the LEVEL, so it is applied here, when the
+// level is created - not at entry. A level on the wrong side of its direction's
+// slow SMA never becomes a setup at all.
+locOKLong   = not i_useMALoc or low  > smaLSlow
+locOKShort  = not i_useMALoc or high < smaSSlow
+mkLong      = i_longOn  and noLowerWick and (i_dirNoWick ? bullBody : true) and high > low and locOKLong
+mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and high > low and locOKShort
+
+if newBar and tfMatch
+    if mkLong
+        st = Setup.new(dir = 1, level = low, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
+             frozenSw = f_pickSwing(true, low), frozenCh = chochLo)
+        if i_showLevels
+            st.ln := line.new(bar_index, low, bar_index + 1, low, color = color.new(i_bullClr, 25),
+                 style = line.style_dotted, width = 1)
+        setups.push(st)
+        nSetups := nSetups + 1
+        if i_showArrows
+            arrowsArr.push(label.new(bar_index, na, "", yloc = yloc.belowbar,
+                 style = label.style_arrowup, color = i_bullClr, size = i_arrowSize))
+            f_trimLabels(arrowsArr, i_arrowKeep)
+    if mkShort
+        st = Setup.new(dir = -1, level = high, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
+             frozenSw = f_pickSwing(false, high), frozenCh = chochHi)
+        if i_showLevels
+            st.ln := line.new(bar_index, high, bar_index + 1, high, color = color.new(i_bearClr, 25),
+                 style = line.style_dotted, width = 1)
+        setups.push(st)
+        nSetups := nSetups + 1
+        if i_showArrows
+            arrowsArr.push(label.new(bar_index, na, "", yloc = yloc.abovebar,
+                 style = label.style_arrowdown, color = i_bearClr, size = i_arrowSize))
+            f_trimLabels(arrowsArr, i_arrowKeep)
+
+    firstTm := na(firstTm) ? time : firstTm
+    lastTm  := time
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═════════════════════════════════════════════════════════════════════════════
+plot(i_showRib ? rib1 : na, "Ribbon 1", color = color.new(#42A5F5, 30))
+plot(i_showRib ? rib2 : na, "Ribbon 2", color = color.new(#42A5F5, 45))
+plot(i_showRib ? rib3 : na, "Ribbon 3", color = color.new(#42A5F5, 60))
+plot(i_showRib ? rib4 : na, "Ribbon 4", color = color.new(#42A5F5, 70))
+plot(i_showRib ? rib5 : na, "Ribbon 5", color = color.new(#42A5F5, 80))
+plot(i_showST  ? stLine : na, "Supertrend",
+     color = stDir == -1 ? i_bullClr : i_bearClr, style = plot.style_linebr, linewidth = 2)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+//
+// The R-denominated rows are the indicator's, so the two scripts can be read
+// side by side. The $ rows come straight out of the Strategy Tester's own
+// accounting, which is what the position sizing above actually produced.
+// ═════════════════════════════════════════════════════════════════════════════
+f_row(table tb, int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color = color.new(color.silver, 0), text_size = size.small,
+         text_halign = text.align_left, bgcolor = i_dashBg)
+    table.cell(tb, 1, r, v, text_color = vc, text_size = size.small,
+         text_halign = text.align_right, bgcolor = i_dashBg)
+
+bracketN  = nWin + nLock + nLoss
+tpRate    = bracketN > 0 ? nWin / bracketN * 100.0 : 0.0
+posRate   = bracketN > 0 ? (nWin + nLock) / bracketN * 100.0 : 0.0
+pf        = grossLosR > 0 ? grossWinR / grossLosR : na
+grossNet  = grossWinR - grossLosR
+netAfter  = netR
+propUsed  = i_propDD > 0 ? cashDD / i_propDD * 100.0 : na
+cushion   = i_propDD - cashDD
+maxPerR   = maxDDR > 0 ? i_propDD / maxDDR : na
+entPerDay = activeDays > 0 ? nEntries / activeDays : 0.0
+calDays   = na(firstTm) or na(lastTm) ? 0 : math.round((lastTm - firstTm) / 86400000.0)
+stratPF   = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+
+[blkLong, whyLong]   = f_sessBlocked(1, time)
+[blkShort, whyShort] = f_sessBlocked(-1, time)
+
+tfTxt = sigSec < 3600 ? str.tostring(sigSec / 60, "0") + "m" :
+     sigSec < 86400 ? str.tostring(sigSec / 3600, "0") + "h" : str.tostring(sigSec / 86400, "0") + "D"
+
+statusTxt = not tfMatch ? "Chart TF ≠ " + tfTxt :
+     trades.size() > 0 ? "In Trade" :
+     pending.size() > 0 ? "Order Resting" :
+     not f_dayOK(time) ? "Day Filter" :
+     blkLong and blkShort ? "Session Block" : "Active"
+statusClr = statusTxt == "Active" ? i_bullClr :
+     statusTxt == "In Trade" or statusTxt == "Order Resting" ? color.new(#42A5F5, 0) : color.orange
+
+cUp   = i_bullClr
+cDn   = i_bearClr
+cWarn = color.orange
+cNeu  = color.new(color.white, 0)
+
+var table dash = table.new(dashPos, 2, 31, border_width = 1, border_color = color.new(color.black, 60))
+
+if barstate.islast and i_showDash
+    table.cell(dash, 0, 0, "NO WICK RETEST — STRATEGY", text_color = color.white, text_size = size.small,
+         text_halign = text.align_left, bgcolor = color.new(color.black, 30))
+    table.cell(dash, 1, 0, tfTxt + " | " + str.tostring(rMultiple, "0.##") + "R",
+         text_color = color.white, text_size = size.small, text_halign = text.align_right,
+         bgcolor = color.new(color.black, 30))
+
+    f_row(dash, 1,  "Status", statusTxt, statusClr)
+    f_row(dash, 2,  "No-Wick Setups",     str.tostring(nSetups),  cNeu)
+    f_row(dash, 3,  "Orders Placed / Filled",
+         str.tostring(nOrders) + " / " + str.tostring(nEntries), cNeu)
+    f_row(dash, 4,  "Expired / Cancelled / Bad Stop",
+         str.tostring(nExpired) + " / " + str.tostring(nCancelled) + " / " + str.tostring(nBadStop),
+         nBadStop > 0 ? cWarn : cNeu)
+    f_row(dash, 5,  "Open / Resting",
+         str.tostring(trades.size()) + " / " + str.tostring(pending.size()),
+         trades.size() > 0 or pending.size() > 0 ? cWarn : cNeu)
+    f_row(dash, 6,  "Wins / Locked / Losses",
+         str.tostring(nWin) + " / " + str.tostring(nLock) + " / " + str.tostring(nLoss), cNeu)
+    f_row(dash, 7,  "Reversal / Manual Exits", str.tostring(nManual), nManual > 0 ? cWarn : cNeu)
+    f_row(dash, 8,  "TP Win Rate", str.tostring(tpRate, "0.00") + "%", tpRate >= 50 ? cUp : cDn)
+    f_row(dash, 9,  "Positive Exit Rate", str.tostring(posRate, "0.00") + "%", posRate >= 50 ? cUp : cDn)
+    f_row(dash, 10, "Profit Factor (R, Gross)",
+         na(pf) ? "—" : str.tostring(pf, "0.00"), na(pf) ? cNeu : pf >= 1 ? cUp : cDn)
+    f_row(dash, 11, "Gross Net Profit", str.tostring(grossNet, "0.00") + "R", grossNet >= 0 ? cUp : cDn)
+    f_row(dash, 12, "Commission Charged", str.tostring(commR, "0.00") + "R", cWarn)
+    f_row(dash, 13, "Net After Costs", str.tostring(netAfter, "0.00") + "R", netAfter >= 0 ? cUp : cDn)
+    f_row(dash, 14, "Strategy Net Profit", "$" + str.tostring(strategy.netprofit, "0.00"),
+         strategy.netprofit >= 0 ? cUp : cDn)
+    f_row(dash, 15, "Strategy Profit Factor",
+         na(stratPF) ? "—" : str.tostring(stratPF, "0.00"), na(stratPF) ? cNeu : stratPF >= 1 ? cUp : cDn)
+    f_row(dash, 16, "Open P&L", "$" + str.tostring(strategy.openprofit, "0.00"),
+         strategy.openprofit >= 0 ? cUp : cDn)
+    f_row(dash, 17, "Max Closed Drawdown",
+         str.tostring(maxDDR, "0.00") + "R | $" + str.tostring(cashDD, "0.00"), cWarn)
+    f_row(dash, 18, "Prop DD Used",
+         na(propUsed) ? "—" : str.tostring(propUsed, "0.0") + "%",
+         na(propUsed) ? cNeu : propUsed >= 100 ? cDn : propUsed >= 75 ? cWarn : cUp)
+    f_row(dash, 19, "DD Cushion Remaining", "$" + str.tostring(cushion, "0.00"), cushion >= 0 ? cUp : cDn)
+    f_row(dash, 20, "Max $/R @ Hist. DD", na(maxPerR) ? "—" : "$" + str.tostring(maxPerR, "0.00"), cNeu)
+    f_row(dash, 21, "Worst Loss Streak", str.tostring(worstLoss), worstLoss >= 5 ? cWarn : cNeu)
+    f_row(dash, 22, "Entries / Active Day", str.tostring(entPerDay, "0.00"), cNeu)
+    f_row(dash, 23, "Long W/LK/L | Net",
+         str.tostring(nLongW) + "/" + str.tostring(nLongLk) + "/" + str.tostring(nLongL) +
+         " | " + str.tostring(longNetR, "0.00") + "R", longNetR >= 0 ? cUp : cDn)
+    f_row(dash, 24, "Short W/LK/L | Net",
+         str.tostring(nShrtW) + "/" + str.tostring(nShrtLk) + "/" + str.tostring(nShrtL) +
+         " | " + str.tostring(shortNetR, "0.00") + "R", shortNetR >= 0 ? cUp : cDn)
+    f_row(dash, 25, "NY AM Closed | Net",
+         str.tostring(nAM) + " | " + str.tostring(amNetR, "0.00") + "R", amNetR >= 0 ? cUp : cDn)
+    f_row(dash, 26, "NY PM Closed | Net",
+         str.tostring(nPM) + " | " + str.tostring(pmNetR, "0.00") + "R", pmNetR >= 0 ? cUp : cDn)
+    f_row(dash, 27, "Overnight Closed | Net",
+         str.tostring(nON) + " | " + str.tostring(onNetR, "0.00") + "R", onNetR >= 0 ? cUp : cDn)
+    f_row(dash, 28, "Last Rejection", lastReject, cWarn)
+    f_row(dash, 29, "Backtest Window",
+         na(firstTm) ? "—" : str.format_time(firstTm, "yyyy-MM-dd", i_perfTZ) + " → " +
+         str.format_time(lastTm, "yyyy-MM-dd", i_perfTZ), cNeu)
+    f_row(dash, 30, "Calendar Days Tested", str.tostring(calDays, "0"), cNeu)
+
+// timeframe mismatch notice ---------------------------------------------------
+var label tfWarn = na
+if barstate.islast
+    label.delete(tfWarn)
+    if not tfMatch
+        tfWarn := label.new(bar_index, high, "NO WICK RETEST is idle:\nchart is " +
+             timeframe.period + ", signal timeframe is " + i_sigTF,
+             style = label.style_label_left, color = color.new(color.orange, 20),
+             textcolor = color.white, size = size.small)
