@@ -51,13 +51,14 @@ valid structural stop. The first failure is what `Last Rejection` shows, and
     `Closest Swing Search` pivots and picked by `Swing Selection`
     (`Most Recent Swing` or `Closest Swing by Price`).
   * `Recent CHOCH` — the swing the last change-of-character came from (for a
-    long: the swing low that preceded the bullish CHOCH break), falling back to
-    the recent swing when that is missing or not beyond entry.
-  * `No-Wick Candle` / `Signal Candle` — that candle's extreme.
-* `Swing Anchor Timing`: `Freeze at Setup` captures the swing on the no-wick
-  candle itself so it cannot drift while the setup waits; `Recalculate at Entry`
-  re-reads structure on the entry bar. A frozen swing that is no longer beyond
-  the entry price falls back to the live one.
+    long: the swing low that preceded the bullish CHOCH break).
+
+  These are the only two options in the real dropdown. Both fall back the same
+  way when the chosen structure is missing or no longer beyond the entry price:
+  frozen → live equivalent → nearest qualifying swing.
+* `Swing Anchor Timing`: `Freeze at Setup` captures the structure (both the
+  swing and the CHOCH swing) on the no-wick candle itself so it cannot drift
+  while the setup waits; `Recalculate at Entry` re-reads it on the entry bar.
 * `raw = |entry − structure| + Stop Offset ticks`, `stop = raw × Stop Multiple`,
   `target = raw × Target Multiple` → dashboard header shows the resulting R
   multiple (1R with the screenshot defaults).
@@ -126,19 +127,20 @@ and on exit. Create one alert on the indicator with **Any alert() function call*
 
 ## Inputs still unknown
 
-The four entry/risk dropdowns have now been confirmed from screenshots and are
-implemented verbatim. What is still open: the two numeric dropdowns, anything
-below `Recent CHOCH` in the Stop-Loss Structure list, and any group after
-`Style → Bearish Color`.
+Every dropdown in the Entry Model and Risk Management groups has now been
+confirmed from screenshots and is implemented verbatim. The only open items are
+whether `Stop / Target Distance` continues past `2` (the crop ends there — the
+list here follows the observed 0.25 step up to 3) and whether any input group
+exists after `Style → Bearish Color`.
 
 | Input | Status | Options used here |
 |---|---|---|
 | Entry Model | **confirmed** | Confirmation Close / Armed Level Retest / Rejection Close / Immediate Level Touch |
 | Swing Selection | **confirmed** | Most Recent Swing / Closest Swing by Price |
 | Swing Anchor Timing | **confirmed** | Freeze at Setup / Recalculate at Entry |
-| Stop-Loss Structure | partly — the screenshot shows `Recent Swing` and `Recent CHOCH`, the list may continue below the crop | Recent Swing / Recent CHOCH / No-Wick Candle / Signal Candle |
-| Stop / Target Distance | still unknown | 0.5 / 0.75 / 1 / 1.25 / 1.5 / 2 / 2.5 / 3 |
-| Move Stop Beyond Breakeven At | still unknown | Off / 25% / 50% / 60% / 75% / 90% |
+| Stop-Loss Structure | **confirmed** (list ends at `Recent CHOCH`) | Recent Swing / Recent CHOCH |
+| Stop / Target Distance | confirmed to `2`, screenshot cut off there | 0.25 steps, 0.5 → 3 |
+| Move Stop Beyond Breakeven At | **confirmed** | Off / 25% / 50% / 75% / 85% / 90% |
 
 If the missing screenshots show different option lists (or extra groups after
 `Style`), they can be swapped in without touching the engine.

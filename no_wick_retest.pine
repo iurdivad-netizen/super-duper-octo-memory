@@ -67,8 +67,6 @@ EM_TOUCH  = "Immediate Level Touch"
 
 SS_SWING  = "Recent Swing"
 SS_CHOCH  = "Recent CHOCH"
-SS_NOWICK = "No-Wick Candle"
-SS_SIGNAL = "Signal Candle"
 
 SW_RECENT = "Most Recent Swing"
 SW_CLOSE  = "Closest Swing by Price"
@@ -192,11 +190,10 @@ i_msBearClr  = input.color(#EF5350, "Bearish Structure Color", group = G_MS)
 // ═════════════════════════════════════════════════════════════════════════════
 i_swingStr    = input.int(1, "Swing Pivot Strength", minval = 1, maxval = 20, group = G_RISK,
      tooltip = "Bars either side of a pivot. 1 = every minor swing.")
-i_slStruct    = input.string(SS_SWING, "Stop-Loss Structure", options = [SS_SWING, SS_CHOCH, SS_NOWICK, SS_SIGNAL],
-     group = G_RISK,
+i_slStruct    = input.string(SS_SWING, "Stop-Loss Structure", options = [SS_SWING, SS_CHOCH], group = G_RISK,
      tooltip = SS_SWING + ": nearest qualifying confirmed swing pivot.\n" +
-     SS_CHOCH + ": the swing that the last change-of-character came from.\n" +
-     SS_NOWICK + " / " + SS_SIGNAL + ": the extreme of that candle.")
+     SS_CHOCH + ": the swing the last change-of-character came from. Falls back to " + SS_SWING +
+     " when there is no usable CHOCH swing.")
 i_swingSel    = input.string(SW_RECENT, "Swing Selection", options = [SW_RECENT, SW_CLOSE], group = G_RISK,
      tooltip = SW_RECENT + ": newest qualifying pivot.\n" + SW_CLOSE + ": the qualifying pivot nearest to entry.")
 i_anchor      = input.string(AN_FREEZE, "Swing Anchor Timing", options = [AN_FREEZE, AN_LIVE], group = G_RISK,
@@ -205,11 +202,11 @@ i_anchor      = input.string(AN_FREEZE, "Swing Anchor Timing", options = [AN_FRE
 i_swingSearch = input.int(6, "Closest Swing Search (Confirmed Pivots)", minval = 1, maxval = 50, group = G_RISK)
 i_stopOffset  = input.int(5, "Stop Offset (Ticks)", minval = 0, group = G_RISK)
 i_stopMult    = input.string("1", "Stop Distance (Structure Multiple)",
-     options = ["0.5", "0.75", "1", "1.25", "1.5", "2", "2.5", "3"], group = G_RISK)
+     options = ["0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "2.75", "3"], group = G_RISK)
 i_tgtMult     = input.string("1", "Target Distance (Structure Multiple)",
-     options = ["0.5", "0.75", "1", "1.25", "1.5", "2", "2.5", "3"], group = G_RISK)
+     options = ["0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "2.75", "3"], group = G_RISK)
 i_bePct       = input.string("75%", "Move Stop Beyond Breakeven At",
-     options = ["Off", "25%", "50%", "60%", "75%", "90%"], group = G_RISK,
+     options = ["Off", "25%", "50%", "75%", "85%", "90%"], group = G_RISK,
      tooltip = "Percentage of the distance from entry to target that price must travel " +
      "before the stop jumps beyond breakeven.")
 i_lockTicks   = input.int(1, "Profit Lock Beyond Entry (Ticks)", minval = 0, group = G_RISK)
@@ -293,6 +290,7 @@ type Setup
     bool  cfmd     = false
     int   cfmdBar  = 0
     float frozenSw = na
+    float frozenCh = na
     line  ln       = na
 
 type Trade
@@ -749,27 +747,20 @@ if newBar and tfMatch and setups.size() > 0
                     freeSlot = i_overlap or trades.size() == 0
 
                     // structural stop
-                    live = f_pickSwing(isLong, entryPx)
-                    float structPx = na
-                    if i_slStruct == SS_SWING
-                        structPx := i_anchor == AN_FREEZE and not na(s.frozenSw) ? s.frozenSw : live
-                        if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
-                            structPx := live
-                    else if i_slStruct == SS_CHOCH
-                        structPx := isLong ? chochLo : chochHi
-                        if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
-                            structPx := live
-                    else if i_slStruct == SS_NOWICK
-                        structPx := isLong ? s.lo : s.hi
-                    else
-                        structPx := isLong ? low : high
+                    live    = f_pickSwing(isLong, entryPx)
+                    liveCh  = isLong ? chochLo : chochHi
+                    frozen  = i_slStruct == SS_CHOCH ? s.frozenCh : s.frozenSw
+                    float structPx = i_anchor == AN_FREEZE ? frozen : i_slStruct == SS_CHOCH ? liveCh : live
+                    // fall back: CHOCH -> live CHOCH -> nearest swing
+                    if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        structPx := i_slStruct == SS_CHOCH ? liveCh : live
+                    if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        structPx := live
 
                     rawDist  = na(structPx) ? na : math.abs(entryPx - structPx) + i_stopOffset * syminfo.mintick
                     stopDist = na(rawDist) ? na : rawDist * stopMult
                     tgtDist  = na(rawDist) ? na : rawDist * tgtMult
-                    needBeyond = i_slStruct == SS_SWING or i_slStruct == SS_CHOCH
-                    structOK = not na(structPx) and
-                         (not needBeyond or (isLong ? structPx < entryPx : structPx > entryPx))
+                    structOK = not na(structPx) and (isLong ? structPx < entryPx : structPx > entryPx)
                     stopOK   = structOK and not na(stopDist) and stopDist > 0
 
                     if not dayOK
@@ -867,7 +858,7 @@ mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and 
 if newBar and tfMatch
     if mkLong
         st = Setup.new(dir = 1, level = low, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
-             frozenSw = f_pickSwing(true, low))
+             frozenSw = f_pickSwing(true, low), frozenCh = chochLo)
         if i_showLevels
             st.ln := line.new(bar_index, low, bar_index + 1, low, color = color.new(i_bullClr, 25),
                  style = line.style_dotted, width = 1)
@@ -879,7 +870,7 @@ if newBar and tfMatch
             f_trimLabels(arrowsArr, i_arrowKeep)
     if mkShort
         st = Setup.new(dir = -1, level = high, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
-             frozenSw = f_pickSwing(false, high))
+             frozenSw = f_pickSwing(false, high), frozenCh = chochHi)
         if i_showLevels
             st.ln := line.new(bar_index, high, bar_index + 1, high, color = color.new(i_bearClr, 25),
                  style = line.style_dotted, width = 1)
