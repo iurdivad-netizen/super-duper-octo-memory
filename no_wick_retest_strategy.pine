@@ -290,6 +290,12 @@ i_dashPos  = input.string("top_right", "Dashboard Position",
      options = ["top_left", "top_center", "top_right", "middle_left", "middle_right",
                  "bottom_left", "bottom_center", "bottom_right"], group = G_DASH)
 i_dashBg   = input.color(color.new(#1E222D, 10), "Table Background", group = G_DASH)
+i_dashSize = input.string("tiny", "Dashboard Text Size", options = ["tiny", "small", "normal"], group = G_DASH,
+     tooltip = "TradingView hides a table that does not fit its pane rather than clipping it, and the " +
+     "Strategy Tester panel takes half the chart height. Shrink the text, or use Compact, if the " +
+     "dashboard disappears.")
+i_dashMode = input.string("Full", "Dashboard Detail", options = ["Full", "Compact"], group = G_DASH,
+     tooltip = "Compact keeps the 15 rows worth watching live and drops the breakdowns.")
 i_perfTZ   = input.string("America/New_York", "Performance Timezone", group = G_DASH)
 
 i_propDD   = input.float(1000, "Account Max Drawdown ($)", minval = 0, step = 50, group = G_PROP)
@@ -1219,11 +1225,17 @@ plot(nCancelled, "Diag: cancelled", display = display.data_window)
 // side by side. The $ rows come straight out of the Strategy Tester's own
 // accounting, which is what the position sizing above actually produced.
 // ═════════════════════════════════════════════════════════════════════════════
-f_row(table tb, int r, string k, string v, color vc) =>
-    table.cell(tb, 0, r, k, text_color = color.new(color.silver, 0), text_size = size.small,
-         text_halign = text.align_left, bgcolor = i_dashBg)
-    table.cell(tb, 1, r, v, text_color = vc, text_size = size.small,
-         text_halign = text.align_right, bgcolor = i_dashBg)
+// One row of the dashboard, staged into parallel arrays so the row set can vary
+// with the detail mode without every row index having to be renumbered.
+var array<string> dashK = array.new<string>()
+var array<string> dashV = array.new<string>()
+var array<color>  dashC = array.new<color>()
+
+f_push(array<string> ks, array<string> vs, array<color> cs, string k, string v, color c) =>
+    ks.push(k)
+    vs.push(v)
+    cs.push(c)
+    ks.size()
 
 bracketN  = nWin + nLock + nLoss
 tpRate    = bracketN > 0 ? nWin / bracketN * 100.0 : 0.0
@@ -1257,67 +1269,98 @@ cDn   = i_bearClr
 cWarn = color.orange
 cNeu  = color.new(color.white, 0)
 
-var table dash = table.new(dashPos, 2, 31, border_width = 1, border_color = color.new(color.black, 60))
+dashFull = i_dashMode == "Full"
+dashRows = dashFull ? 31 : 16
+
+var table dash = table.new(dashPos, 2, dashRows, border_width = 1, border_color = color.new(color.black, 60))
 
 if barstate.islast and i_showDash
-    table.cell(dash, 0, 0, "NO WICK RETEST — STRATEGY", text_color = color.white, text_size = size.small,
-         text_halign = text.align_left, bgcolor = color.new(color.black, 30))
-    table.cell(dash, 1, 0, tfTxt + " | " + str.tostring(rMultiple, "0.##") + "R",
-         text_color = color.white, text_size = size.small, text_halign = text.align_right,
-         bgcolor = color.new(color.black, 30))
+    dashK.clear()
+    dashV.clear()
+    dashC.clear()
 
-    f_row(dash, 1,  "Status", statusTxt, statusClr)
-    f_row(dash, 2,  "No-Wick Setups",     str.tostring(nSetups),  cNeu)
-    f_row(dash, 3,  "Orders Placed / Filled",
+    f_push(dashK, dashV, dashC, "Status", statusTxt, statusClr)
+    f_push(dashK, dashV, dashC, "No-Wick Setups", str.tostring(nSetups), cNeu)
+    f_push(dashK, dashV, dashC, "Orders Placed / Filled",
          str.tostring(nOrders) + " / " + str.tostring(nEntries), cNeu)
-    f_row(dash, 4,  "Expired / Cancelled / Bad Stop",
-         str.tostring(nExpired) + " / " + str.tostring(nCancelled) + " / " + str.tostring(nBadStop),
-         nBadStop > 0 ? cWarn : cNeu)
-    f_row(dash, 5,  "Open / Resting",
+    if dashFull
+        f_push(dashK, dashV, dashC, "Expired / Cancelled / Bad Stop",
+             str.tostring(nExpired) + " / " + str.tostring(nCancelled) + " / " + str.tostring(nBadStop),
+             nBadStop > 0 ? cWarn : cNeu)
+    f_push(dashK, dashV, dashC, "Open / Resting",
          str.tostring(trades.size()) + " / " + str.tostring(pending.size()),
          trades.size() > 0 or pending.size() > 0 ? cWarn : cNeu)
-    f_row(dash, 6,  "Wins / Locked / Losses",
+    f_push(dashK, dashV, dashC, "Wins / Locked / Losses",
          str.tostring(nWin) + " / " + str.tostring(nLock) + " / " + str.tostring(nLoss), cNeu)
-    f_row(dash, 7,  "Reversal / Manual Exits", str.tostring(nManual), nManual > 0 ? cWarn : cNeu)
-    f_row(dash, 8,  "TP Win Rate", str.tostring(tpRate, "0.00") + "%", tpRate >= 50 ? cUp : cDn)
-    f_row(dash, 9,  "Positive Exit Rate", str.tostring(posRate, "0.00") + "%", posRate >= 50 ? cUp : cDn)
-    f_row(dash, 10, "Profit Factor (R, Gross)",
+    if dashFull
+        f_push(dashK, dashV, dashC, "Reversal / Manual Exits", str.tostring(nManual),
+             nManual > 0 ? cWarn : cNeu)
+    f_push(dashK, dashV, dashC, "TP Win Rate", str.tostring(tpRate, "0.00") + "%",
+         tpRate >= 50 ? cUp : cDn)
+    f_push(dashK, dashV, dashC, "Positive Exit Rate", str.tostring(posRate, "0.00") + "%",
+         posRate >= 50 ? cUp : cDn)
+    f_push(dashK, dashV, dashC, "Profit Factor (R, Gross)",
          na(pf) ? "—" : str.tostring(pf, "0.00"), na(pf) ? cNeu : pf >= 1 ? cUp : cDn)
-    f_row(dash, 11, "Gross Net Profit", str.tostring(grossNet, "0.00") + "R", grossNet >= 0 ? cUp : cDn)
-    f_row(dash, 12, "Commission Charged", str.tostring(commR, "0.00") + "R", cWarn)
-    f_row(dash, 13, "Net After Costs", str.tostring(netAfter, "0.00") + "R", netAfter >= 0 ? cUp : cDn)
-    f_row(dash, 14, "Strategy Net Profit", "$" + str.tostring(strategy.netprofit, "0.00"),
+    if dashFull
+        f_push(dashK, dashV, dashC, "Gross Net Profit", str.tostring(grossNet, "0.00") + "R",
+             grossNet >= 0 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "Commission Charged", str.tostring(commR, "0.00") + "R", cWarn)
+    f_push(dashK, dashV, dashC, "Net After Costs", str.tostring(netAfter, "0.00") + "R",
+         netAfter >= 0 ? cUp : cDn)
+    f_push(dashK, dashV, dashC, "Strategy Net Profit", "$" + str.tostring(strategy.netprofit, "0.00"),
          strategy.netprofit >= 0 ? cUp : cDn)
-    f_row(dash, 15, "Strategy Profit Factor",
-         na(stratPF) ? "—" : str.tostring(stratPF, "0.00"), na(stratPF) ? cNeu : stratPF >= 1 ? cUp : cDn)
-    f_row(dash, 16, "Open P&L", "$" + str.tostring(strategy.openprofit, "0.00"),
-         strategy.openprofit >= 0 ? cUp : cDn)
-    f_row(dash, 17, "Max Closed Drawdown",
+    if dashFull
+        f_push(dashK, dashV, dashC, "Strategy Profit Factor",
+             na(stratPF) ? "—" : str.tostring(stratPF, "0.00"),
+             na(stratPF) ? cNeu : stratPF >= 1 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "Open P&L", "$" + str.tostring(strategy.openprofit, "0.00"),
+             strategy.openprofit >= 0 ? cUp : cDn)
+    f_push(dashK, dashV, dashC, "Max Closed Drawdown",
          str.tostring(maxDDR, "0.00") + "R | $" + str.tostring(cashDD, "0.00"), cWarn)
-    f_row(dash, 18, "Prop DD Used",
+    f_push(dashK, dashV, dashC, "Prop DD Used",
          na(propUsed) ? "—" : str.tostring(propUsed, "0.0") + "%",
          na(propUsed) ? cNeu : propUsed >= 100 ? cDn : propUsed >= 75 ? cWarn : cUp)
-    f_row(dash, 19, "DD Cushion Remaining", "$" + str.tostring(cushion, "0.00"), cushion >= 0 ? cUp : cDn)
-    f_row(dash, 20, "Max $/R @ Hist. DD", na(maxPerR) ? "—" : "$" + str.tostring(maxPerR, "0.00"), cNeu)
-    f_row(dash, 21, "Worst Loss Streak", str.tostring(worstLoss), worstLoss >= 5 ? cWarn : cNeu)
-    f_row(dash, 22, "Entries / Active Day", str.tostring(entPerDay, "0.00"), cNeu)
-    f_row(dash, 23, "Long W/LK/L | Net",
-         str.tostring(nLongW) + "/" + str.tostring(nLongLk) + "/" + str.tostring(nLongL) +
-         " | " + str.tostring(longNetR, "0.00") + "R", longNetR >= 0 ? cUp : cDn)
-    f_row(dash, 24, "Short W/LK/L | Net",
-         str.tostring(nShrtW) + "/" + str.tostring(nShrtLk) + "/" + str.tostring(nShrtL) +
-         " | " + str.tostring(shortNetR, "0.00") + "R", shortNetR >= 0 ? cUp : cDn)
-    f_row(dash, 25, "NY AM Closed | Net",
-         str.tostring(nAM) + " | " + str.tostring(amNetR, "0.00") + "R", amNetR >= 0 ? cUp : cDn)
-    f_row(dash, 26, "NY PM Closed | Net",
-         str.tostring(nPM) + " | " + str.tostring(pmNetR, "0.00") + "R", pmNetR >= 0 ? cUp : cDn)
-    f_row(dash, 27, "Overnight Closed | Net",
-         str.tostring(nON) + " | " + str.tostring(onNetR, "0.00") + "R", onNetR >= 0 ? cUp : cDn)
-    f_row(dash, 28, "Last Rejection", lastReject, cWarn)
-    f_row(dash, 29, "Backtest Window",
-         na(firstTm) ? "—" : str.format_time(firstTm, "yyyy-MM-dd", i_perfTZ) + " → " +
-         str.format_time(lastTm, "yyyy-MM-dd", i_perfTZ), cNeu)
-    f_row(dash, 30, "Calendar Days Tested", str.tostring(calDays, "0"), cNeu)
+    if dashFull
+        f_push(dashK, dashV, dashC, "DD Cushion Remaining", "$" + str.tostring(cushion, "0.00"),
+             cushion >= 0 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "Max $/R @ Hist. DD",
+             na(maxPerR) ? "—" : "$" + str.tostring(maxPerR, "0.00"), cNeu)
+    f_push(dashK, dashV, dashC, "Worst Loss Streak", str.tostring(worstLoss),
+         worstLoss >= 5 ? cWarn : cNeu)
+    f_push(dashK, dashV, dashC, "Entries / Active Day", str.tostring(entPerDay, "0.00"), cNeu)
+    if dashFull
+        f_push(dashK, dashV, dashC, "Long W/LK/L | Net",
+             str.tostring(nLongW) + "/" + str.tostring(nLongLk) + "/" + str.tostring(nLongL) +
+             " | " + str.tostring(longNetR, "0.00") + "R", longNetR >= 0 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "Short W/LK/L | Net",
+             str.tostring(nShrtW) + "/" + str.tostring(nShrtLk) + "/" + str.tostring(nShrtL) +
+             " | " + str.tostring(shortNetR, "0.00") + "R", shortNetR >= 0 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "NY AM Closed | Net",
+             str.tostring(nAM) + " | " + str.tostring(amNetR, "0.00") + "R", amNetR >= 0 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "NY PM Closed | Net",
+             str.tostring(nPM) + " | " + str.tostring(pmNetR, "0.00") + "R", pmNetR >= 0 ? cUp : cDn)
+        f_push(dashK, dashV, dashC, "Overnight Closed | Net",
+             str.tostring(nON) + " | " + str.tostring(onNetR, "0.00") + "R", onNetR >= 0 ? cUp : cDn)
+    f_push(dashK, dashV, dashC, "Last Rejection", lastReject, cWarn)
+    if dashFull
+        f_push(dashK, dashV, dashC, "Backtest Window",
+             na(firstTm) ? "—" : str.format_time(firstTm, "yyyy-MM-dd", i_perfTZ) + " → " +
+             str.format_time(lastTm, "yyyy-MM-dd", i_perfTZ), cNeu)
+        f_push(dashK, dashV, dashC, "Calendar Days Tested", str.tostring(calDays, "0"), cNeu)
+
+    table.cell(dash, 0, 0, "NO WICK RETEST — STRATEGY", text_color = color.white, text_size = i_dashSize,
+         text_halign = text.align_left, bgcolor = color.new(color.black, 30))
+    table.cell(dash, 1, 0, tfTxt + " | " + str.tostring(rMultiple, "0.##") + "R",
+         text_color = color.white, text_size = i_dashSize, text_halign = text.align_right,
+         bgcolor = color.new(color.black, 30))
+
+    shown = math.min(dashK.size(), dashRows - 1)
+    if shown > 0
+        for r = 0 to shown - 1
+            table.cell(dash, 0, r + 1, dashK.get(r), text_color = color.new(color.silver, 0),
+                 text_size = i_dashSize, text_halign = text.align_left, bgcolor = i_dashBg)
+            table.cell(dash, 1, r + 1, dashV.get(r), text_color = dashC.get(r),
+                 text_size = i_dashSize, text_halign = text.align_right, bgcolor = i_dashBg)
 
 // timeframe mismatch notice ---------------------------------------------------
 var label tfWarn = na

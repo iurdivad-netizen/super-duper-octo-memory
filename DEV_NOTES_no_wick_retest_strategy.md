@@ -153,6 +153,18 @@ Commission and slippage come from the `strategy()` declaration
 Tester's **Properties** tab, not in the script's inputs — Pine will not accept
 `input.*` values for those parameters.
 
+### Why the dashboard has a size control
+
+TradingView **hides** a table that does not fit its pane rather than clipping
+it, and the Strategy Tester panel takes roughly half the chart height — which an
+indicator never has to share. At `size.small` the full 31-row table is about
+465px and simply vanishes on a half-height pane. Hence `Dashboard Text Size`
+(default `tiny`, ~340px) and `Dashboard Detail` (`Compact` keeps the 15 rows
+worth watching live and drops the breakdowns, ~180px at tiny).
+
+Rows are staged into parallel arrays and written in one loop, so the row set can
+vary with the detail mode without every row index having to be renumbered.
+
 ### Dashboard rows that changed
 
 | Row | Change |
