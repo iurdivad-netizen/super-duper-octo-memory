@@ -255,9 +255,12 @@ tgtMult    = nz(str.tonumber(i_tgtMult),  1.0)
 beEnabled  = i_bePct != "Off"
 bePct      = beEnabled ? nz(str.tonumber(str.replace(i_bePct, "%", "", 0)), 75.0) / 100.0 : na
 rMultiple  = stopMult > 0 ? tgtMult / stopMult : na
-tickVal    = syminfo.mintick * syminfo.pointvalue
-costCash   = (i_fees + 2.0 * i_slipTicks * tickVal) * i_qty
-costR      = i_riskPer1R > 0 ? costCash / i_riskPer1R : 0.0
+// Fees are a cash cost measured against the cash risk of 1R; slippage is a PRICE
+// cost measured against the trade's own stop distance. Mixing the two (charging
+// slippage at tick value against $/1R) overstates costs by an order of magnitude
+// on tick-heavy instruments.
+feeR       = i_riskPer1R > 0 ? i_fees * i_qty / i_riskPer1R : 0.0
+slipPrice  = 2.0 * i_slipTicks * syminfo.mintick
 
 sigSec     = timeframe.in_seconds(i_sigTF)
 chartSec   = timeframe.in_seconds(timeframe.period)
@@ -307,6 +310,9 @@ type Trade
     bool   locked   = false
     box    bxTP     = na
     box    bxSL     = na
+    line   lnE      = na
+    label  lbT      = na
+    label  lbS      = na
 
 // ═════════════════════════════════════════════════════════════════════════════
 // CORE SERIES  (all ta.* calls unconditional / global)
@@ -345,6 +351,8 @@ var array<label> arrowsArr = array.new<label>()
 var array<label> diagArr   = array.new<label>()
 var array<label> msArr     = array.new<label>()
 var array<box>   toolArr   = array.new<box>()
+var array<line>  toolLnArr = array.new<line>()
+var array<label> toolLbArr = array.new<label>()
 var array<label> markArr   = array.new<label>()
 
 // statistics
@@ -358,6 +366,7 @@ var int   nLoss      = 0
 var float grossWinR  = 0.0
 var float grossLosR  = 0.0
 var float netR       = 0.0
+var float costSumR   = 0.0
 var float eqPeakR    = 0.0
 var float maxDDR     = 0.0
 var int   lossStreak = 0
@@ -445,22 +454,18 @@ f_sessBlocked(int dir, int t) =>
         why := "NY PM short block (12-4 PM)"
     [blocked, why]
 
-// trend filters -> [ok, reason]
-f_trendOK(int dir, float level, float px) =>
+// trend filters applied at ENTRY (the MA location filter runs at setup creation)
+f_trendOK(int dir, float px) =>
     bool ok = true
     string why = ""
     isLong = dir == 1
-    if i_useMALoc
-        locOK = isLong ? (level > smaLFast and level > smaLSlow) : (level < smaSFast and level < smaSSlow)
-        if not locOK
-            ok := false
-            why := "No-wick level on wrong side of MAs"
-    if ok and i_useRibbon
-        ribOK = isLong ? (rib1 > rib2 and rib2 > rib3 and rib3 > rib4 and rib4 > rib5) :
-             (rib1 < rib2 and rib2 < rib3 and rib3 < rib4 and rib4 < rib5)
+    if i_useRibbon
+        ribHi = math.max(math.max(math.max(math.max(rib1, rib2), rib3), rib4), rib5)
+        ribLo = math.min(math.min(math.min(math.min(rib1, rib2), rib3), rib4), rib5)
+        ribOK = isLong ? px > ribHi : px < ribLo
         if not ribOK
             ok := false
-            why := "Ribbon not stacked"
+            why := "Entry inside the MA ribbon"
     if ok and i_useMADir
         dirOK = isLong ? rib1 > rib1[3] : rib1 < rib1[3]
         sepOK = math.abs(px - rib1) >= i_maSep * atr and (isLong ? px > rib1 : px < rib1)
@@ -508,6 +513,11 @@ f_confirmOK(int dir, float level) =>
 f_trimLabels(array<label> a, int keep) =>
     while a.size() > keep
         label.delete(a.shift())
+    a.size()
+
+f_trimLines(array<line> a, int keep) =>
+    while a.size() > keep
+        line.delete(a.shift())
     a.size()
 
 f_trimBoxes(array<box> a, int keep) =>
@@ -576,6 +586,13 @@ if newBar
 if newBar and tfMatch and trades.size() > 0
     for i = trades.size() - 1 to 0
         t = trades.get(i)
+        if i_showRR and not na(t.bxTP)
+            rEnd = math.max(bar_index, t.entryBar + i_rrWidth)
+            box.set_right(t.bxTP, rEnd)
+            box.set_right(t.bxSL, rEnd)
+            line.set_x2(t.lnE, rEnd)
+            label.set_x(t.lbT, rEnd)
+            label.set_x(t.lbS, rEnd)
         if t.entryBar != bar_index
             float  exitPx   = na
             string exitType = ""
@@ -601,14 +618,19 @@ if newBar and tfMatch and trades.size() > 0
                 if hit
                     t.locked := true
                     t.stop   := t.entry + t.dir * i_lockTicks * syminfo.mintick
+                    if i_showRR and not na(t.lbS)
+                        label.set_text(t.lbS, "SL/BE " + str.tostring(t.stop, format.mintick))
+                        label.set_y(t.lbS, t.stop)
                     if i_ghost and i_alertBE
                         alert(f_json("modify", t.dir == 1 ? "long" : "short", t.entry, t.stop, t.target,
                              t.id, "profit lock"), alert.freq_once_per_bar_close)
 
             if not na(exitPx)
                 grossR = t.dir * (exitPx - t.entry) / t.rDist
+                costR  = feeR + (t.rDist > 0 ? slipPrice / t.rDist : 0.0)
                 tradeR = grossR - costR
-                netR   := netR + tradeR
+                costSumR := costSumR + costR
+                netR     := netR + tradeR
                 if grossR > 0
                     grossWinR := grossWinR + grossR
                 else
@@ -647,10 +669,6 @@ if newBar and tfMatch and trades.size() > 0
                 else
                     nON    := nON + 1
                     onNetR := onNetR + tradeR
-
-                if i_showRR and not na(t.bxTP) and not na(t.bxSL)
-                    box.set_right(t.bxTP, bar_index)
-                    box.set_right(t.bxSL, bar_index)
 
                 if i_ghost and i_alertEx
                     alert(f_json("exit", t.dir == 1 ? "long" : "short", exitPx, na, na, t.id,
@@ -742,7 +760,7 @@ if newBar and tfMatch and setups.size() > 0
 
                 if trigger
                     [blocked, blockWhy] = f_sessBlocked(s.dir, time)
-                    [trOK, trWhy]       = f_trendOK(s.dir, s.level, entryPx)
+                    [trOK, trWhy]       = f_trendOK(s.dir, entryPx)
                     dayOK    = f_dayOK(time)
                     freeSlot = i_overlap or trades.size() == 0
 
@@ -789,16 +807,30 @@ if newBar and tfMatch and setups.size() > 0
                              entryTm = time, bucket = bucket)
 
                         if i_showRR
-                            clr = isLong ? i_bullClr : i_bearClr
-                            tr.bxTP := box.new(bar_index, math.max(entryPx, tgtPx), bar_index + i_rrWidth,
-                                 math.min(entryPx, tgtPx), border_color = color.new(i_bullClr, 40),
-                                 bgcolor = color.new(i_bullClr, 88))
-                            tr.bxSL := box.new(bar_index, math.max(entryPx, stopPx), bar_index + i_rrWidth,
-                                 math.min(entryPx, stopPx), border_color = color.new(i_bearClr, 40),
-                                 bgcolor = color.new(i_bearClr, 88))
+                            clr  = isLong ? i_bullClr : i_bearClr
+                            rEnd = bar_index + i_rrWidth
+                            tr.bxTP := box.new(bar_index, math.max(entryPx, tgtPx), rEnd,
+                                 math.min(entryPx, tgtPx), border_color = color.new(i_bullClr, 45),
+                                 bgcolor = color.new(i_bullClr, 80))
+                            tr.bxSL := box.new(bar_index, math.max(entryPx, stopPx), rEnd,
+                                 math.min(entryPx, stopPx), border_color = color.new(i_bearClr, 45),
+                                 bgcolor = color.new(i_bearClr, 80))
+                            tr.lnE := line.new(bar_index, entryPx, rEnd, entryPx,
+                                 color = color.new(color.white, 15), style = line.style_dashed, width = 1)
+                            tr.lbT := label.new(rEnd, tgtPx, "TP " + str.tostring(tgtPx, format.mintick),
+                                 style = label.style_label_left, color = color.new(i_bullClr, 15),
+                                 textcolor = color.white, size = size.tiny)
+                            tr.lbS := label.new(rEnd, stopPx, "SL " + str.tostring(stopPx, format.mintick),
+                                 style = label.style_label_left, color = color.new(i_bearClr, 15),
+                                 textcolor = color.white, size = size.tiny)
                             toolArr.push(tr.bxTP)
                             toolArr.push(tr.bxSL)
+                            toolLnArr.push(tr.lnE)
+                            toolLbArr.push(tr.lbT)
+                            toolLbArr.push(tr.lbS)
                             f_trimBoxes(toolArr, i_toolKeep * 2)
+                            f_trimLines(toolLnArr, i_toolKeep)
+                            f_trimLabels(toolLbArr, i_toolKeep * 2)
                             markArr.push(label.new(bar_index, na, isLong ? "▲" : "▼",
                                  yloc = isLong ? yloc.belowbar : yloc.abovebar,
                                  style = label.style_none, textcolor = clr, size = size.small))
@@ -852,8 +884,13 @@ noLowerWick = (open - low)  < tol
 noUpperWick = (high - open) < tol
 bullBody    = close > open
 bearBody    = close < open
-mkLong      = i_longOn  and noLowerWick and (i_dirNoWick ? bullBody : true) and high > low
-mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and high > low
+// "No-Wick MA Location Filter" gates the LEVEL, so it is applied here, when the
+// level is created - not at entry. A level on the wrong side of its MAs never
+// becomes a setup at all.
+locOKLong   = not i_useMALoc or (low  > smaLFast and low  > smaLSlow)
+locOKShort  = not i_useMALoc or (high < smaSFast and high < smaSSlow)
+mkLong      = i_longOn  and noLowerWick and (i_dirNoWick ? bullBody : true) and high > low and locOKLong
+mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and high > low and locOKShort
 
 if newBar and tfMatch
     if mkLong
@@ -909,7 +946,7 @@ tpRate    = closedN > 0 ? nWin / closedN * 100.0 : 0.0
 posRate   = closedN > 0 ? (nWin + nLock) / closedN * 100.0 : 0.0
 pf        = grossLosR > 0 ? grossWinR / grossLosR : na
 grossNet  = grossWinR - grossLosR
-estCosts  = closedN * costR
+estCosts  = costSumR
 netAfter  = grossNet - estCosts
 ddCash    = maxDDR * i_riskPer1R
 propUsed  = i_propDD > 0 ? ddCash / i_propDD * 100.0 : na

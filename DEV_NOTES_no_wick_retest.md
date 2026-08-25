@@ -40,7 +40,18 @@ statistics will not reproduce the original tick-for-tick.
    Every setup therefore ends as an entry, a bad stop, or an expiry — which is
    why `Setups = Entries + Expired + Bad Stop` on the dashboard.
 
-### Filters (all evaluated at entry, not at level creation)
+### Where each filter runs
+`Use No-Wick MA Location Filter` gates the **level**, so it runs when the no-wick
+candle forms: a level on the wrong side of its direction's MAs never becomes a
+setup at all. Everything else runs at entry. This matters for the dashboard —
+it roughly halves `No-Wick Setups`, and it keeps "wrong side of MAs" out of
+`Last Rejection`, which is why the original's last rejection is an expiry.
+
+`Use MA Ribbon Filter` requires the entry price to be clear of the whole ribbon
+(above all five MAs for a long), not that the five MAs are perfectly stacked —
+stacking is a far rarer condition and starves the entry count.
+
+### Filter order at entry
 Confirmations → day filter → session blocks → trend filters → free trade slot →
 valid structural stop. The first failure is what `Last Rejection` shows, and
 `Show Rejection Diagnostics` prints it on the bar.
@@ -78,7 +89,7 @@ valid structural stop. The first failure is what `Last Rejection` shows, and
 | Positive Exit Rate | `(wins + locked) / closed` |
 | Profit Factor (Gross) | `Σ positive R / Σ negative R`, before costs |
 | Gross Net Profit | `Σ R` before costs |
-| Estimated Costs | `closed × (round-trip fees + 2 × slippage ticks × tick value) × qty / $ per 1R` |
+| Estimated Costs | per trade: `fees × qty / $ per 1R` **+** `2 × slippage ticks × mintick / stop distance` |
 | Net After Costs | gross − costs (this is the curve everything below uses) |
 | Max Closed Drawdown | peak-to-valley of the net closed-trade R curve, and `× $ per 1R` |
 | Prop DD Used | `drawdown $ / Account Max Drawdown` |
@@ -92,6 +103,14 @@ Session buckets and the session/day filters are independent: the filters use
 `Session Filter Timezone`, the statistics use `Performance Timezone`.
 
 ---
+
+### Why costs are split that way
+Fees are a cash cost, so they belong against the cash value of 1R. Slippage is a
+*price* cost, so it belongs against the trade's own stop distance — that ratio
+is position-size independent, which is the whole point of scoring in R.
+Charging slippage as `ticks × dollar tick value ÷ $per1R` instead mixes the two
+and overstates costs by ~10× on a tick-heavy instrument (it silently assumes the
+position was sized so that the stop distance equals exactly $1R).
 
 ## Deliberate implementation choices
 
