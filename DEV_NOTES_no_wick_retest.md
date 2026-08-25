@@ -144,6 +144,44 @@ and on exit. Create one alert on the indicator with **Any alert() function call*
 
 ---
 
+## Calibration against the original
+
+Same chart, same settings, 2025-09-30 → 2026-08-25. "v1" is the first build,
+"v2" after moving the MA location filter to level creation, relaxing the ribbon
+filter and fixing the cost model, "v3" after setting the MA location line to the
+fast/slow midpoint.
+
+| Row | v1 | v2 | v3 target | Original |
+|---|---|---|---|---|
+| No-Wick Setups | 803 | 303 | ~408 | 408 |
+| Confirmed Entries | 38 | 105 | | 126 |
+| Positive Exit Rate | 55.26% | 62.86% | | 63.49% |
+| Entries / Active Day | 1.06 | 1.13 | | 1.18 |
+| Estimated Costs | 4.16R | 2.09R | | 1.36R |
+| Gross Net Profit | 0.01R | 15.05R | | 11.11R |
+
+### What the remaining gap says
+The cost row is a usable probe of the average stop distance, because slippage is
+charged as `2 × slipTicks × mintick / stopDistance`. Backing that out:
+
+* ours: `(2.09/105 − 0.0095) = 0.0104R` per trade → average stop ≈ **192 ticks**
+* original: `(1.36/126 − 0.0095) = 0.0013R` per trade → average stop ≈ **1540 ticks**
+
+So the original's structural stops are roughly **8× wider** than ours on the same
+data. That single difference also explains the rest of the profile: wider stops
+take longer to travel 75% of the way to target, which is why the original shows
+more `Locked` exits (18.3% of closed trades against our 11.4%) and a lower TP
+win rate (45.2% against our 51.4%), and why its drawdown is larger in R.
+
+The suspect is what counts as a swing. With `Swing Pivot Strength 1` I take
+every minor 1-bar pivot, so for a long the nearest pivot low under the level is
+often one or two bars back. A stop 8× wider implies the original qualifies
+swings at a higher structural degree — the phrase "Confirmed Pivots" in
+`Closest Swing Search (Confirmed Pivots)` may mean pivots confirmed by a
+structure break (the ones that produced BOS/CHOCH), not merely confirmed by the
+pivot lookback. Reading one stop level off each indicator's R/R tool on the same
+setup settles it, which is cheaper than guessing.
+
 ## Inputs still unknown
 
 Every dropdown in the Entry Model and Risk Management groups has now been

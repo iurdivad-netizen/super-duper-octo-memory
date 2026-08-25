@@ -887,8 +887,14 @@ bearBody    = close < open
 // "No-Wick MA Location Filter" gates the LEVEL, so it is applied here, when the
 // level is created - not at entry. A level on the wrong side of its MAs never
 // becomes a setup at all.
-locOKLong   = not i_useMALoc or (low  > smaLFast and low  > smaLSlow)
-locOKShort  = not i_useMALoc or (high < smaSFast and high < smaSSlow)
+// The dividing line is the midpoint of the direction's fast and slow SMA, which
+// is what reproduces the original's setup count: of the same raw no-wick
+// candles, "beyond BOTH MAs" keeps ~38% and "beyond EITHER" ~62%, while the
+// original keeps ~51%.
+locLineLong  = (smaLFast + smaLSlow) / 2.0
+locLineShort = (smaSFast + smaSSlow) / 2.0
+locOKLong   = not i_useMALoc or low  > locLineLong
+locOKShort  = not i_useMALoc or high < locLineShort
 mkLong      = i_longOn  and noLowerWick and (i_dirNoWick ? bullBody : true) and high > low and locOKLong
 mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and high > low and locOKShort
 
