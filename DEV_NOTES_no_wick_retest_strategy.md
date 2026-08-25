@@ -96,6 +96,30 @@ count against the cap). An opposing signal is then handled by
 With overlapping trades off, the one-trade rule blocks the case before this
 input matters.
 
+## Capital, margin and the silent funds refusal
+
+`initial_capital = 1000000`, `margin_long = 0`, `margin_short = 0`.
+
+This is not cosmetic. One NQ contract at 29,000 is roughly $580,000 of notional.
+If the broker emulator's margin requirement cannot be met from the account
+balance it **refuses the order and says nothing** — the Strategy Tester simply
+reports no trades, which looks exactly like a broken signal engine. Zero margin
+plus a large notional capital takes that failure mode off the table so the
+backtest measures the strategy rather than the account. Set realistic values in
+the Strategy Tester's **Properties** tab when you want the equity curve to model
+margin; Pine will not accept `input.*` for these parameters.
+
+A market order that has not been reported filled by the bar after it was placed
+is treated as refused: it is cancelled, counted under `Cancelled`, and
+`Last Rejection` reads `Market order refused — check capital / margin`. Without
+that, a single refused order would hold the one-trade slot for the rest of the
+backtest and every later signal would be rejected as `Trade already open`.
+
+Four counters are also plotted to the Data Window (`Diag: setups / orders /
+fills / cancelled`) so the engine can be read even if the dashboard is not
+drawing. Setups but no orders means the filters are refusing the signals;
+orders but no fills means the emulator is refusing the orders.
+
 ## Statistics
 
 The registry no longer simulates fills — it reads them back. Each signal gets a

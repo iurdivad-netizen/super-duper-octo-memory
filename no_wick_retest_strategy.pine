@@ -28,6 +28,11 @@
 //   3. POSITION SIZING. The indicator scores everything in R and never needs a
 //      quantity. A strategy does: fixed contracts, a cash risk budget, or a %
 //      of equity, all solved against the trade's own structural stop distance.
+//      Margin is declared at 0 and capital at 1,000,000 so the broker emulator
+//      never refuses an order for want of funds - one NQ contract is over half
+//      a million dollars of notional, and a funds refusal is silent. Set a
+//      realistic margin in the Strategy Tester's Properties tab if you want the
+//      equity curve to model it.
 //
 //   4. COSTS ARE REAL. Commission and slippage come from the strategy
 //      declaration (override them in Properties), so they land inside the fill
@@ -49,8 +54,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 strategy("NO WICK RETEST — Strategy", shorttitle = "NWR-S", overlay = true,
-     currency = currency.NONE, initial_capital = 100000,
+     currency = currency.NONE, initial_capital = 1000000,
      default_qty_type = strategy.fixed, default_qty_value = 1,
+     margin_long = 0, margin_short = 0,
      pyramiding = 20,
      calc_on_every_tick = false, process_orders_on_close = true,
      commission_type = strategy.commission.cash_per_contract, commission_value = 0.95,
@@ -884,25 +890,36 @@ if newBar and pending.size() > 0
 if newBar and pending.size() > 0
     for i = pending.size() - 1 to 0
         p = pending.get(i)
+        bool   drop = false
+        string why  = ""
         if p.resting
-            expired = bar_index >= p.expireBar
-            bool filterOut = false
-            if i_cancelOnFilter and not expired
+            if bar_index >= p.expireBar
+                drop := true
+                why  := "Resting order expired"
+            else if i_cancelOnFilter
                 [blk, _bw]  = f_sessBlocked(p.dir, time)
                 [trOK, _tw] = f_trendOK(p.dir, p.entry)
-                filterOut := blk or not trOK or not f_dayOK(time)
-            if expired or filterOut
-                strategy.cancel(p.eid)
-                strategy.cancel(p.xid)
-                nCancelled := nCancelled + 1
-                lastReject := expired ? "Resting order expired" : "Resting order pulled by filter"
-                if i_showExpired
-                    diagArr.push(label.new(bar_index, p.dir == 1 ? low : high,
-                         expired ? "ORDER EXPIRED" : "ORDER PULLED",
-                         style = p.dir == 1 ? label.style_label_up : label.style_label_down,
-                         color = color.new(color.orange, 40), textcolor = color.white, size = size.tiny))
-                    f_trimLabels(diagArr, i_diagKeep)
-                pending.remove(i)
+                if blk or not trOK or not f_dayOK(time)
+                    drop := true
+                    why  := "Resting order pulled by filter"
+        else if bar_index > p.placedBar + 1
+            // A market order fills at the bar it was placed on, so it must have
+            // been reported by now. If it was not, the emulator refused it -
+            // almost always for want of capital or margin. Drop it rather than
+            // let it hold the trade slot for the rest of the backtest.
+            drop := true
+            why  := "Market order refused — check capital / margin"
+        if drop
+            strategy.cancel(p.eid)
+            strategy.cancel(p.xid)
+            nCancelled := nCancelled + 1
+            lastReject := why
+            if i_showExpired
+                diagArr.push(label.new(bar_index, p.dir == 1 ? low : high, why,
+                     style = p.dir == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.orange, 40), textcolor = color.white, size = size.tiny))
+                f_trimLabels(diagArr, i_diagKeep)
+            pending.remove(i)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // 4. MANAGE OPEN TRADES  (R/R tool, breakeven / profit lock)
@@ -1185,6 +1202,15 @@ plot(i_showRib ? rib4 : na, "Ribbon 4", color = color.new(#42A5F5, 70))
 plot(i_showRib ? rib5 : na, "Ribbon 5", color = color.new(#42A5F5, 80))
 plot(i_showST  ? stLine : na, "Supertrend",
      color = stDir == -1 ? i_bullClr : i_bearClr, style = plot.style_linebr, linewidth = 2)
+
+// Diagnostic counters. Data Window only, so they cost nothing visually, but they
+// still report if the dashboard is not drawing for any reason. Setups without
+// orders means the filters are refusing; orders without fills means the broker
+// emulator is refusing (capital / margin) rather than the signal engine.
+plot(nSetups,    "Diag: setups",    display = display.data_window)
+plot(nOrders,    "Diag: orders",    display = display.data_window)
+plot(nEntries,   "Diag: fills",     display = display.data_window)
+plot(nCancelled, "Diag: cancelled", display = display.data_window)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
