@@ -1,0 +1,998 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// NO WICK RETEST
+//
+// Open-source re-implementation of the workflow shown in the "No Wick Retest"
+// settings + performance-dashboard screenshots (original closed-source idea by
+// mogodfrey, https://www.tradingview.com/v/XvrNGxNk/).
+//
+// This file was written ONLY from the visible input list and the dashboard
+// rows — the original script is protected and none of its source was used, so
+// internals (exact filter maths, exact rejection wording) are my own model and
+// will not tick-for-tick reproduce the original's statistics.
+//
+// MODEL
+//   1. A "no-wick" candle is a candle with no wick on one side:
+//        long  setup -> open == low   (no lower wick), level = the low/open
+//        short setup -> open == high  (no upper wick), level = the high/open
+//      "Require Directional No-Wick Candle" additionally demands the candle
+//      closes in the setup's direction (bull candle for a long level).
+//   2. Price must PULL AWAY from the level by at least N * ATR.
+//   3. Price must RETEST the level within "Maximum Candles to Retest" — the
+//      setup is then ARMED.
+//   4. Entry fires per "Entry Model" + the "Entry Confirmations" toggles,
+//      subject to session / day / trend / structure filters.
+//   5. Stop comes from market structure (swing pivots), target is a multiple of
+//      that structure distance; the stop is pushed beyond breakeven once price
+//      travels a chosen % of the way to target ("Locked" outcome).
+//   6. Every simulated trade is scored in R and reported on the dashboard,
+//      including prop-firm drawdown maths and estimated costs.
+//
+// The engine is fully event-driven on CONFIRMED bars only, so nothing repaints.
+// Intrabar fill order is conservative: if a bar touches both stop and target,
+// the stop is taken.
+//
+// No license. Free and open source.
+// ─────────────────────────────────────────────────────────────────────────────
+
+indicator("NO WICK RETEST", shorttitle = "NWR", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
+     max_bars_back = 5000)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GROUPS
+// ═════════════════════════════════════════════════════════════════════════════
+G_TF    = "Timeframe"
+G_SETUP = "No-Wick Setup"
+G_DIAG  = "Diagnostics"
+G_MODEL = "Entry Model"
+G_CONF  = "Entry Confirmations"
+G_SESS  = "Session Filters"
+G_DAY   = "Day Filters"
+G_TREND = "Trend Filters"
+G_MS    = "Market Structure"
+G_RISK  = "Risk Management"
+G_AUTO  = "Automation"
+G_DISP  = "Display"
+G_DASH  = "Dashboard"
+G_PROP  = "Prop Risk"
+G_COST  = "Dashboard Costs"
+G_STYLE = "Style"
+
+// mode constants -------------------------------------------------------------
+EM_CONF   = "Confirmation Close"
+EM_RETEST = "Armed Level Retest"
+EM_REJECT = "Rejection Close"
+EM_TOUCH  = "Immediate Level Touch"
+
+SS_SWING  = "Recent Swing"
+SS_CHOCH  = "Recent CHOCH"
+
+SW_RECENT = "Most Recent Swing"
+SW_CLOSE  = "Closest Swing by Price"
+
+AN_FREEZE = "Freeze at Setup"
+AN_LIVE   = "Recalculate at Entry"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — TIMEFRAME
+// ═════════════════════════════════════════════════════════════════════════════
+i_sigTF = input.timeframe("15", "Signal / Execution Timeframe", group = G_TF,
+     tooltip = "The engine only runs when the chart timeframe matches this value. " +
+     "Put the chart on this timeframe; the dashboard tells you when they differ.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — NO-WICK SETUP
+// ═════════════════════════════════════════════════════════════════════════════
+i_longOn     = input.bool(true,  "Enable Long Setups",  group = G_SETUP)
+i_shortOn    = input.bool(true,  "Enable Short Setups", group = G_SETUP)
+i_dirNoWick  = input.bool(true,  "Require Directional No-Wick Candle", group = G_SETUP,
+     tooltip = "ON: a long level must come from a bullish no-lower-wick candle (and vice versa).\n" +
+     "OFF: any candle without the relevant wick creates a level.")
+i_maxCandles = input.int(10, "Maximum Candles to Retest", minval = 1, maxval = 200, group = G_SETUP,
+     tooltip = "Bars after the no-wick candle in which the retest AND the entry must complete. " +
+     "Otherwise the setup expires.")
+i_showLevels = input.bool(true,  "Show Active No-Wick Levels", group = G_SETUP)
+i_showArrows = input.bool(true,  "Show No-Wick Arrows", group = G_SETUP)
+i_arrowSize  = input.string("small", "No-Wick Arrow Size", options = ["tiny", "small", "normal", "large"], group = G_SETUP)
+i_arrowKeep  = input.int(200, "No-Wick Arrows to Keep", minval = 1, maxval = 450, group = G_SETUP)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DIAGNOSTICS
+// ═════════════════════════════════════════════════════════════════════════════
+i_showRejects = input.bool(false, "Show Rejection Diagnostics", group = G_DIAG,
+     tooltip = "Prints why an armed setup did not convert into an entry on that bar.")
+i_showExpired = input.bool(false, "Show Expired Setup Labels", group = G_DIAG)
+i_diagKeep    = input.int(100, "Diagnostic Labels to Keep", minval = 1, maxval = 450, group = G_DIAG)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — ENTRY MODEL
+// ═════════════════════════════════════════════════════════════════════════════
+i_entryModel = input.string(EM_CONF, "Entry Model", options = [EM_CONF, EM_RETEST, EM_REJECT, EM_TOUCH], group = G_MODEL,
+     tooltip = EM_CONF + ": enter on the close of the first candle that satisfies the confirmations below.\n" +
+     EM_RETEST + ": that confirmation only ARMS the level - the fill is a limit at the level on a later candle.\n" +
+     EM_REJECT + ": the candle must wick into the level and close back out of it, wick >= half the range.\n" +
+     EM_TOUCH + ": fill at the level the moment it is retested, no candle close required.")
+i_pullAway   = input.float(0.15, "Minimum Pull-Away Before Retest (ATR)", minval = 0.0, step = 0.05, group = G_MODEL,
+     tooltip = "Price must travel this far away from the level before a touch counts as a retest.")
+i_showArmed  = input.bool(false, "Show Armed Labels", group = G_MODEL)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — ENTRY CONFIRMATIONS
+// ═════════════════════════════════════════════════════════════════════════════
+i_cfBack     = input.bool(true,  "Require Close Back Through No-Wick Level", group = G_CONF,
+     tooltip = "Long: the confirmation candle must close above the level.")
+i_cfCandle   = input.bool(true,  "Require Bull/Bear Confirmation Candle", group = G_CONF,
+     tooltip = "Long: close > open.")
+i_cfPrev     = input.bool(true,  "Require Close Beyond Previous Candle", group = G_CONF,
+     tooltip = "Long: close > previous candle high.")
+i_cfChoch    = input.bool(false, "Require Matching CHOCH Bias", group = G_CONF,
+     tooltip = "Only take longs while market structure is bullish (last break was to the upside).")
+i_overlap    = input.bool(false, "Allow Overlapping Trades", group = G_CONF,
+     tooltip = "OFF: a new entry is skipped while another simulated trade is open.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — SESSION FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+i_sessTZ    = input.string("America/New_York", "Session Filter Timezone", group = G_SESS)
+i_blkNYOpen = input.bool(false, "Block New York Open Entries (9:30-10:00 AM)", group = G_SESS)
+i_blkNYPMS  = input.bool(true,  "Block NY PM Short Entries Only (12-4 PM)",   group = G_SESS,
+     tooltip = "Blocks short entries only, between 12:00 and 16:00 in the timezone above.")
+i_blkNYLate = input.bool(true,  "Block Late New York Entries (2-4 PM)",       group = G_SESS)
+i_blkAsia   = input.bool(true,  "Block Early Asia Entries (6-8 PM)",          group = G_SESS)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DAY FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+i_mon = input.bool(true,  "Trade Monday",         group = G_DAY)
+i_tue = input.bool(true,  "Trade Tuesday",        group = G_DAY)
+i_wed = input.bool(true,  "Trade Wednesday",      group = G_DAY)
+i_thu = input.bool(true,  "Trade Thursday",       group = G_DAY)
+i_fri = input.bool(true,  "Trade Friday",         group = G_DAY)
+i_sun = input.bool(false, "Trade Sunday Evening", group = G_DAY)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — TREND FILTERS
+// ═════════════════════════════════════════════════════════════════════════════
+i_useMALoc  = input.bool(true, "Use No-Wick MA Location Filter", group = G_TREND,
+     tooltip = "Long levels must sit above both 'Long' MAs, short levels below both 'Short' MAs.")
+i_sFast     = input.int(20,  "Short Fast SMA Length", minval = 1, group = G_TREND)
+i_sSlow     = input.int(100, "Short Slow SMA Length", minval = 1, group = G_TREND)
+i_lFast     = input.int(20,  "Long Fast SMA Length",  minval = 1, group = G_TREND)
+i_lSlow     = input.int(100, "Long Slow SMA Length",  minval = 1, group = G_TREND)
+i_useRibbon = input.bool(true,  "Use MA Ribbon Filter", group = G_TREND,
+     tooltip = "The 5 ribbon MAs must be stacked in the direction of the trade.")
+i_useMADir  = input.bool(false, "Use MA Direction + Separation Filter", group = G_TREND,
+     tooltip = "The ribbon base MA must be sloping with the trade AND price must be far enough from it.")
+i_maSep     = input.float(0.15, "Minimum Entry-to-MA Separation (ATR)", minval = 0.0, step = 0.05, group = G_TREND)
+i_showRib   = input.bool(false, "Show MA Ribbon on Chart", group = G_TREND)
+i_ribBase   = input.int(20, "Ribbon Base Length", minval = 1, group = G_TREND,
+     tooltip = "Ribbon uses base x1 ... base x5.")
+
+i_useST     = input.bool(false, "Use Supertrend Filter",   group = G_TREND)
+i_showST    = input.bool(false, "Show Supertrend on Chart", group = G_TREND)
+i_stMult    = input.float(3.0, "Supertrend Multiplier", minval = 0.1, step = 0.1, group = G_TREND)
+i_stPeriod  = input.int(10, "Supertrend Period", minval = 1, group = G_TREND)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — MARKET STRUCTURE
+// ═════════════════════════════════════════════════════════════════════════════
+i_showStruct = input.bool(false, "Show BOS / CHOCH Labels", group = G_MS)
+i_showBOS    = input.bool(false, "Show BOS Labels",   group = G_MS)
+i_showCHOCH  = input.bool(false, "Show CHOCH Labels", group = G_MS)
+i_msSize     = input.string("tiny", "Structure Label Size", options = ["tiny", "small", "normal", "large"], group = G_MS)
+i_msKeep     = input.int(150, "Structure Labels to Keep", minval = 1, maxval = 450, group = G_MS)
+i_msBullClr  = input.color(#26A69A, "Bullish Structure Color", group = G_MS)
+i_msBearClr  = input.color(#EF5350, "Bearish Structure Color", group = G_MS)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — RISK MANAGEMENT
+// ═════════════════════════════════════════════════════════════════════════════
+i_swingStr    = input.int(1, "Swing Pivot Strength", minval = 1, maxval = 20, group = G_RISK,
+     tooltip = "Bars either side of a pivot. 1 = every minor swing.")
+i_slStruct    = input.string(SS_SWING, "Stop-Loss Structure", options = [SS_SWING, SS_CHOCH], group = G_RISK,
+     tooltip = SS_SWING + ": nearest qualifying confirmed swing pivot.\n" +
+     SS_CHOCH + ": the swing the last change-of-character came from. Falls back to " + SS_SWING +
+     " when there is no usable CHOCH swing.")
+i_swingSel    = input.string(SW_RECENT, "Swing Selection", options = [SW_RECENT, SW_CLOSE], group = G_RISK,
+     tooltip = SW_RECENT + ": newest qualifying pivot.\n" + SW_CLOSE + ": the qualifying pivot nearest to entry.")
+i_anchor      = input.string(AN_FREEZE, "Swing Anchor Timing", options = [AN_FREEZE, AN_LIVE], group = G_RISK,
+     tooltip = AN_FREEZE + ": structure is captured on the no-wick candle and cannot drift.\n" +
+     AN_LIVE + ": structure is re-read on the entry bar.")
+i_swingSearch = input.int(6, "Closest Swing Search (Confirmed Pivots)", minval = 1, maxval = 50, group = G_RISK)
+i_stopOffset  = input.int(5, "Stop Offset (Ticks)", minval = 0, group = G_RISK)
+i_stopMult    = input.string("1", "Stop Distance (Structure Multiple)",
+     options = ["0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "2.75", "3"], group = G_RISK)
+i_tgtMult     = input.string("1", "Target Distance (Structure Multiple)",
+     options = ["0.5", "0.75", "1", "1.25", "1.5", "1.75", "2", "2.25", "2.5", "2.75", "3"], group = G_RISK)
+i_bePct       = input.string("75%", "Move Stop Beyond Breakeven At",
+     options = ["Off", "25%", "50%", "75%", "85%", "90%"], group = G_RISK,
+     tooltip = "Percentage of the distance from entry to target that price must travel " +
+     "before the stop jumps beyond breakeven.")
+i_lockTicks   = input.int(1, "Profit Lock Beyond Entry (Ticks)", minval = 0, group = G_RISK)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — AUTOMATION
+// ═════════════════════════════════════════════════════════════════════════════
+i_ghost    = input.bool(true, "Enable Ghost JSON Webhook Alerts", group = G_AUTO,
+     tooltip = "Fires alert() with a JSON payload on entry (and, below, on stop moves / exits). " +
+     "Create ONE alert on this indicator with 'Any alert() function call'.")
+i_qty      = input.int(1, "Order Quantity", minval = 1, group = G_AUTO)
+i_alertBE  = input.bool(true, "Send Breakeven / Profit-Lock Alert", group = G_AUTO)
+i_alertEx  = input.bool(true, "Send TP / SL Exit Alerts", group = G_AUTO)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DISPLAY
+// ═════════════════════════════════════════════════════════════════════════════
+i_showRR   = input.bool(true, "Show Risk/Reward Tools", group = G_DISP)
+i_rrWidth  = input.int(5, "R/R Tool Width (Signal Candles)", minval = 1, maxval = 100, group = G_DISP)
+i_toolKeep = input.int(10, "Recent Trade Markers / Tools", minval = 1, maxval = 100, group = G_DISP)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — DASHBOARD / PROP RISK / COSTS / STYLE
+// ═════════════════════════════════════════════════════════════════════════════
+i_showDash = input.bool(true, "Show Performance Dashboard", group = G_DASH)
+i_dashPos  = input.string("top_right", "Dashboard Position",
+     options = ["top_left", "top_center", "top_right", "middle_left", "middle_right",
+                 "bottom_left", "bottom_center", "bottom_right"], group = G_DASH)
+i_dashBg   = input.color(color.new(#1E222D, 10), "Table Background", group = G_DASH)
+i_perfTZ   = input.string("America/New_York", "Performance Timezone", group = G_DASH)
+
+i_propDD   = input.float(1000, "Account Max Drawdown ($)", minval = 0, step = 50, group = G_PROP)
+i_riskPer1R= input.float(100,  "Planned Risk per Trade / 1R ($)", minval = 0.01, step = 5, group = G_PROP)
+
+i_fees     = input.float(0.95, "Round-Trip Fees / Contract ($)", minval = 0, step = 0.05, group = G_COST)
+i_slipTicks= input.float(1, "Estimated Slippage (Ticks / Side)", minval = 0, step = 0.5, group = G_COST)
+
+i_bullClr  = input.color(#26A69A, "Bullish Color", group = G_STYLE)
+i_bearClr  = input.color(#EF5350, "Bearish Color", group = G_STYLE)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DERIVED SETTINGS
+// ═════════════════════════════════════════════════════════════════════════════
+stopMult   = nz(str.tonumber(i_stopMult), 1.0)
+tgtMult    = nz(str.tonumber(i_tgtMult),  1.0)
+beEnabled  = i_bePct != "Off"
+bePct      = beEnabled ? nz(str.tonumber(str.replace(i_bePct, "%", "", 0)), 75.0) / 100.0 : na
+rMultiple  = stopMult > 0 ? tgtMult / stopMult : na
+tickVal    = syminfo.mintick * syminfo.pointvalue
+costCash   = (i_fees + 2.0 * i_slipTicks * tickVal) * i_qty
+costR      = i_riskPer1R > 0 ? costCash / i_riskPer1R : 0.0
+
+sigSec     = timeframe.in_seconds(i_sigTF)
+chartSec   = timeframe.in_seconds(timeframe.period)
+tfMatch    = sigSec == chartSec
+newBar     = barstate.isconfirmed
+
+dashPos = switch i_dashPos
+    "top_left"      => position.top_left
+    "top_center"    => position.top_center
+    "top_right"     => position.top_right
+    "middle_left"   => position.middle_left
+    "middle_right"  => position.middle_right
+    "bottom_left"   => position.bottom_left
+    "bottom_center" => position.bottom_center
+    => position.bottom_right
+
+// ═════════════════════════════════════════════════════════════════════════════
+// TYPES
+// ═════════════════════════════════════════════════════════════════════════════
+type Setup
+    int   dir      = 0
+    float level    = na
+    float atr0     = na
+    float hi       = na
+    float lo       = na
+    int   bar0     = 0
+    bool  pulled   = false
+    bool  armed    = false
+    int   armedBar = 0
+    bool  cfmd     = false
+    int   cfmdBar  = 0
+    float frozenSw = na
+    float frozenCh = na
+    line  ln       = na
+
+type Trade
+    int    id       = 0
+    int    dir      = 0
+    float  entry    = na
+    float  stop     = na
+    float  initStop = na
+    float  target   = na
+    float  rDist    = na
+    int    entryBar = 0
+    int    entryTm  = 0
+    int    bucket   = 2
+    bool   locked   = false
+    box    bxTP     = na
+    box    bxSL     = na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CORE SERIES  (all ta.* calls unconditional / global)
+// ═════════════════════════════════════════════════════════════════════════════
+atr        = ta.atr(14)
+smaSFast   = ta.sma(close, i_sFast)
+smaSSlow   = ta.sma(close, i_sSlow)
+smaLFast   = ta.sma(close, i_lFast)
+smaLSlow   = ta.sma(close, i_lSlow)
+rib1       = ta.sma(close, i_ribBase)
+rib2       = ta.sma(close, i_ribBase * 2)
+rib3       = ta.sma(close, i_ribBase * 3)
+rib4       = ta.sma(close, i_ribBase * 4)
+rib5       = ta.sma(close, i_ribBase * 5)
+[stLine, stDir] = ta.supertrend(i_stMult, i_stPeriod)
+pvtHi      = ta.pivothigh(i_swingStr, i_swingStr)
+pvtLo      = ta.pivotlow(i_swingStr, i_swingStr)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STATE
+// ═════════════════════════════════════════════════════════════════════════════
+var array<float> phPrice = array.new<float>()
+var array<float> plPrice = array.new<float>()
+var float lastPH   = na
+var float lastPL   = na
+var bool  phBroken = true
+var bool  plBroken = true
+var int   structBias = 0                  // 1 bull, -1 bear, 0 undefined
+var float chochLo    = na                 // swing the last bullish CHOCH came from
+var float chochHi    = na                 // swing the last bearish CHOCH came from
+
+var array<Setup> setups = array.new<Setup>()
+var array<Trade> trades = array.new<Trade>()
+
+var array<label> arrowsArr = array.new<label>()
+var array<label> diagArr   = array.new<label>()
+var array<label> msArr     = array.new<label>()
+var array<box>   toolArr   = array.new<box>()
+var array<label> markArr   = array.new<label>()
+
+// statistics
+var int   nSetups    = 0
+var int   nEntries   = 0
+var int   nExpired   = 0
+var int   nBadStop   = 0
+var int   nWin       = 0
+var int   nLock      = 0
+var int   nLoss      = 0
+var float grossWinR  = 0.0
+var float grossLosR  = 0.0
+var float netR       = 0.0
+var float eqPeakR    = 0.0
+var float maxDDR     = 0.0
+var int   lossStreak = 0
+var int   worstLoss  = 0
+var int   activeDays = 0
+var int   lastDayId  = 0
+var int   tradeSeq   = 0
+
+var int   nLongW    = 0
+var int   nLongLk   = 0
+var int   nLongL    = 0
+var float longNetR  = 0.0
+var int   nShrtW    = 0
+var int   nShrtLk   = 0
+var int   nShrtL    = 0
+var float shortNetR = 0.0
+var int   nAM    = 0
+var float amNetR = 0.0
+var int   nPM    = 0
+var float pmNetR = 0.0
+var int   nON    = 0
+var float onNetR = 0.0
+
+var string lastReject = "—"
+var int    firstTm    = na
+var int    lastTm     = na
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HELPERS  (pure, top-level)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// pick a structural swing beyond the reference price, honouring Swing Selection
+f_pickSwing(bool isLong, float ref) =>
+    float best = na
+    cnt = isLong ? plPrice.size() : phPrice.size()
+    n   = math.min(i_swingSearch, cnt)
+    if n > 0
+        for k = 0 to n - 1
+            idx = cnt - 1 - k
+            float p = na
+            if isLong
+                p := plPrice.get(idx)
+            else
+                p := phPrice.get(idx)
+            ok = isLong ? p < ref - syminfo.mintick : p > ref + syminfo.mintick
+            if ok
+                if na(best)
+                    best := p
+                else if i_swingSel == SW_CLOSE
+                    best := isLong ? math.max(best, p) : math.min(best, p)
+    best
+
+// minutes since midnight in the session-filter timezone
+f_mod(int t) =>
+    hour(t, i_sessTZ) * 60 + minute(t, i_sessTZ)
+
+// day filter
+f_dayOK(int t) =>
+    dow = dayofweek(t, i_sessTZ)
+    switch dow
+        dayofweek.monday    => i_mon
+        dayofweek.tuesday   => i_tue
+        dayofweek.wednesday => i_wed
+        dayofweek.thursday  => i_thu
+        dayofweek.friday    => i_fri
+        dayofweek.sunday    => i_sun
+        => false
+
+// session filter -> [blocked, reason]
+f_sessBlocked(int dir, int t) =>
+    m = f_mod(t)
+    bool blocked = false
+    string why = ""
+    if i_blkNYOpen and m >= 570 and m < 600
+        blocked := true
+        why := "NY open block (9:30-10:00)"
+    else if i_blkNYLate and m >= 840 and m < 960
+        blocked := true
+        why := "Late NY block (2-4 PM)"
+    else if i_blkAsia and m >= 1080 and m < 1200
+        blocked := true
+        why := "Early Asia block (6-8 PM)"
+    else if i_blkNYPMS and dir == -1 and m >= 720 and m < 960
+        blocked := true
+        why := "NY PM short block (12-4 PM)"
+    [blocked, why]
+
+// trend filters -> [ok, reason]
+f_trendOK(int dir, float level, float px) =>
+    bool ok = true
+    string why = ""
+    isLong = dir == 1
+    if i_useMALoc
+        locOK = isLong ? (level > smaLFast and level > smaLSlow) : (level < smaSFast and level < smaSSlow)
+        if not locOK
+            ok := false
+            why := "No-wick level on wrong side of MAs"
+    if ok and i_useRibbon
+        ribOK = isLong ? (rib1 > rib2 and rib2 > rib3 and rib3 > rib4 and rib4 > rib5) :
+             (rib1 < rib2 and rib2 < rib3 and rib3 < rib4 and rib4 < rib5)
+        if not ribOK
+            ok := false
+            why := "Ribbon not stacked"
+    if ok and i_useMADir
+        dirOK = isLong ? rib1 > rib1[3] : rib1 < rib1[3]
+        sepOK = math.abs(px - rib1) >= i_maSep * atr and (isLong ? px > rib1 : px < rib1)
+        if not dirOK
+            ok := false
+            why := "Ribbon slope against trade"
+        else if not sepOK
+            ok := false
+            why := "Entry too close to MA"
+    if ok and i_useST
+        stOK = isLong ? stDir == -1 : stDir == 1
+        if not stOK
+            ok := false
+            why := "Supertrend against trade"
+    [ok, why]
+
+// entry confirmations -> [ok, reason]
+f_confirmOK(int dir, float level) =>
+    bool ok = true
+    string why = ""
+    isLong = dir == 1
+    if i_cfBack
+        c = isLong ? close > level : close < level
+        if not c
+            ok := false
+            why := "No close back through level"
+    if ok and i_cfCandle
+        c = isLong ? close > open : close < open
+        if not c
+            ok := false
+            why := "No confirmation candle"
+    if ok and i_cfPrev
+        c = isLong ? close > high[1] : close < low[1]
+        if not c
+            ok := false
+            why := "No close beyond previous candle"
+    if ok and i_cfChoch
+        c = isLong ? structBias == 1 : structBias == -1
+        if not c
+            ok := false
+            why := "CHOCH bias mismatch"
+    [ok, why]
+
+// FIFO drawing pools ---------------------------------------------------------
+f_trimLabels(array<label> a, int keep) =>
+    while a.size() > keep
+        label.delete(a.shift())
+    a.size()
+
+f_trimBoxes(array<box> a, int keep) =>
+    while a.size() > keep
+        box.delete(a.shift())
+    a.size()
+
+// Ghost JSON payload ---------------------------------------------------------
+f_json(string action, string side, float px, float sl, float tp, int id, string note) =>
+    '{"ticker":"' + syminfo.ticker + '","exchange":"' + syminfo.prefix +
+     '","strategy":"NO_WICK_RETEST","action":"' + action +
+     '","side":"' + side +
+     '","quantity":' + str.tostring(i_qty) +
+     ',"price":' + str.tostring(px, format.mintick) +
+     ',"stop":' + (na(sl) ? "null" : str.tostring(sl, format.mintick)) +
+     ',"target":' + (na(tp) ? "null" : str.tostring(tp, format.mintick)) +
+     ',"tradeId":"NWR-' + str.tostring(id) +
+     '","timeframe":"' + timeframe.period +
+     '","note":"' + note +
+     '","time":"' + str.format_time(time_close, "yyyy-MM-dd HH:mm:ss", "UTC") + '"}'
+
+// ═════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE  (pivot book + BOS / CHOCH)
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar
+    if not na(pvtHi)
+        lastPH   := pvtHi
+        phBroken := false
+        phPrice.push(pvtHi)
+        if phPrice.size() > 60
+            phPrice.shift()
+    if not na(pvtLo)
+        lastPL   := pvtLo
+        plBroken := false
+        plPrice.push(pvtLo)
+        if plPrice.size() > 60
+            plPrice.shift()
+
+    if not na(lastPH) and not phBroken and close > lastPH
+        phBroken := true
+        isChoch = structBias == -1
+        structBias := 1
+        if isChoch
+            chochLo := lastPL
+        if i_showStruct and ((isChoch and i_showCHOCH) or (not isChoch and i_showBOS))
+            msArr.push(label.new(bar_index, high, isChoch ? "CHoCH" : "BOS",
+                 style = label.style_label_down, color = color.new(i_msBullClr, 20),
+                 textcolor = color.white, size = i_msSize))
+            f_trimLabels(msArr, i_msKeep)
+
+    if not na(lastPL) and not plBroken and close < lastPL
+        plBroken := true
+        isChochDn = structBias == 1
+        structBias := -1
+        if isChochDn
+            chochHi := lastPH
+        if i_showStruct and ((isChochDn and i_showCHOCH) or (not isChochDn and i_showBOS))
+            msArr.push(label.new(bar_index, low, isChochDn ? "CHoCH" : "BOS",
+                 style = label.style_label_up, color = color.new(i_msBearClr, 20),
+                 textcolor = color.white, size = i_msSize))
+            f_trimLabels(msArr, i_msKeep)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OPEN TRADE MANAGEMENT  (exits first, then breakeven / profit lock)
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and tfMatch and trades.size() > 0
+    for i = trades.size() - 1 to 0
+        t = trades.get(i)
+        if t.entryBar != bar_index
+            float  exitPx   = na
+            string exitType = ""
+
+            if t.dir == 1
+                if low <= t.stop
+                    exitPx   := t.stop
+                    exitType := t.locked ? "LOCK" : "SL"
+                else if high >= t.target
+                    exitPx   := t.target
+                    exitType := "TP"
+            else
+                if high >= t.stop
+                    exitPx   := t.stop
+                    exitType := t.locked ? "LOCK" : "SL"
+                else if low <= t.target
+                    exitPx   := t.target
+                    exitType := "TP"
+
+            if na(exitPx) and beEnabled and not t.locked
+                trig = t.entry + t.dir * bePct * math.abs(t.target - t.entry)
+                hit  = t.dir == 1 ? high >= trig : low <= trig
+                if hit
+                    t.locked := true
+                    t.stop   := t.entry + t.dir * i_lockTicks * syminfo.mintick
+                    if i_ghost and i_alertBE
+                        alert(f_json("modify", t.dir == 1 ? "long" : "short", t.entry, t.stop, t.target,
+                             t.id, "profit lock"), alert.freq_once_per_bar_close)
+
+            if not na(exitPx)
+                grossR = t.dir * (exitPx - t.entry) / t.rDist
+                tradeR = grossR - costR
+                netR   := netR + tradeR
+                if grossR > 0
+                    grossWinR := grossWinR + grossR
+                else
+                    grossLosR := grossLosR - grossR
+                eqPeakR := math.max(eqPeakR, netR)
+                maxDDR  := math.max(maxDDR, eqPeakR - netR)
+
+                if exitType == "TP"
+                    nWin := nWin + 1
+                    lossStreak := 0
+                else if exitType == "LOCK"
+                    nLock := nLock + 1
+                    lossStreak := 0
+                else
+                    nLoss := nLoss + 1
+                    lossStreak := lossStreak + 1
+                    worstLoss := math.max(worstLoss, lossStreak)
+
+                if t.dir == 1
+                    longNetR := longNetR + tradeR
+                    nLongW   := nLongW  + (exitType == "TP"   ? 1 : 0)
+                    nLongLk  := nLongLk + (exitType == "LOCK" ? 1 : 0)
+                    nLongL   := nLongL  + (exitType == "SL"   ? 1 : 0)
+                else
+                    shortNetR := shortNetR + tradeR
+                    nShrtW    := nShrtW  + (exitType == "TP"   ? 1 : 0)
+                    nShrtLk   := nShrtLk + (exitType == "LOCK" ? 1 : 0)
+                    nShrtL    := nShrtL  + (exitType == "SL"   ? 1 : 0)
+
+                if t.bucket == 0
+                    nAM    := nAM + 1
+                    amNetR := amNetR + tradeR
+                else if t.bucket == 1
+                    nPM    := nPM + 1
+                    pmNetR := pmNetR + tradeR
+                else
+                    nON    := nON + 1
+                    onNetR := onNetR + tradeR
+
+                if i_showRR and not na(t.bxTP) and not na(t.bxSL)
+                    box.set_right(t.bxTP, bar_index)
+                    box.set_right(t.bxSL, bar_index)
+
+                if i_ghost and i_alertEx
+                    alert(f_json("exit", t.dir == 1 ? "long" : "short", exitPx, na, na, t.id,
+                         exitType == "TP" ? "target hit" : exitType == "LOCK" ? "profit lock hit" : "stop hit"),
+                         alert.freq_once_per_bar_close)
+
+                trades.remove(i)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SETUP LIFECYCLE  (pull-away -> retest / arm -> confirmations -> entry)
+// ═════════════════════════════════════════════════════════════════════════════
+if newBar and tfMatch and setups.size() > 0
+    for i = setups.size() - 1 to 0
+        s      = setups.get(i)
+        bool   dropIt = false
+        age    = bar_index - s.bar0
+        isLong = s.dir == 1
+
+        if i_showLevels and not na(s.ln)
+            line.set_x2(s.ln, bar_index + 1)
+
+        if age >= 1
+            // ── pull-away ────────────────────────────────────────────────────
+            if not s.pulled
+                away = isLong ? high - s.level : s.level - low
+                if away >= i_pullAway * s.atr0
+                    s.pulled := true
+
+            // ── retest / arming ─────────────────────────────────────────────
+            if s.pulled and not s.armed
+                touched = isLong ? low <= s.level : high >= s.level
+                if touched
+                    s.armed    := true
+                    s.armedBar := bar_index
+                    if i_showArmed and i_entryModel != EM_RETEST
+                        diagArr.push(label.new(bar_index, isLong ? low : high, "ARMED",
+                             style = isLong ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny))
+                        f_trimLabels(diagArr, i_diagKeep)
+
+            // ── entry evaluation ────────────────────────────────────────────
+            if s.armed and not dropIt
+                [confOK, confWhy] = f_confirmOK(s.dir, s.level)
+                rng     = high - low
+                wickLen = isLong ? math.min(open, close) - low : high - math.max(open, close)
+                intoLvl = isLong ? low <= s.level : high >= s.level
+                backOut = isLong ? close > s.level : close < s.level
+                rejOK   = rng > 0 and intoLvl and backOut and wickLen >= 0.5 * rng
+
+                bool   trigger = false
+                float  entryPx = na
+                string rej     = ""
+
+                if i_entryModel == EM_TOUCH
+                    // fill at the level on the retest itself
+                    if s.armedBar == bar_index
+                        trigger := true
+                        entryPx := s.level
+                else if i_entryModel == EM_CONF
+                    // first close that satisfies the confirmations
+                    if confOK
+                        trigger := true
+                        entryPx := close
+                    else
+                        rej := confWhy
+                else if i_entryModel == EM_REJECT
+                    // wick into the level, close back out of it
+                    if rejOK and confOK
+                        trigger := true
+                        entryPx := close
+                    else
+                        rej := rejOK ? confWhy : "No rejection candle at level"
+                else
+                    // EM_RETEST: the confirmation only arms a limit at the level
+                    if not s.cfmd
+                        if confOK
+                            s.cfmd    := true
+                            s.cfmdBar := bar_index
+                            if i_showArmed
+                                diagArr.push(label.new(bar_index, isLong ? low : high, "ARMED",
+                                     style = isLong ? label.style_label_up : label.style_label_down,
+                                     color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny))
+                                f_trimLabels(diagArr, i_diagKeep)
+                        else
+                            rej := confWhy
+                    else if bar_index > s.cfmdBar and intoLvl
+                        trigger := true
+                        entryPx := s.level
+
+                if trigger
+                    [blocked, blockWhy] = f_sessBlocked(s.dir, time)
+                    [trOK, trWhy]       = f_trendOK(s.dir, s.level, entryPx)
+                    dayOK    = f_dayOK(time)
+                    freeSlot = i_overlap or trades.size() == 0
+
+                    // structural stop
+                    live    = f_pickSwing(isLong, entryPx)
+                    liveCh  = isLong ? chochLo : chochHi
+                    frozen  = i_slStruct == SS_CHOCH ? s.frozenCh : s.frozenSw
+                    float structPx = i_anchor == AN_FREEZE ? frozen : i_slStruct == SS_CHOCH ? liveCh : live
+                    // fall back: CHOCH -> live CHOCH -> nearest swing
+                    if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        structPx := i_slStruct == SS_CHOCH ? liveCh : live
+                    if na(structPx) or (isLong ? structPx >= entryPx : structPx <= entryPx)
+                        structPx := live
+
+                    rawDist  = na(structPx) ? na : math.abs(entryPx - structPx) + i_stopOffset * syminfo.mintick
+                    stopDist = na(rawDist) ? na : rawDist * stopMult
+                    tgtDist  = na(rawDist) ? na : rawDist * tgtMult
+                    structOK = not na(structPx) and (isLong ? structPx < entryPx : structPx > entryPx)
+                    stopOK   = structOK and not na(stopDist) and stopDist > 0
+
+                    if not dayOK
+                        rej := "Day filter"
+                    else if blocked
+                        rej := blockWhy
+                    else if not trOK
+                        rej := trWhy
+                    else if not freeSlot
+                        rej := "Trade already open"
+                    else if not stopOK
+                        rej := "No valid structure for stop"
+                        nBadStop := nBadStop + 1
+                        dropIt   := true
+
+                    if rej == ""
+                        // ── ENTRY ───────────────────────────────────────────
+                        stopPx = entryPx - s.dir * stopDist
+                        tgtPx  = entryPx + s.dir * tgtDist
+                        m      = f_mod(time)
+                        bucket = m >= 570 and m < 720 ? 0 : m >= 720 and m < 960 ? 1 : 2
+
+                        tradeSeq := tradeSeq + 1
+                        tr = Trade.new(id = tradeSeq, dir = s.dir, entry = entryPx, stop = stopPx,
+                             initStop = stopPx, target = tgtPx, rDist = stopDist, entryBar = bar_index,
+                             entryTm = time, bucket = bucket)
+
+                        if i_showRR
+                            clr = isLong ? i_bullClr : i_bearClr
+                            tr.bxTP := box.new(bar_index, math.max(entryPx, tgtPx), bar_index + i_rrWidth,
+                                 math.min(entryPx, tgtPx), border_color = color.new(i_bullClr, 40),
+                                 bgcolor = color.new(i_bullClr, 88))
+                            tr.bxSL := box.new(bar_index, math.max(entryPx, stopPx), bar_index + i_rrWidth,
+                                 math.min(entryPx, stopPx), border_color = color.new(i_bearClr, 40),
+                                 bgcolor = color.new(i_bearClr, 88))
+                            toolArr.push(tr.bxTP)
+                            toolArr.push(tr.bxSL)
+                            f_trimBoxes(toolArr, i_toolKeep * 2)
+                            markArr.push(label.new(bar_index, na, isLong ? "▲" : "▼",
+                                 yloc = isLong ? yloc.belowbar : yloc.abovebar,
+                                 style = label.style_none, textcolor = clr, size = size.small))
+                            f_trimLabels(markArr, i_toolKeep)
+
+                        trades.push(tr)
+                        nEntries := nEntries + 1
+
+                        dayId = year(time, i_perfTZ) * 10000 + month(time, i_perfTZ) * 100 + dayofmonth(time, i_perfTZ)
+                        if dayId != lastDayId
+                            lastDayId  := dayId
+                            activeDays := activeDays + 1
+
+                        if i_ghost
+                            alert(f_json("entry", isLong ? "long" : "short", entryPx, stopPx, tgtPx,
+                                 tradeSeq, "no-wick retest"), alert.freq_once_per_bar_close)
+
+                        dropIt := true
+
+                if rej != ""
+                    lastReject := rej
+                    if i_showRejects
+                        diagArr.push(label.new(bar_index, isLong ? low : high, rej,
+                             style = isLong ? label.style_label_up : label.style_label_down,
+                             color = color.new(color.gray, 30), textcolor = color.white, size = size.tiny))
+                        f_trimLabels(diagArr, i_diagKeep)
+
+        // ── expiry ─────────────────────────────────────────────────────────
+        if not dropIt and age >= i_maxCandles
+            dropIt     := true
+            nExpired   := nExpired + 1
+            lastReject := "Expired after " + str.tostring(i_maxCandles) + " candles"
+            if i_showExpired
+                diagArr.push(label.new(bar_index, isLong ? low : high,
+                     "EXPIRED " + str.tostring(i_maxCandles),
+                     style = isLong ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.orange, 40), textcolor = color.white, size = size.tiny))
+                f_trimLabels(diagArr, i_diagKeep)
+
+        if dropIt
+            if not na(s.ln)
+                line.delete(s.ln)
+            setups.remove(i)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// NO-WICK CANDLE DETECTION  (runs after the lifecycle: a level cannot be
+// retested by its own candle)
+// ═════════════════════════════════════════════════════════════════════════════
+tol         = syminfo.mintick * 0.5
+noLowerWick = (open - low)  < tol
+noUpperWick = (high - open) < tol
+bullBody    = close > open
+bearBody    = close < open
+mkLong      = i_longOn  and noLowerWick and (i_dirNoWick ? bullBody : true) and high > low
+mkShort     = i_shortOn and noUpperWick and (i_dirNoWick ? bearBody : true) and high > low
+
+if newBar and tfMatch
+    if mkLong
+        st = Setup.new(dir = 1, level = low, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
+             frozenSw = f_pickSwing(true, low), frozenCh = chochLo)
+        if i_showLevels
+            st.ln := line.new(bar_index, low, bar_index + 1, low, color = color.new(i_bullClr, 25),
+                 style = line.style_dotted, width = 1)
+        setups.push(st)
+        nSetups := nSetups + 1
+        if i_showArrows
+            arrowsArr.push(label.new(bar_index, na, "", yloc = yloc.belowbar,
+                 style = label.style_arrowup, color = i_bullClr, size = i_arrowSize))
+            f_trimLabels(arrowsArr, i_arrowKeep)
+    if mkShort
+        st = Setup.new(dir = -1, level = high, atr0 = atr, hi = high, lo = low, bar0 = bar_index,
+             frozenSw = f_pickSwing(false, high), frozenCh = chochHi)
+        if i_showLevels
+            st.ln := line.new(bar_index, high, bar_index + 1, high, color = color.new(i_bearClr, 25),
+                 style = line.style_dotted, width = 1)
+        setups.push(st)
+        nSetups := nSetups + 1
+        if i_showArrows
+            arrowsArr.push(label.new(bar_index, na, "", yloc = yloc.abovebar,
+                 style = label.style_arrowdown, color = i_bearClr, size = i_arrowSize))
+            f_trimLabels(arrowsArr, i_arrowKeep)
+
+    firstTm := na(firstTm) ? time : firstTm
+    lastTm  := time
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PLOTS
+// ═════════════════════════════════════════════════════════════════════════════
+plot(i_showRib ? rib1 : na, "Ribbon 1", color = color.new(#42A5F5, 30))
+plot(i_showRib ? rib2 : na, "Ribbon 2", color = color.new(#42A5F5, 45))
+plot(i_showRib ? rib3 : na, "Ribbon 3", color = color.new(#42A5F5, 60))
+plot(i_showRib ? rib4 : na, "Ribbon 4", color = color.new(#42A5F5, 70))
+plot(i_showRib ? rib5 : na, "Ribbon 5", color = color.new(#42A5F5, 80))
+plot(i_showST  ? stLine : na, "Supertrend",
+     color = stDir == -1 ? i_bullClr : i_bearClr, style = plot.style_linebr, linewidth = 2)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═════════════════════════════════════════════════════════════════════════════
+f_row(table tb, int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color = color.new(color.silver, 0), text_size = size.small,
+         text_halign = text.align_left, bgcolor = i_dashBg)
+    table.cell(tb, 1, r, v, text_color = vc, text_size = size.small,
+         text_halign = text.align_right, bgcolor = i_dashBg)
+
+closedN   = nWin + nLock + nLoss
+tpRate    = closedN > 0 ? nWin / closedN * 100.0 : 0.0
+posRate   = closedN > 0 ? (nWin + nLock) / closedN * 100.0 : 0.0
+pf        = grossLosR > 0 ? grossWinR / grossLosR : na
+grossNet  = grossWinR - grossLosR
+estCosts  = closedN * costR
+netAfter  = grossNet - estCosts
+ddCash    = maxDDR * i_riskPer1R
+propUsed  = i_propDD > 0 ? ddCash / i_propDD * 100.0 : na
+cushion   = i_propDD - ddCash
+maxPerR   = maxDDR > 0 ? i_propDD / maxDDR : na
+entPerDay = activeDays > 0 ? nEntries / activeDays : 0.0
+calDays   = na(firstTm) or na(lastTm) ? 0 : math.round((lastTm - firstTm) / 86400000.0)
+
+[blkLong, whyLong]   = f_sessBlocked(1, time)
+[blkShort, whyShort] = f_sessBlocked(-1, time)
+
+tfTxt = sigSec < 3600 ? str.tostring(sigSec / 60, "0") + "m" :
+     sigSec < 86400 ? str.tostring(sigSec / 3600, "0") + "h" : str.tostring(sigSec / 86400, "0") + "D"
+
+statusTxt = not tfMatch ? "Chart TF ≠ " + tfTxt :
+     trades.size() > 0 ? "In Trade" :
+     not f_dayOK(time) ? "Day Filter" :
+     blkLong and blkShort ? "Session Block" : "Active"
+statusClr = statusTxt == "Active" ? i_bullClr : statusTxt == "In Trade" ? color.new(#42A5F5, 0) : color.orange
+
+cUp   = i_bullClr
+cDn   = i_bearClr
+cWarn = color.orange
+cNeu  = color.new(color.white, 0)
+
+var table dash = table.new(dashPos, 2, 28, border_width = 1, border_color = color.new(color.black, 60))
+
+if barstate.islast and i_showDash
+    table.cell(dash, 0, 0, "NO WICK RETEST", text_color = color.white, text_size = size.small,
+         text_halign = text.align_left, bgcolor = color.new(color.black, 30))
+    table.cell(dash, 1, 0, tfTxt + " | " + str.tostring(rMultiple, "0.##") + "R",
+         text_color = color.white, text_size = size.small, text_halign = text.align_right,
+         bgcolor = color.new(color.black, 30))
+
+    f_row(dash, 1,  "Status", statusTxt, statusClr)
+    f_row(dash, 2,  "No-Wick Setups",     str.tostring(nSetups),  cNeu)
+    f_row(dash, 3,  "Confirmed Entries",  str.tostring(nEntries), cNeu)
+    f_row(dash, 4,  "Expired / Bad Stop",
+         str.tostring(nExpired) + " / " + str.tostring(nBadStop), nBadStop > 0 ? cWarn : cNeu)
+    f_row(dash, 5,  "Open Trades", str.tostring(trades.size()), trades.size() > 0 ? cWarn : cNeu)
+    f_row(dash, 6,  "Wins / Locked / Losses",
+         str.tostring(nWin) + " / " + str.tostring(nLock) + " / " + str.tostring(nLoss), cNeu)
+    f_row(dash, 7,  "TP Win Rate", str.tostring(tpRate, "0.00") + "%", tpRate >= 50 ? cUp : cDn)
+    f_row(dash, 8,  "Positive Exit Rate", str.tostring(posRate, "0.00") + "%", posRate >= 50 ? cUp : cDn)
+    f_row(dash, 9,  "Profit Factor (Gross)",
+         na(pf) ? "—" : str.tostring(pf, "0.00"), na(pf) ? cNeu : pf >= 1 ? cUp : cDn)
+    f_row(dash, 10, "Gross Net Profit", str.tostring(grossNet, "0.00") + "R", grossNet >= 0 ? cUp : cDn)
+    f_row(dash, 11, "Estimated Costs", str.tostring(estCosts, "0.00") + "R", cWarn)
+    f_row(dash, 12, "Net After Costs", str.tostring(netAfter, "0.00") + "R", netAfter >= 0 ? cUp : cDn)
+    f_row(dash, 13, "Max Closed Drawdown",
+         str.tostring(maxDDR, "0.00") + "R | $" + str.tostring(ddCash, "0.00"), cWarn)
+    f_row(dash, 14, "Prop DD Used",
+         na(propUsed) ? "—" : str.tostring(propUsed, "0.0") + "%",
+         na(propUsed) ? cNeu : propUsed >= 100 ? cDn : propUsed >= 75 ? cWarn : cUp)
+    f_row(dash, 15, "DD Cushion Remaining", "$" + str.tostring(cushion, "0.00"), cushion >= 0 ? cUp : cDn)
+    f_row(dash, 16, "Max $/R @ Hist. DD", na(maxPerR) ? "—" : "$" + str.tostring(maxPerR, "0.00"), cNeu)
+    f_row(dash, 17, "Worst Loss Streak", str.tostring(worstLoss), worstLoss >= 5 ? cWarn : cNeu)
+    f_row(dash, 18, "Entries / Active Day", str.tostring(entPerDay, "0.00"), cNeu)
+    f_row(dash, 19, "Long W/LK/L | Net",
+         str.tostring(nLongW) + "/" + str.tostring(nLongLk) + "/" + str.tostring(nLongL) +
+         " | " + str.tostring(longNetR, "0.00") + "R", longNetR >= 0 ? cUp : cDn)
+    f_row(dash, 20, "Short W/LK/L | Net",
+         str.tostring(nShrtW) + "/" + str.tostring(nShrtLk) + "/" + str.tostring(nShrtL) +
+         " | " + str.tostring(shortNetR, "0.00") + "R", shortNetR >= 0 ? cUp : cDn)
+    f_row(dash, 21, "NY AM Closed | Net",
+         str.tostring(nAM) + " | " + str.tostring(amNetR, "0.00") + "R", amNetR >= 0 ? cUp : cDn)
+    f_row(dash, 22, "NY PM Closed | Net",
+         str.tostring(nPM) + " | " + str.tostring(pmNetR, "0.00") + "R", pmNetR >= 0 ? cUp : cDn)
+    f_row(dash, 23, "Overnight Closed | Net",
+         str.tostring(nON) + " | " + str.tostring(onNetR, "0.00") + "R", onNetR >= 0 ? cUp : cDn)
+    f_row(dash, 24, "Last Rejection", lastReject, cWarn)
+    f_row(dash, 25, "Backtest Start",
+         na(firstTm) ? "—" : str.format_time(firstTm, "yyyy-MM-dd", i_perfTZ), cNeu)
+    f_row(dash, 26, "Backtest End",
+         na(lastTm) ? "—" : str.format_time(lastTm, "yyyy-MM-dd", i_perfTZ), cNeu)
+    f_row(dash, 27, "Calendar Days Tested", str.tostring(calDays, "0"), cNeu)
+
+// timeframe mismatch notice ---------------------------------------------------
+var label tfWarn = na
+if barstate.islast
+    label.delete(tfWarn)
+    if not tfMatch
+        tfWarn := label.new(bar_index, high, "NO WICK RETEST is idle:\nchart is " +
+             timeframe.period + ", signal timeframe is " + i_sigTF,
+             style = label.style_label_left, color = color.new(color.orange, 20),
+             textcolor = color.white, size = size.small)
