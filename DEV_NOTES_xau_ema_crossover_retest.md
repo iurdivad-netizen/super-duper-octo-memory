@@ -15,6 +15,7 @@
 | 4 | Stop loss at the 50 EMA | `pendStop = emaSlow - iSlBuf` |
 | 5 | Take profit = 2.5 × the stop distance | `actTp = actEntry + 2.5 * actR` |
 | + | The opposite 20/50 cross closes the trade | `crossExitLong` / `crossExitShort` |
+| + | The stop moves to break-even at 1R | `beTrigL` / `beTrigS` |
 | + | 1h trend must agree | `htfLongOk` / `htfShortOk` |
 | + | Trade retest number N, not necessarily the first | `lNumOk` / `sNumOk` |
 
@@ -88,6 +89,41 @@ loss here, exactly as it would be in the market.
 The stop level itself is frozen at the 50 EMA reading from the signal bar. **Trail the
 stop with the 50 EMA** (off by default, since it is not what was asked for) makes it
 follow the 50 EMA in the trade's favour, never backwards, and never past the current price.
+
+### Break-even at 1R
+
+Once price has travelled one stop distance in favour, the stop jumps from the 50 EMA to the
+entry price. On by default, trigger and offset both configurable.
+
+```pinescript
+beReady = iUseBe and inTrade and not beDone and not justIn and nz(actR, 0) > 0
+beTrigL = beReady and strategy.position_size > 0 and high >= actEntry + iBeAt * actR
+...
+actStop := math.max(nz(actStop, actEntry), actEntry + iBeOffset)
+```
+
+Four details behind those three lines:
+
+* **The bar's extreme, not its close.** `high >= entry + 1R` fires on the bar that actually
+  traded 1R. Waiting for a close above 1R would move the stop later than the trade earned it.
+* **Never on the fill bar.** In the resting-limit entry mode the bar's high can predate the
+  fill, which would trigger break-even on a move the trade never captured. `not justIn`
+  costs one bar of protection and removes a class of fake results from the backtest.
+* **`math.max`, so it only ever moves in the trade's favour.** Break-even and the optional
+  50 EMA trail both write to `actStop` and neither can pull it back.
+* **`beDone` latches per trade** and is reset on every fill, so a trade that comes back
+  through the entry does not re-trigger anything.
+
+**Break-even offset** shifts the level off the exact entry. Positive locks in a little and
+covers costs — 0.3-0.5 on XAUUSD roughly covers a typical spread, and a stop sitting exactly
+at the entry is a scratch *minus* commission. Negative leaves a cushion short of the entry
+so that a wick back through it does not scratch the trade.
+
+The trade-off is the point of testing it: at a 1R trigger with a 2.5R target, a real share
+of the trades that would have reached the target get scratched at break-even instead. It
+reliably improves the loss column and just as reliably costs some of the win column — which
+side wins is an empirical question on your data, not a general truth. Raising the trigger to
+1.5R or 2R is the usual middle ground.
 
 ### The opposite 20/50 cross as an exit
 
