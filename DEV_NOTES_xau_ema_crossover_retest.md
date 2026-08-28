@@ -16,6 +16,7 @@
 | 5 | Take profit = 2.5 × the stop distance | `actTp = actEntry + 2.5 * actR` |
 | + | The opposite 20/50 cross closes the trade | `crossExitLong` / `crossExitShort` |
 | + | The stop moves to break-even at 1R | `beTrigL` / `beTrigS` |
+| + | Part of the position comes off at 1R | `ID_LTP1` / `ID_STP1` |
 | + | 1h trend must agree | `htfLongOk` / `htfShortOk` |
 | + | Trade retest number N, not necessarily the first | `lNumOk` / `sNumOk` |
 
@@ -89,6 +90,41 @@ loss here, exactly as it would be in the market.
 The stop level itself is frozen at the 50 EMA reading from the signal bar. **Trail the
 stop with the 50 EMA** (off by default, since it is not what was asked for) makes it
 follow the 50 EMA in the trade's favour, never backwards, and never past the current price.
+
+### Partial take profit at 1R
+
+A limit order takes `Percent of the position to close` (default 50 %) off at 1R; the runner
+carries on to the full target, the opposite cross, or the stop.
+
+```pinescript
+if iUsePartial and not tp1Done
+    strategy.exit(ID_LTP1, ID_LONG, qty_percent = iTp1Pct, limit = actEntry + iTp1At * actR,
+         stop = actStop, comment_profit = "TP1", comment_loss = "SL")
+strategy.exit(ID_LEXIT, ID_LONG, stop = actStop, limit = tpLevel, ...)
+```
+
+* **Why `tp1Done` has to latch.** `strategy.exit()` called again with an ID that has already
+  filled places a *new* order — so without the latch, every bar after the partial would skim
+  another slice off the runner. `tp1Fill` detects it the only way that is reliable here: the
+  open position shrank while the trade is still open. Nothing else reduces a position in this
+  script (pyramiding is 0).
+* **Both legs carry the stop.** While the partial is pending there are two exit orders
+  against the same entry, each with `stop = actStop`. If the stop is hit, both fire and the
+  position closes in full; the emulator caps the total at the open quantity. Both legs are
+  also re-issued every bar, so a stop moved to break-even moves for the runner *and* the
+  partial.
+* **A partial at or beyond the target does nothing** — it can never fill before the target
+  does. Keep `Partial trigger (R)` below the take-profit multiple.
+* **Fractional quantities.** On XAUUSD brokers generally accept fractional lots, so 50 % of
+  1 unit is 0.5. On an instrument that only trades whole contracts the emulator rounds, and a
+  1-contract position cannot be split at all — raise the quantity or the partial does nothing.
+
+Paired with break-even at the same 1R, the trade becomes: bank half at 1R, run the rest at no
+risk. That is the usual reason to want both, and it is also why the two together change the
+distribution so much — a much higher share of small wins and scratches, a much lower share of
+full 2.5R winners. Compare it against the plain 2.5R version on the same period before
+deciding it is an improvement; the equity curve gets smoother, but smoother is not the same
+as better.
 
 ### Break-even at 1R
 
