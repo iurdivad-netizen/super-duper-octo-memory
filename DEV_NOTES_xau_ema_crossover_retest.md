@@ -14,6 +14,8 @@
 | 3 | Enter on the retest | `longTrigger` → `strategy.entry` |
 | 4 | Stop loss at the 50 EMA | `pendStop = emaSlow - iSlBuf` |
 | 5 | Take profit = 2.5 × the stop distance | `actTp = actEntry + 2.5 * actR` |
+| + | 1h trend must agree | `htfLongOk` / `htfShortOk` |
+| + | Trade retest number N, not necessarily the first | `lNumOk` / `sNumOk` |
 
 Shorts are the exact mirror and can be turned off with **Trade direction → Long only**.
 
@@ -95,6 +97,63 @@ follow the 50 EMA in the trade's favour, never backwards, and never past the cur
 * **Invalid fill** — if the fill lands on the wrong side of its own stop (a gap through the
   50 EMA), the position is flattened instead of running an inverted bracket.
 
+### Higher-timeframe (1h) confluence
+
+The 15m retest is only taken when the 1h agrees with it. One `request.security` call
+fetches the 1h fast EMA, slow EMA and close — plus their previous values — with
+`barmerge.gaps_off, barmerge.lookahead_off`, so no future data reaches the backtest.
+
+Four rules, longs shown (shorts are the mirror):
+
+| Rule | Passes when |
+|------|-------------|
+| **1h 20 EMA above the 1h 50 EMA** (default) | `eFast > eSlow` |
+| **1h price above the 1h 50 EMA** | `eClose > eSlow` |
+| **Both of the above** | both |
+| **Both, and the 1h 50 EMA sloping the right way** | both, plus `eSlow > eSlow[1]` |
+
+**Use the last CLOSED 1h bar** (on by default) is the setting that decides whether the
+filter is honest. With it ON the script reads the previous, completed 1h bar in history and
+in real time alike, so a 15m signal means the same thing live as it does in the backtest.
+With it OFF, live trading uses the forming 1h bar while history can only ever show closed
+ones — the two diverge, and the backtest stops describing what you will actually get.
+
+The filter gates entries, not arming. A cross can arm the setup while the 1h is still
+undecided and become tradeable by the time the retest arrives — which is often exactly how
+a good pullback develops.
+
+The confluence timeframe is an input, so "1h" is only the default; the dashboard warns if
+it is set below the chart timeframe.
+
+### Enter on retest number N
+
+`Enter on retest number N` skips the first N-1 touches of the 20 EMA after a cross. The
+first pullback into a fresh cross is the one most likely to just keep going; N = 2 or 3
+trades a trend that has already held the 20 EMA at least once.
+
+Counting distinct retests is the part that needs care. A cluster of bars sitting on the
+20 EMA is **one** retest, not six, so a touch is only counted once price has pulled away
+again:
+
+```pinescript
+if lTouch
+    lCount := lCount + 1
+    lRef   := high      // the pull-away measurement restarts here
+```
+
+`lRef` is the highest high since the cross *or since the last counted retest*, and the
+same `Required pull-away (× ATR)` threshold that gates the first touch also gates every
+subsequent one. Setting the pull-away multiplier to 0 removes that separation, and then
+every touching bar counts as its own retest — worth knowing before combining `0` with a
+high N.
+
+`That retest only` restricts entries to exactly retest N; with it off, retest N and every
+retest after it qualify. In the resting-limit entry mode the fill *is* the touch, so the
+order is only parked when a fill would be retest number N.
+
+Turn on **Number the retests on the chart** while tuning N — it prints 1, 2, 3 … on each
+touch so you can see what the count is actually doing on your data.
+
 ### One trade per cross
 
 By default a filled retest spends the setup: the script then waits for the next 20/50
@@ -153,3 +212,9 @@ points, and closed-trade stats (count, win rate, profit factor, net P&L).
   plans) is the fix if that matters for your sample.
 * **The retest window is measured in bars, not in structure.** A setup that pulls back over
   a weekend gap will age out on bar count.
+* **A high N and a short retest window fight each other.** Waiting for retest 3 inside a
+  40-bar window leaves very little room; raise `Retest must happen within N bars` (or set it
+  to 0) when raising N, and watch the trade count on the dashboard.
+* **The 1h filter costs trades.** Stacking it with a high N can cut the sample to a handful
+  over a year of 15m data. Two filters that each look sensible can leave nothing behind
+  worth measuring.
