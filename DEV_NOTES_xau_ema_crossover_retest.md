@@ -14,6 +14,7 @@
 | 3 | Enter on the retest | `longTrigger` → `strategy.entry` |
 | 4 | Stop loss at the 50 EMA | `pendStop = emaSlow - iSlBuf` |
 | 5 | Take profit = 2.5 × the stop distance | `actTp = actEntry + 2.5 * actR` |
+| + | The opposite 20/50 cross closes the trade | `crossExitLong` / `crossExitShort` |
 | + | 1h trend must agree | `htfLongOk` / `htfShortOk` |
 | + | Trade retest number N, not necessarily the first | `lNumOk` / `sNumOk` |
 
@@ -87,6 +88,40 @@ loss here, exactly as it would be in the market.
 The stop level itself is frozen at the 50 EMA reading from the signal bar. **Trail the
 stop with the 50 EMA** (off by default, since it is not what was asked for) makes it
 follow the 50 EMA in the trade's favour, never backwards, and never past the current price.
+
+### The opposite 20/50 cross as an exit
+
+For an open long, the 20 EMA crossing back under the 50 EMA is the signal that got you in
+going away. **Take profit / exit** decides what that is worth:
+
+| Mode | Behaviour |
+|------|-----------|
+| **R multiple or the opposite cross, whichever comes first** (default) | The 2.5R limit is live *and* a cross closes the trade early |
+| **Fixed R multiple only** | The original behaviour — 2.5R or the stop, the cross is ignored |
+| **Opposite 20/50 cross only** | No limit order at all; the trade runs until the cross or the stop |
+
+Cross-only lets a trend run well past 2.5R, at the cost of giving open profit back when it
+turns — the cross is a lagging signal by construction. Whichever-comes-first caps the
+upside at 2.5R but stops a stalled trade from riding all the way back to the 50 EMA stop.
+They are genuinely different systems; backtest both before picking.
+
+Two implementation points that matter:
+
+* **The bracket stays live while the close is in flight.** `strategy.close()` is a market
+  order that fills at the *next* bar's open, so the stop has to cover the bar in between.
+  The `strategy.exit` call is made first and unconditionally; only then is the close sent.
+* **In cross-only mode the limit is `na`, not a far-away price.** `limit = tpLevel` with
+  `tpLevel = na` places no limit order at all, rather than a target that silently caps the
+  trade.
+
+**Only close on the cross when the trade is in profit** (off by default) turns the cross
+into a strict take-profit: a cross while the trade is underwater is ignored and the 50 EMA
+stop is left to do its job. Off, the cross closes the trade either way — which is the more
+defensible reading, since the premise for the trade is gone regardless of the P&L.
+
+Note this exit fires on the same bar that arms the setup in the opposite direction, which
+is intended: the long is closed at the next open, and the short then waits for its own
+retest before it can enter.
 
 ### Guards that skip a trade rather than take a bad one
 
@@ -207,6 +242,9 @@ points, and closed-trade stats (count, win rate, profit factor, net P&L).
 
 * **Net position only.** Pine strategies hold one position, so a short signal appearing
   while a long is open is skipped, not stacked. `flat` is part of every entry permission.
+* **A cross exit is one bar late by design.** It is detected at the close of the crossing
+  bar and filled at the next open. On a fast reversal the stop can be hit first — that is
+  the honest result, not a modelling error.
 * **Intrabar order of stop vs target is unknown.** When a single bar spans both levels, the
   broker emulator resolves it by its own assumption, not by tick data. Bar Magnifier (paid
   plans) is the fix if that matters for your sample.

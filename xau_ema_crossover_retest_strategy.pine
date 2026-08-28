@@ -11,7 +11,8 @@
 //               - the 1h trend agrees (confluence filter), and
 //               - it is retest number N of this cross
 //          4. stop loss at the 50 EMA
-//          5. take profit = 2.5 x the stop distance
+//          5. take profit = 2.5 x the stop distance, and/or the trade is
+//             closed when the 20 EMA crosses back through the 50 EMA
 //
 //   SHORT  the exact mirror (20 EMA crosses below the 50 EMA, retest from
 //          underneath, stop at the 50 EMA above). Shorts can be switched off
@@ -48,6 +49,10 @@
 //   * "Retest number N" counts EPISODES, not bars: a touch is only counted once
 //     price has pulled away from the 20 EMA again, so a run of bars sitting on
 //     the EMA is one retest rather than six.
+//
+//   * The opposite 20/50 cross can close the trade: as the only exit target, or
+//     alongside the 2.5R limit with whichever comes first taking it. The stop
+//     stays live while a market close is on its way to the next bar's open.
 //
 // Intended chart timeframe: 15 minutes. The script warns on the dashboard if it
 // is loaded on anything else — the EMAs are read from the chart timeframe, so a
@@ -96,6 +101,10 @@ EM_LIMIT = "Resting limit order at the 20 EMA"
 DIR_BOTH  = "Both"
 DIR_LONG  = "Long only"
 DIR_SHORT = "Short only"
+
+TP_RR    = "Fixed R multiple only"
+TP_CROSS = "Opposite 20/50 cross only"
+TP_FIRST = "R multiple or the opposite cross, whichever comes first"
 
 HTF_EMA   = "1h 20 EMA above the 1h 50 EMA"
 HTF_PRICE = "1h price above the 1h 50 EMA"
@@ -181,7 +190,19 @@ iHtfClosed = input.bool(true, "Use the last CLOSED 1h bar", group = grpHtf,
 // ═════════════════════════════════════════════════════════════════════════════
 // INPUTS — RISK
 // ═════════════════════════════════════════════════════════════════════════════
-iRR       = input.float(2.5, "Take profit (x the stop distance)", minval = 0.1, step = 0.1, group = grpRisk)
+iTpMode   = input.string(TP_FIRST, "Take profit / exit", options = [TP_FIRST, TP_RR, TP_CROSS], group = grpRisk,
+     tooltip = "R multiple only : the original fixed target. The trade runs to 2.5R or the stop.\n" +
+               "Opposite cross only : no limit order at all — the trade is closed when the 20 EMA crosses " +
+               "back through the 50 EMA. Lets a trend run past 2.5R, gives back open profit when it turns.\n" +
+               "Whichever comes first : the 2.5R limit is live AND the cross closes the trade early if it " +
+               "happens before the target is hit.")
+iRR       = input.float(2.5, "Take profit (x the stop distance)", minval = 0.1, step = 0.1, group = grpRisk,
+     tooltip = "Ignored when the exit mode is 'Opposite 20/50 cross only'.")
+iCrossProfitOnly = input.bool(false, "Only close on the cross when the trade is in profit", group = grpRisk,
+     tooltip = "OFF (default): the opposite cross closes the trade either way — the signal that got you in " +
+               "has reversed.\n" +
+               "ON: the cross is treated strictly as a take-profit. A cross while the trade is underwater " +
+               "is ignored and the 50 EMA stop is left to do its job.")
 iSlBuf    = input.float(0.0, "Stop buffer beyond the 50 EMA (price points)", minval = 0.0, step = 0.1,
      group = grpRisk,
      tooltip = "Pushes the stop past the 50 EMA so it is not hit by a one-tick poke. On XAUUSD, " +
@@ -477,6 +498,12 @@ if iEntryMode == EM_LIMIT
 // EXIT MANAGEMENT
 // Levels are built from the ACTUAL fill price, then held as live bracket orders.
 // ═════════════════════════════════════════════════════════════════════════════
+// Exit mode switches. crossDn / crossUp are the same series that arm the setups —
+// for an open long, the 20 EMA crossing back under the 50 EMA is the signal that
+// got you in going away.
+useRrTp    = iTpMode != TP_CROSS
+useCrossTp = iTpMode != TP_RR
+
 var float actEntry = na
 var float actStop  = na
 var float actTp    = na
@@ -499,18 +526,32 @@ if justIn
 // trade left in it — flatten instead of running an inverted bracket.
 badFill = justIn and (strategy.position_size > 0 ? actEntry <= nz(actStop, actEntry) : actEntry >= nz(actStop, actEntry))
 
+// The opposite 20/50 cross as an exit. Checked against the ACTUAL entry price,
+// so "in profit" means what it says.
+crossProfitL   = not iCrossProfitOnly or close > nz(actEntry, close)
+crossProfitS   = not iCrossProfitOnly or close < nz(actEntry, close)
+crossExitLong  = inTrade and strategy.position_size > 0 and useCrossTp and crossDn and crossProfitL
+crossExitShort = inTrade and strategy.position_size < 0 and useCrossTp and crossUp and crossProfitS
+
 if inTrade
     if badFill
         strategy.close_all(comment = "invalid stop")
     else
+        // The bracket stays live either way — a market close fills at the next
+        // bar's open, and the stop has to cover the bar in between.
+        float tpLevel = useRrTp ? actTp : na
         if strategy.position_size > 0
             if iTrailSlow and not justIn
                 actStop := math.max(nz(actStop, emaSlow - iSlBuf), math.min(emaSlow - iSlBuf, close))
-            strategy.exit(ID_LEXIT, ID_LONG, stop = actStop, limit = actTp, comment_loss = "SL", comment_profit = "TP")
+            strategy.exit(ID_LEXIT, ID_LONG, stop = actStop, limit = tpLevel, comment_loss = "SL", comment_profit = "TP")
+            if crossExitLong
+                strategy.close(ID_LONG, comment = "20/50 cross")
         else
             if iTrailSlow and not justIn
                 actStop := math.min(nz(actStop, emaSlow + iSlBuf), math.max(emaSlow + iSlBuf, close))
-            strategy.exit(ID_SEXIT, ID_SHORT, stop = actStop, limit = actTp, comment_loss = "SL", comment_profit = "TP")
+            strategy.exit(ID_SEXIT, ID_SHORT, stop = actStop, limit = tpLevel, comment_loss = "SL", comment_profit = "TP")
+            if crossExitShort
+                strategy.close(ID_SHORT, comment = "20/50 cross")
 
 // ═════════════════════════════════════════════════════════════════════════════
 // ALERTS
@@ -521,8 +562,12 @@ if justIn and not badFill
           '","symbol":"' + syminfo.ticker +
           '","entry":' + str.tostring(actEntry, format.mintick) +
           ',"stop":'   + str.tostring(actStop,  format.mintick) +
-          ',"target":' + str.tostring(actTp,    format.mintick) +
+          ',"target":' + (useRrTp ? str.tostring(actTp, format.mintick) : "null") +
           ',"rr":'     + str.tostring(iRR, "#.##") + '}', alert.freq_once_per_bar)
+
+if (crossExitLong or crossExitShort) and not badFill
+    alert('{"strategy":"XAU 20/50 retest","action":"close","reason":"opposite 20/50 cross","symbol":"' +
+          syminfo.ticker + '","price":' + str.tostring(close, format.mintick) + '}', alert.freq_once_per_bar)
 
 if crossUp and iDir != DIR_SHORT
     alert("XAU 20/50 — bullish cross, watching for the retest of the 20 EMA", alert.freq_once_per_bar)
@@ -640,8 +685,12 @@ if iShowDash and barstate.islast
     table.cell(dash, 1, 10, inTrade ? f_px(actStop) + "  (" + str.tostring(actR, "#.##") + " pts)" : "—",
          text_color = color.red, text_size = size.tiny)
 
-    table.cell(dash, 0, 11, "Target (" + str.tostring(iRR, "#.##") + "R)", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 11, inTrade ? f_px(actTp) : "—", text_color = color.green, text_size = size.tiny)
+    string tgtLbl = useRrTp ? "Target (" + str.tostring(iRR, "#.##") + "R)" : "Target"
+    string tgtTxt = not inTrade ? "—"
+         : not useRrTp ? "opposite 20/50 cross"
+         : f_px(actTp) + (useCrossTp ? "  or the cross" : "")
+    table.cell(dash, 0, 11, tgtLbl, text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 11, tgtTxt, text_color = color.green, text_size = size.tiny)
 
     table.cell(dash, 0, 12, "Trades · win% · PF", text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 12, str.tostring(nClosed) + " · " +
