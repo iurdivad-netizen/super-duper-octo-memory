@@ -54,6 +54,10 @@
 //     alongside the 2.5R limit with whichever comes first taking it. The stop
 //     stays live while a market close is on its way to the next bar's open.
 //
+//   * The stop moves to break-even once price has travelled 1R in favour. It is
+//     measured on the bar's extreme (price genuinely traded 1R), never on the
+//     fill bar, and it only ever moves the stop in the trade's favour.
+//
 // Intended chart timeframe: 15 minutes. The script warns on the dashboard if it
 // is loaded on anything else — the EMAs are read from the chart timeframe, so a
 // different chart timeframe is a different system.
@@ -213,6 +217,18 @@ iMinStop  = input.float(0.5, "Minimum stop distance (price points)", minval = 0.
 iMaxStop  = input.float(0.0, "Maximum stop distance (price points, 0 = no limit)", minval = 0.0, step = 0.5,
      group = grpRisk,
      tooltip = "Skip the trade when the EMAs are stretched far apart and the 50 EMA stop would be huge.")
+iUseBe    = input.bool(true, "Move the stop to break-even once the trade reaches 1R", group = grpRisk,
+     tooltip = "The stop jumps from the 50 EMA to the entry price once price has travelled one stop " +
+               "distance in favour. Cuts the average loser, at the cost of a share of winners that would " +
+               "have gone on to 2.5R being scratched at break-even instead.")
+iBeAt     = input.float(1.0, "Break-even trigger (R)", minval = 0.1, step = 0.1, group = grpRisk,
+     tooltip = "How far in favour price must travel, measured in stop distances. 1.0 = the trade is up by " +
+               "exactly what it was risking.")
+iBeOffset = input.float(0.0, "Break-even offset (price points)", step = 0.1, group = grpRisk,
+     tooltip = "Positive pushes the stop past the entry to lock in a little and cover costs (0.3 - 0.5 on " +
+               "XAUUSD roughly covers a typical spread). Negative leaves a cushion short of the entry, so " +
+               "a wick back through the entry does not scratch the trade. 0 = exactly the entry price.")
+
 iTrailSlow = input.bool(false, "Trail the stop with the 50 EMA", group = grpRisk,
      tooltip = "OFF (default, and what was asked for): the stop stays where the 50 EMA was at entry. " +
                "ON: the stop follows the 50 EMA in the trade's favour and never moves back.")
@@ -508,6 +524,7 @@ var float actEntry = na
 var float actStop  = na
 var float actTp    = na
 var float actR     = na
+var bool  beDone   = false      // break-even already applied for this trade
 
 justIn  = strategy.position_size != 0 and nz(strategy.position_size[1], 0) == 0
 inTrade = strategy.position_size != 0
@@ -517,6 +534,7 @@ if justIn
     actStop  := pendStop
     actR     := math.abs(actEntry - nz(actStop, actEntry))
     actTp    := strategy.position_size > 0 ? actEntry + iRR * actR : actEntry - iRR * actR
+    beDone := false
     tradesToday += 1
     if not iRearm
         lArmed := false
@@ -525,6 +543,13 @@ if justIn
 // A fill on the wrong side of its own stop (gap through the 50 EMA) has no
 // trade left in it — flatten instead of running an inverted bracket.
 badFill = justIn and (strategy.position_size > 0 ? actEntry <= nz(actStop, actEntry) : actEntry >= nz(actStop, actEntry))
+
+// Break-even trigger. Measured against the bar's extreme, so it fires on the bar
+// that actually traded 1R, not on the first close above it — and never on the
+// fill bar itself, whose range in limit mode can predate the fill.
+beReady = iUseBe and inTrade and not beDone and not justIn and nz(actR, 0) > 0
+beTrigL = beReady and strategy.position_size > 0 and high >= actEntry + iBeAt * actR
+beTrigS = beReady and strategy.position_size < 0 and low  <= actEntry - iBeAt * actR
 
 // The opposite 20/50 cross as an exit. Checked against the ACTUAL entry price,
 // so "in profit" means what it says.
@@ -541,12 +566,18 @@ if inTrade
         // bar's open, and the stop has to cover the bar in between.
         float tpLevel = useRrTp ? actTp : na
         if strategy.position_size > 0
+            if beTrigL
+                actStop := math.max(nz(actStop, actEntry), actEntry + iBeOffset)
+                beDone  := true
             if iTrailSlow and not justIn
                 actStop := math.max(nz(actStop, emaSlow - iSlBuf), math.min(emaSlow - iSlBuf, close))
             strategy.exit(ID_LEXIT, ID_LONG, stop = actStop, limit = tpLevel, comment_loss = "SL", comment_profit = "TP")
             if crossExitLong
                 strategy.close(ID_LONG, comment = "20/50 cross")
         else
+            if beTrigS
+                actStop := math.min(nz(actStop, actEntry), actEntry - iBeOffset)
+                beDone  := true
             if iTrailSlow and not justIn
                 actStop := math.min(nz(actStop, emaSlow + iSlBuf), math.max(emaSlow + iSlBuf, close))
             strategy.exit(ID_SEXIT, ID_SHORT, stop = actStop, limit = tpLevel, comment_loss = "SL", comment_profit = "TP")
@@ -564,6 +595,11 @@ if justIn and not badFill
           ',"stop":'   + str.tostring(actStop,  format.mintick) +
           ',"target":' + (useRrTp ? str.tostring(actTp, format.mintick) : "null") +
           ',"rr":'     + str.tostring(iRR, "#.##") + '}', alert.freq_once_per_bar)
+
+if (beTrigL or beTrigS) and not badFill
+    alert('{"strategy":"XAU 20/50 retest","action":"modify","reason":"break-even at ' +
+          str.tostring(iBeAt, "#.##") + 'R","symbol":"' + syminfo.ticker +
+          '","stop":' + str.tostring(actStop, format.mintick) + '}', alert.freq_once_per_bar)
 
 if (crossExitLong or crossExitShort) and not badFill
     alert('{"strategy":"XAU 20/50 retest","action":"close","reason":"opposite 20/50 cross","symbol":"' +
@@ -681,9 +717,11 @@ if iShowDash and barstate.islast
     table.cell(dash, 0, 9, "Entry", text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 9, inTrade ? f_px(actEntry) : "—", text_color = color.white, text_size = size.tiny)
 
-    table.cell(dash, 0, 10, "Stop (50 EMA)", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 10, inTrade ? f_px(actStop) + "  (" + str.tostring(actR, "#.##") + " pts)" : "—",
-         text_color = color.red, text_size = size.tiny)
+    string stopTxt = not inTrade ? "—"
+         : f_px(actStop) + (beDone ? "  · at BE" : "  (" + str.tostring(actR, "#.##") + " pts risk)")
+    table.cell(dash, 0, 10, beDone ? "Stop (break-even)" : "Stop (50 EMA)",
+         text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 10, stopTxt, text_color = beDone ? color.yellow : color.red, text_size = size.tiny)
 
     string tgtLbl = useRrTp ? "Target (" + str.tostring(iRR, "#.##") + "R)" : "Target"
     string tgtTxt = not inTrade ? "—"
