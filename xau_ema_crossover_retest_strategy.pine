@@ -7,7 +7,9 @@
 //   LONG   1. the 20 EMA crosses ABOVE the 50 EMA            -> setup is armed
 //          2. price pulls away from the 20 EMA, then comes
 //             back and TOUCHES it                            -> retest
-//          3. entry on that retest
+//          3. entry on that retest, provided
+//               - the 1h trend agrees (confluence filter), and
+//               - it is retest number N of this cross
 //          4. stop loss at the 50 EMA
 //          5. take profit = 2.5 x the stop distance
 //
@@ -38,6 +40,14 @@
 //
 //   * Orders are created on a confirmed bar close and fill at the next bar's
 //     open (process_orders_on_close = false). Nothing repaints.
+//
+//   * The 1h confluence filter reads the last CLOSED 1h bar by default, so its
+//     verdict for a given 15m bar never changes afterwards and the backtest
+//     describes what live trading will do.
+//
+//   * "Retest number N" counts EPISODES, not bars: a touch is only counted once
+//     price has pulled away from the 20 EMA again, so a run of bars sitting on
+//     the EMA is one retest rather than six.
 //
 // Intended chart timeframe: 15 minutes. The script warns on the dashboard if it
 // is loaded on anything else — the EMAs are read from the chart timeframe, so a
@@ -70,10 +80,11 @@ strategy("XAUUSD EMA 20/50 Crossover + Retest", shorttitle = "XAU 20/50 RT",
 // ═════════════════════════════════════════════════════════════════════════════
 grpSig   = "1 · Signal — EMAs & retest"
 grpEntry = "2 · Entry model"
-grpRisk  = "3 · Stop loss & take profit"
-grpFilt  = "4 · Filters"
-grpSize  = "5 · Position sizing"
-grpDisp  = "6 · Display"
+grpHtf   = "3 · Higher-timeframe (1h) confluence"
+grpRisk  = "4 · Stop loss & take profit"
+grpFilt  = "5 · Filters"
+grpSize  = "6 · Position sizing"
+grpDisp  = "7 · Display"
 
 // ═════════════════════════════════════════════════════════════════════════════
 // MODE CONSTANTS
@@ -85,6 +96,11 @@ EM_LIMIT = "Resting limit order at the 20 EMA"
 DIR_BOTH  = "Both"
 DIR_LONG  = "Long only"
 DIR_SHORT = "Short only"
+
+HTF_EMA   = "1h 20 EMA above the 1h 50 EMA"
+HTF_PRICE = "1h price above the 1h 50 EMA"
+HTF_BOTH  = "Both of the above"
+HTF_ALL   = "Both, and the 1h 50 EMA sloping the right way"
 
 SZ_FIXED = "Fixed quantity"
 SZ_RISK  = "Risk % of equity"
@@ -117,6 +133,15 @@ iTouchBuf = input.float(0.0, "Touch tolerance (price points)", minval = 0.0, ste
 iInvalidSlow = input.bool(true, "Drop the setup if a bar closes through the 50 EMA", group = grpSig,
      tooltip = "Longs: a close below the 50 EMA cancels the armed setup. The retest premise is gone.")
 
+iRetestNum = input.int(1, "Enter on retest number N", minval = 1, maxval = 20, group = grpSig,
+     tooltip = "1 = the first touch of the 20 EMA after the cross (the classic setup).\n" +
+               "2 = skip the first touch and trade the second, and so on. The first pullback into a " +
+               "fresh cross is the one most likely to just keep going; waiting for the second or third " +
+               "retest trades a trend that has already held the 20 EMA once.")
+iRetestExact = input.bool(false, "That retest only", group = grpSig,
+     tooltip = "OFF: retest N and every retest after it are tradeable.\n" +
+               "ON: only retest number N. If it does not trigger, the setup is done.")
+
 // ═════════════════════════════════════════════════════════════════════════════
 // INPUTS — ENTRY MODEL
 // ═════════════════════════════════════════════════════════════════════════════
@@ -134,6 +159,24 @@ iRearm     = input.bool(false, "Allow a new trade on every later retest of the s
                "crossed the same way.")
 iConfirmed = input.bool(true, "Signals on confirmed bars only", group = grpEntry,
      tooltip = "Keep ON. Matters only if 'Recalculate on every tick' is enabled in Properties.")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS — HIGHER-TIMEFRAME CONFLUENCE
+// ═════════════════════════════════════════════════════════════════════════════
+iUseHtf   = input.bool(true, "Require higher-timeframe trend confluence", group = grpHtf,
+     tooltip = "Only take the 15m retest when the 1h agrees with it. Filters out the counter-trend " +
+               "crosses that produce most of the losses on gold.")
+iHtfTf    = input.timeframe("60", "Confluence timeframe", group = grpHtf)
+iHtfMode  = input.string(HTF_EMA, "Confluence rule", options = [HTF_EMA, HTF_PRICE, HTF_BOTH, HTF_ALL],
+     group = grpHtf,
+     tooltip = "Shorts require the mirror of whichever rule is selected.")
+iHtfFast  = input.int(20, "1h fast EMA", minval = 1, group = grpHtf)
+iHtfSlow  = input.int(50, "1h slow EMA", minval = 2, group = grpHtf)
+iHtfClosed = input.bool(true, "Use the last CLOSED 1h bar", group = grpHtf,
+     tooltip = "ON (recommended): the filter reads the last CLOSED 1h bar, in history and live alike, so " +
+               "a 15m signal means the same thing in the backtest as it does in real time.\n" +
+               "OFF: live, the still-forming 1h bar is used — but history can only ever show completed 1h " +
+               "bars, so live entries will differ from the ones the backtest shows.")
 
 // ═════════════════════════════════════════════════════════════════════════════
 // INPUTS — RISK
@@ -177,6 +220,10 @@ iRiskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, maxv
 iShowEmas   = input.bool(true,  "Plot the EMAs and the ribbon",   group = grpDisp)
 iShowMarks  = input.bool(true,  "Mark crosses and retests",       group = grpDisp)
 iShowLevels = input.bool(true,  "Plot the live stop / target",    group = grpDisp)
+iShowHtf    = input.bool(false, "Plot the 1h EMAs",               group = grpDisp)
+iNumRetests = input.bool(false, "Number the retests on the chart", group = grpDisp,
+     tooltip = "Prints 1, 2, 3 ... on each touch of the 20 EMA within the same cross. Turn it on while " +
+               "tuning 'Enter on retest number N'.")
 iShowDash   = input.bool(true,  "Show the dashboard",             group = grpDisp)
 iDashPos    = input.string("Top right", "Dashboard position",
      options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = grpDisp)
@@ -224,6 +271,40 @@ inSess   = not iUseSess or not na(sessTime)
 tfMinutes = timeframe.in_seconds(timeframe.period) / 60.0
 tfIs15    = math.abs(tfMinutes - 15.0) < 0.01
 
+// --- higher-timeframe trend confluence -------------------------------------
+// One request, current and previous values in the same tuple, so the "closed
+// bar only" option costs nothing extra and the slope is available either way.
+// lookahead_off + gaps_off: no future data leaks into the backtest.
+[hFast, hSlow, hClose, hFastP, hSlowP, hCloseP, hSlowP2] = request.security(
+     syminfo.tickerid, iHtfTf,
+     [ta.ema(close, iHtfFast), ta.ema(close, iHtfSlow), close,
+      ta.ema(close, iHtfFast)[1], ta.ema(close, iHtfSlow)[1], close[1],
+      ta.ema(close, iHtfSlow)[2]],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+eFast     = iHtfClosed ? hFastP  : hFast
+eSlow     = iHtfClosed ? hSlowP  : hSlow
+eClose    = iHtfClosed ? hCloseP : hClose
+eSlowPrev = iHtfClosed ? hSlowP2 : hSlowP
+
+htfReady = not na(eFast) and not na(eSlow) and not na(eClose) and not na(eSlowPrev)
+
+htfBull = switch iHtfMode
+    HTF_EMA   => eFast > eSlow
+    HTF_PRICE => eClose > eSlow
+    HTF_BOTH  => eFast > eSlow and eClose > eSlow
+    => eFast > eSlow and eClose > eSlow and eSlow > eSlowPrev
+
+htfBear = switch iHtfMode
+    HTF_EMA   => eFast < eSlow
+    HTF_PRICE => eClose < eSlow
+    HTF_BOTH  => eFast < eSlow and eClose < eSlow
+    => eFast < eSlow and eClose < eSlow and eSlow < eSlowPrev
+
+htfHigher  = timeframe.in_seconds(iHtfTf) >= timeframe.in_seconds(timeframe.period)
+htfLongOk  = not iUseHtf or (htfReady and htfBull)
+htfShortOk = not iUseHtf or (htfReady and htfBear)
+
 // ═════════════════════════════════════════════════════════════════════════════
 // SETUP STATE MACHINE
 // A cross arms a setup; the setup waits for the retest and can expire or be
@@ -231,34 +312,40 @@ tfIs15    = math.abs(tfMinutes - 15.0) < 0.01
 // ═════════════════════════════════════════════════════════════════════════════
 var bool  lArmed = false        // long setup armed, waiting for the retest
 var int   lCross = na           // bar_index of the arming cross
-var float lHigh  = na           // highest high since the cross (pull-away measure)
+var float lRef   = na           // highest high since the cross OR the last counted retest
+var int   lCount = 0            // how many retests of the 20 EMA this cross has produced
 
 var bool  sArmed = false
 var int   sCross = na
-var float sLow   = na
+var float sRef   = na
+var int   sCount = 0
 
 // --- arming / opposite-cross invalidation ---
 if crossUp
     lArmed := true
     lCross := bar_index
-    lHigh  := high
+    lRef   := high
+    lCount := 0
     sArmed := false
     sCross := na
-    sLow   := na
+    sRef   := na
+    sCount := 0
 
 if crossDn
     sArmed := true
     sCross := bar_index
-    sLow   := low
+    sRef   := low
+    sCount := 0
     lArmed := false
     lCross := na
-    lHigh  := na
+    lRef   := na
+    lCount := 0
 
-// --- running extremes since the cross ---
+// --- running extreme since the cross / since the last counted retest ---
 if lArmed
-    lHigh := math.max(nz(lHigh, high), high)
+    lRef := math.max(nz(lRef, high), high)
 if sArmed
-    sLow := math.min(nz(sLow, low), low)
+    sRef := math.min(nz(sRef, low), low)
 
 // --- expiry / structural invalidation ---
 lStale = lArmed and iMaxBars > 0 and (bar_index - nz(lCross, bar_index)) > iMaxBars
@@ -277,8 +364,8 @@ if sStale or sBreak
 lBars  = lArmed ? bar_index - nz(lCross, bar_index) : na
 sBars  = sArmed ? bar_index - nz(sCross, bar_index) : na
 
-lPullOk = lArmed and (nz(lHigh, high) - emaFast) >= iPullMult * atrVal
-sPullOk = sArmed and (emaFast - nz(sLow, low))   >= iPullMult * atrVal
+lPullOk = lArmed and (nz(lRef, high) - emaFast) >= iPullMult * atrVal
+sPullOk = sArmed and (emaFast - nz(sRef, low))   >= iPullMult * atrVal
 
 lAgeOk  = lArmed and nz(lBars, 0) >= iMinBars
 sAgeOk  = sArmed and nz(sBars, 0) >= iMinBars
@@ -287,12 +374,28 @@ sAgeOk  = sArmed and nz(sBars, 0) >= iMinBars
 lTouch = lArmed and lPullOk and lAgeOk and emaFast > emaSlow and low  <= emaFast + iTouchBuf and close > emaSlow
 sTouch = sArmed and sPullOk and sAgeOk and emaFast < emaSlow and high >= emaFast - iTouchBuf and close < emaSlow
 
+// Each touch is one retest. Resetting the pull-away reference to this bar's
+// extreme is what makes the count meaningful: price has to travel away from the
+// 20 EMA again before the NEXT touch counts, so a cluster of bars sitting on the
+// EMA is one retest, not six.
+if lTouch
+    lCount := lCount + 1
+    lRef   := high
+if sTouch
+    sCount := sCount + 1
+    sRef   := low
+
+// "Enter on retest number N" — and, unless 'That retest only' is on, on any
+// retest after it.
+lNumOk = iRetestExact ? lCount == iRetestNum : lCount >= iRetestNum
+sNumOk = iRetestExact ? sCount == iRetestNum : sCount >= iRetestNum
+
 // Confirmation: the touching bar closes back on the right side of the 20 EMA.
 lConf = lTouch and close > emaFast
 sConf = sTouch and close < emaFast
 
-longTrigger  = iEntryMode == EM_CONF ? lConf : iEntryMode == EM_TOUCH ? lTouch : false
-shortTrigger = iEntryMode == EM_CONF ? sConf : iEntryMode == EM_TOUCH ? sTouch : false
+longTrigger  = lNumOk and (iEntryMode == EM_CONF ? lConf : iEntryMode == EM_TOUCH ? lTouch : false)
+shortTrigger = sNumOk and (iEntryMode == EM_CONF ? sConf : iEntryMode == EM_TOUCH ? sTouch : false)
 
 // ═════════════════════════════════════════════════════════════════════════════
 // TRADE PERMISSIONS
@@ -305,8 +408,8 @@ flat      = strategy.position_size == 0
 barOk     = not iConfirmed or barstate.isconfirmed
 dayOk     = iMaxPerDay == 0 or tradesToday < iMaxPerDay
 baseOk    = flat and barOk and dayOk and inSess and not na(emaSlow) and not na(atrVal)
-longOk    = baseOk and iDir != DIR_SHORT
-shortOk   = baseOk and iDir != DIR_LONG
+longOk    = baseOk and iDir != DIR_SHORT and htfLongOk
+shortOk   = baseOk and iDir != DIR_LONG  and htfShortOk
 
 ID_LONG  = "Long"
 ID_SHORT = "Short"
@@ -347,7 +450,9 @@ if iEntryMode == EM_LIMIT
     float lDist    = emaFast - lStopLvl
     float lQty     = f_qty(lDist)
     bool  lSized   = lDist >= iMinStop and (iMaxStop == 0 or lDist <= iMaxStop) and lQty > 0
-    bool  lRest    = lArmed and lPullOk and lAgeOk and longOk and emaFast > emaSlow and lSized
+    // A fill on this resting order WOULD be retest number lCount + 1.
+    bool  lNumRest = iRetestExact ? (lCount + 1) == iRetestNum : (lCount + 1) >= iRetestNum
+    bool  lRest    = lArmed and lPullOk and lAgeOk and longOk and emaFast > emaSlow and lSized and lNumRest
 
     if lRest
         pendStop := lStopLvl
@@ -359,7 +464,8 @@ if iEntryMode == EM_LIMIT
     float sDist    = sStopLvl - emaFast
     float sQty     = f_qty(sDist)
     bool  sSized   = sDist >= iMinStop and (iMaxStop == 0 or sDist <= iMaxStop) and sQty > 0
-    bool  sRest    = sArmed and sPullOk and sAgeOk and shortOk and emaFast < emaSlow and sSized
+    bool  sNumRest = iRetestExact ? (sCount + 1) == iRetestNum : (sCount + 1) >= iRetestNum
+    bool  sRest    = sArmed and sPullOk and sAgeOk and shortOk and emaFast < emaSlow and sSized and sNumRest
 
     if sRest
         pendStop := sStopLvl
@@ -444,13 +550,27 @@ plotshape(iShowMarks and lTouch, title = "Long retest", style = shape.circle,
 plotshape(iShowMarks and sTouch, title = "Short retest", style = shape.circle,
      location = location.abovebar, color = color.new(color.fuchsia, 20), size = size.tiny)
 
+// 1h trend, drawn on the 15m chart
+plot(iShowHtf ? eFast : na, "1h fast EMA", color = color.new(color.aqua, 55),
+     linewidth = 1, style = plot.style_line)
+plot(iShowHtf ? eSlow : na, "1h slow EMA", color = color.new(color.orange, 55),
+     linewidth = 1, style = plot.style_line)
+
+// Retest numbering — makes "enter on retest N" tunable by eye
+if iNumRetests and lTouch
+    label.new(bar_index, low, str.tostring(lCount), style = label.style_label_up,
+         color = color.new(color.lime, 30), textcolor = color.black, size = size.tiny)
+if iNumRetests and sTouch
+    label.new(bar_index, high, str.tostring(sCount), style = label.style_label_down,
+         color = color.new(color.fuchsia, 30), textcolor = color.black, size = size.tiny)
+
 bgcolor(iShowMarks and (lArmed or sArmed) and not inTrade
      ? color.new(lArmed ? color.teal : color.red, 94) : na, title = "Setup armed")
 
 // ═════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ═════════════════════════════════════════════════════════════════════════════
-var table dash = table.new(f_tablePos(iDashPos), 2, 11,
+var table dash = table.new(f_tablePos(iDashPos), 2, 13,
      bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 60))
 
 if iShowDash and barstate.islast
@@ -461,6 +581,22 @@ if iShowDash and barstate.islast
          : "Flat — waiting for a 20/50 cross"
 
     color stateClr = inTrade ? color.yellow : (lArmed ? color.lime : sArmed ? color.orange : color.silver)
+
+    string htfTxt = not iUseHtf ? "off"
+         : not htfHigher        ? "⚠ below the chart timeframe"
+         : not htfReady         ? "no data"
+         : htfBull              ? "bullish — longs allowed"
+         : htfBear              ? "bearish — shorts allowed"
+         : "mixed — no entries"
+    color  htfClr = not iUseHtf or not htfReady ? color.silver
+         : not htfHigher ? color.orange
+         : htfBull ? color.lime : htfBear ? color.orange : color.red
+
+    int    reqN     = iRetestNum
+    int    seenN    = lArmed ? lCount : sArmed ? sCount : 0
+    string retestTx = (lArmed or sArmed)
+         ? str.tostring(seenN) + " of " + str.tostring(reqN) + (iRetestExact ? " (that one only)" : " needed")
+         : "—"
 
     int    nClosed = strategy.closedtrades
     float  winRate = nClosed > 0 ? 100.0 * strategy.wintrades / nClosed : na
@@ -483,24 +619,32 @@ if iShowDash and barstate.islast
     table.cell(dash, 0, 4, "EMA " + str.tostring(iSlowLen), text_color = color.silver, text_size = size.tiny)
     table.cell(dash, 1, 4, f_px(emaSlow), text_color = color.orange, text_size = size.tiny)
 
-    table.cell(dash, 0, 5, "Bars since cross", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 5, lArmed ? str.tostring(lBars) : sArmed ? str.tostring(sBars) : "—",
+    table.cell(dash, 0, 5, iHtfTf + " confluence", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 5, htfTxt, text_color = htfClr, text_size = size.tiny)
+
+    table.cell(dash, 0, 6, iHtfTf + " EMAs", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 6, iUseHtf ? f_px(eFast) + " / " + f_px(eSlow) : "—",
          text_color = color.white, text_size = size.tiny)
 
-    table.cell(dash, 0, 6, "Entry", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 6, inTrade ? f_px(actEntry) : "—", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 0, 7, "Bars since cross", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 7, lArmed ? str.tostring(lBars) : sArmed ? str.tostring(sBars) : "—",
+         text_color = color.white, text_size = size.tiny)
 
-    table.cell(dash, 0, 7, "Stop (50 EMA)", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 7, inTrade ? f_px(actStop) + "  (" + str.tostring(actR, "#.##") + " pts)" : "—",
+    table.cell(dash, 0, 8, "Retests so far", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 8, retestTx, text_color = color.white, text_size = size.tiny)
+
+    table.cell(dash, 0, 9, "Entry", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 9, inTrade ? f_px(actEntry) : "—", text_color = color.white, text_size = size.tiny)
+
+    table.cell(dash, 0, 10, "Stop (50 EMA)", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 10, inTrade ? f_px(actStop) + "  (" + str.tostring(actR, "#.##") + " pts)" : "—",
          text_color = color.red, text_size = size.tiny)
 
-    table.cell(dash, 0, 8, "Target (" + str.tostring(iRR, "#.##") + "R)", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 8, inTrade ? f_px(actTp) : "—", text_color = color.green, text_size = size.tiny)
+    table.cell(dash, 0, 11, "Target (" + str.tostring(iRR, "#.##") + "R)", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 11, inTrade ? f_px(actTp) : "—", text_color = color.green, text_size = size.tiny)
 
-    table.cell(dash, 0, 9, "Trades · win rate", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 9, str.tostring(nClosed) + " · " + (na(winRate) ? "—" : str.tostring(winRate, "#.#") + "%"),
-         text_color = color.white, text_size = size.tiny)
-
-    table.cell(dash, 0, 10, "Profit factor · net", text_color = color.silver, text_size = size.tiny)
-    table.cell(dash, 1, 10, (na(pf) ? "—" : str.tostring(pf, "#.##")) + " · " + str.tostring(strategy.netprofit, "#.#"),
+    table.cell(dash, 0, 12, "Trades · win% · PF", text_color = color.silver, text_size = size.tiny)
+    table.cell(dash, 1, 12, str.tostring(nClosed) + " · " +
+         (na(winRate) ? "—" : str.tostring(winRate, "#.#")) + " · " +
+         (na(pf) ? "—" : str.tostring(pf, "#.##")),
          text_color = strategy.netprofit >= 0 ? color.green : color.red, text_size = size.tiny)
