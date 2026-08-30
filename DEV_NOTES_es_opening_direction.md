@@ -149,68 +149,68 @@ a 40-point target beyond the median reach.
 ### Trading the retest of the 08:00 candle's level
 
 `backtest_es_retest.py` — note the 08:00 candle's direction, wait for price to
-leave its level, then enter in that direction when price comes back and touches
-the level (a resting limit, so the fill is the level itself). "The level" is
-ambiguous, so all four readings are tested: the **breakout** side (candle high
-for a bullish candle, low for a bearish one — the usual meaning), the candle's
-**close**, its **mid**point, and the **far** edge (a deeper pullback into the
-body). A retest arrives on 85–91% of sessions, so the sample barely shrinks.
+leave its level, then take the same direction when price comes back and touches
+it. "The level" is ambiguous, so all four readings are tested: the **breakout**
+side (candle high for a bullish candle, low for a bearish one — the usual
+meaning), the candle's **close**, its **mid**point, and the **far** edge.
 
-10/40 bracket, entry window 09:30–15:00, heuristic resolution:
+**Entry is the open of the candle after the retest candle** (`--fill next-open`,
+the default). That is how the trade is actually placed — the retest candle has
+to close before you can act on it — and it also removes the intrabar problem
+entirely: entry sits on a bar boundary, so **0%** of trades depend on an
+assumption. The first version of this test filled a limit at the level itself,
+which is optimistic and left 55% of trades assumption-dependent; those numbers
+are superseded by the ones below.
+
+A retest arrives on 85–91% of sessions. With `--require-hold`, the retest candle
+must also close back on the signal's side of the level — otherwise price simply
+went through it — which drops the sample to ~65% of sessions.
+
+10/40 bracket, entry window 09:30–15:00, all resolutions identical:
 
 | level | n | TP% | SL% | E[pts] | t | net $ | PF |
 |---|---|---|---|---|---|---|---|
-| breakout | 206 | 11.7 | 80.1 | **-3.00** | -2.57 | -30,850 | 0.65 |
-| close | 213 | 13.1 | 79.8 | -2.33 | -1.94 | -24,762 | 0.72 |
-| mid | 206 | 12.6 | 77.7 | -2.11 | -1.74 | -21,725 | 0.74 |
-| far | 199 | 17.1 | 72.4 | +0.52 | +0.38 | +5,162 | 1.07 |
+| breakout | 206 | 11.2 | 76.2 | -2.20 | -1.87 | -22,625 | 0.73 |
+| close | 213 | 13.1 | 76.1 | -1.57 | -1.29 | -16,688 | 0.81 |
+| mid | 206 | 12.6 | 77.2 | -2.04 | -1.69 | -21,012 | 0.75 |
+| far | 199 | 13.6 | 73.9 | -1.00 | -0.79 | -9,950 | 0.87 |
 
-**This is worse than entering on the clock.** The breakout retest — the reading
-most people mean — loses 3.00 points per trade against the -1.64 of the plain
-09:30 entry, and it is the first variant in this whole study with a t past 2.
-Three of the four levels lose on every resolution, pessimistic through
-optimistic. The only non-negative cell, `far`, is t = +0.38.
+Requiring the level to hold improves every cell without rescuing any of them:
 
-**The direction rule is again irrelevant.** At each level, running the same
-mechanic with the signal inverted, permanently long, and permanently short:
+| level | n | TP% | SL% | E[pts] | t | net $ | PF |
+|---|---|---|---|---|---|---|---|
+| breakout | 157 | 12.7 | 73.2 | -1.51 | -1.09 | -11,825 | 0.81 |
+| close | 159 | 13.2 | 71.7 | -0.63 | -0.44 | -5,000 | 0.92 |
+| mid | 161 | 11.8 | 74.5 | -1.68 | -1.24 | -13,550 | 0.79 |
+| far | 154 | 12.3 | 72.7 | -1.08 | -0.76 | -8,338 | 0.86 |
+
+Every level loses in the signal's direction, on both variants, and none of the
+losses is significant. Target-first stays in the 11–13% band against the 21%
+break-even — the same bracket geometry as every other test in this document.
+
+**The controls say the same thing as everywhere else.** Held retest, entry at
+the next candle's open, expectancy in points:
 
 | level | as specified | inverted | always long | always short |
 |---|---|---|---|---|
-| breakout | -3.00 | -0.77 | -1.89 | -1.98 |
-| close | -2.33 | -2.09 | -2.20 | -2.22 |
-| mid | -2.11 | -1.67 | -1.52 | -2.26 |
-| far | +0.52 | -2.91 | -0.69 | -1.70 |
+| breakout | -1.51 | **+2.28** (t +1.34) | -0.36 | +0.97 |
+| close | -0.63 | +2.07 (t +1.30) | +0.88 | +0.58 |
+| mid | -1.68 | +0.71 (t +0.46) | -0.04 | -0.97 |
+| far | -1.08 | +0.15 (t +0.09) | -0.79 | -0.16 |
 
-At the `close` and `mid` levels all four rules land within 0.7 points of each
-other. The retest *mechanic* is what loses; the 08:00 candle's direction is not
-adding or subtracting anything reliable.
+Fading the 08:00 candle on a held retest is the best-looking cell in the whole
+study (+2.28 pts, PF 1.33) and it still only reaches t = +1.34 on 138 trades —
+one of 16 cells tried, so nowhere near enough to act on. The consistent pattern
+across every test here is that the 08:00 direction is worth slightly *less* than
+nothing, and its inverse slightly more, with neither clearing noise.
 
-**A structural stop makes it worse, and shows why.** Sizing the stop beyond the
-candle's far edge instead of using a fixed 10 points — the normal way to trade a
-retest — gives, in R:
-
-| R:R | n | E[R] | t | pess .. opt |
-|---|---|---|---|---|
-| 1:1 | 206 | -0.416 | -6.35 | -0.562 .. +0.137 |
-| 1:2 | 206 | -0.356 | -4.03 | -0.538 .. +0.051 |
-| 1:3 | 206 | -0.238 | -2.13 | -0.478 .. -0.043 |
-| 1:4 | 206 | -0.262 | -2.11 | -0.533 .. -0.238 |
-
-The reason is in one number: **the median 08:00 candle spans 6.8 points**
-(p10 3.5, p90 15.2). Anchoring a stop to that candle puts it ~8 points from
-entry, against a median adverse excursion of ~24 points once RTH is running.
-The stop is inside the noise *by construction*, and at 1:2 every direction rule
-loses about the same (-0.33 to -0.40 R, t = -3.6 to -4.5).
-
-**Caveat, and it is a real one.** Unlike the fixed-time tests, which had 0%
-assumption-dependent trades, **~55% of retest trades are assumption-dependent at
-15m resolution**: once price touches the level mid-bar, that bar's remaining
-path is unknown, and a 10-point stop often sits inside it. That is why the
-pessimistic and optimistic columns diverge so far (breakout: -5.29 vs -2.75).
-Settling those trades needs 1-minute data. The conclusion survives anyway
-because even the optimistic bound is negative for three of the four levels — but
-the exact figures here carry more uncertainty than the rest of this document.
-
+**A structural stop makes it worse, and explains the family.** Sizing the stop
+beyond the candle's far edge instead of a fixed 10 points — the normal way to
+trade a retest — gives -0.36 R at 1:2 (t = -4.03), with all four direction rules
+between -0.33 and -0.40 R. The reason is one number: **the median 08:00 candle
+spans 6.8 points** (p10 3.5, p90 15.2). A stop anchored to that candle sits ~8
+points from entry against a ~24-point median adverse excursion once RTH runs, so
+it is inside the noise by construction.
 
 ### Fading the candle is not the answer either
 

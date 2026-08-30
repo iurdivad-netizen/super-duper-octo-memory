@@ -51,7 +51,7 @@ def level_of(signal_bar, direction, kind):
     return (hi + lo) / 2
 
 
-def find_trade(day, kind, direction, entry_start, entry_end):
+def find_trade(day, kind, direction, entry_start, entry_end, require_hold=False):
     """Walk the session; return (entry_level, bars_after_entry, entry_bar)."""
     level = level_of(day["signal"], direction, kind)
     armed = False
@@ -68,8 +68,45 @@ def find_trade(day, kind, direction, entry_start, entry_end):
             continue
         touched = bar["low"] <= level if direction > 0 else bar["high"] >= level
         if touched:
+            if require_hold:
+                # the level has to hold: the retest candle must close back on
+                # the signal's side of it, otherwise price simply went through
+                held = (bar["close"] >= level if direction > 0
+                        else bar["close"] <= level)
+                if not held:
+                    continue
             return level, day["session"][i + 1:], bar
     return None, None, None
+
+
+def resolve_from(entry, path, direction, stop, target, resolution):
+    """Bracket resolved from a bar-boundary entry: no intrabar assumption at
+    the entry itself, only the usual one if a later bar holds both levels."""
+    if direction > 0:
+        t_level, s_level = entry + target, entry - stop
+    else:
+        t_level, s_level = entry - target, entry + stop
+    for bar in path:
+        if direction > 0:
+            hit_t, hit_s = bar["high"] >= t_level, bar["low"] <= s_level
+        else:
+            hit_t, hit_s = bar["low"] <= t_level, bar["high"] >= s_level
+        if hit_t and hit_s:
+            if resolution == "pessimistic":
+                return "stop", -stop, True
+            if resolution == "optimistic":
+                return "target", target, True
+            up = bar["close"] >= bar["open"]
+            first = ("stop" if up else "target") if direction > 0 else \
+                    ("stop" if not up else "target")
+            return first, (target if first == "target" else -stop), True
+        if hit_t:
+            return "target", target, False
+        if hit_s:
+            return "stop", -stop, False
+    if not path:
+        return "no-exit", 0.0, False
+    return "eod", (path[-1]["close"] - entry) * direction, False
 
 
 def resolve(level, entry_bar, rest, direction, stop, target, resolution, exit_time):
@@ -137,7 +174,9 @@ def build(bars, signal_time, exit_time):
 
 
 def run(days, kind, mode, stop, target, cost, resolution, entry_start,
-        entry_end, exit_time):
+        entry_end, exit_time, fill="next-open", require_hold=False):
+    """fill='next-open': market order at the open of the bar after the touch.
+       fill='level':     resting limit at the level itself."""
     trades = []
     for day in days:
         d = 1 if day["signal"]["close"] >= day["signal"]["open"] else -1
@@ -147,15 +186,26 @@ def run(days, kind, mode, stop, target, cost, resolution, entry_start,
             d = 1
         elif mode == "short":
             d = -1
-        level, rest, entry_bar = find_trade(day, kind, d, entry_start, entry_end)
+        level, rest, entry_bar = find_trade(day, kind, d, entry_start, entry_end,
+                                            require_hold)
         if level is None:
             continue
-        outcome, pnl, amb = resolve(level, entry_bar, rest, d, stop, target,
-                                    resolution, exit_time)
+        if fill == "level":
+            entry = level
+            outcome, pnl, amb = resolve(level, entry_bar, rest, d, stop, target,
+                                        resolution, exit_time)
+        else:
+            path = [b for b in rest if b["ts"].time() <= exit_time]
+            if not path:
+                continue
+            entry = path[0]["open"]
+            outcome, pnl, amb = resolve_from(entry, path, d, stop, target,
+                                             resolution)
         if outcome == "no-exit":
             continue
         trades.append({"date": day["date"], "dir": d, "outcome": outcome,
-                       "pnl": pnl - cost, "ambiguous": amb})
+                       "pnl": pnl - cost, "ambiguous": amb,
+                       "slip": (level - entry) * d})
     return trades
 
 
@@ -209,6 +259,14 @@ def main():
     p.add_argument("--entry-start", default="09:30")
     p.add_argument("--entry-end", default="15:00")
     p.add_argument("--exit-time", default="15:45")
+    p.add_argument("--fill", choices=("next-open", "level"), default="next-open",
+                   help="'next-open': enter at the open of the candle after the "
+                        "retest candle (realistic, no intrabar assumption). "
+                        "'level': resting limit at the level itself.")
+    p.add_argument("--require-hold", action="store_true",
+                   help="the retest candle must close back on the signal's side "
+                        "of the level, so trades where price simply went through "
+                        "are skipped")
     p.add_argument("--tz-shift", type=int, default=0)
     args = p.parse_args()
 
@@ -219,7 +277,7 @@ def main():
           f"{days[0]['date']} -> {days[-1]['date']}")
     print(f"retest entry between {args.entry_start} and {args.entry_end}, "
           f"stop {args.stop:g} / target {args.target:g}, cost {args.cost:g}, "
-          f"flat after {args.exit_time}\n")
+          f"flat after {args.exit_time}, fill = {args.fill}\n")
 
     kinds = LEVELS if args.level == "all" else (args.level,)
     for kind in kinds:
@@ -227,14 +285,16 @@ def main():
         print(HEADER)
         for resolution in ("pessimistic", "heuristic", "optimistic"):
             s = summarise(run(days, kind, "signal", args.stop, args.target,
-                              args.cost, resolution, es, ee, xt))
+                              args.cost, resolution, es, ee, xt, args.fill,
+                              args.require_hold))
             if s:
                 print(line(resolution, s))
         print("  controls (heuristic) -- does the signal matter?")
         for mode, label in (("invert", "inverted"), ("long", "always long"),
                             ("short", "always short")):
             s = summarise(run(days, kind, mode, args.stop, args.target,
-                              args.cost, "heuristic", es, ee, xt))
+                              args.cost, "heuristic", es, ee, xt, args.fill,
+                              args.require_hold))
             if s:
                 print(line("  " + label, s))
         print()
