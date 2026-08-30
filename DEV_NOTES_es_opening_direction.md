@@ -82,6 +82,70 @@ Expectancy in ES points per trade, net of 0.5 points cost, 08:00 signal and
 The best cell (20/25) is t = +0.97 and it is the best of 56 tried — that is
 what the maximum of 56 noisy draws looks like, not an edge.
 
+### Entering at 10:00 instead of 09:30
+
+Delaying the entry does help mechanically — the opening noise is behind you, so
+fewer trades are killed immediately:
+
+| | 09:30 entry | 10:00 entry |
+|---|---|---|
+| stopped inside the entry candle | 46.2% | 33.3% |
+| stop-first | 76.5% | 71.8% |
+| target-first | 13.2% | **17.1%** (break-even is 21%) |
+| expectancy | -1.64 pts | **+0.46 pts** |
+| net, 1 contract | -$19,150 | **+$5,388** |
+| profit factor | 0.80 | 1.06 |
+
+That flips the sign, and it is a real effect rather than a fluke of one month —
+but it does not make the strategy work, for three reasons.
+
+**1. The signal still contributes nothing.** Run the same 10:00 entry with the
+signal, with the signal inverted, and with the signal ignored entirely:
+
+| entry | as specified | inverted | always long | always short |
+|---|---|---|---|---|
+| 09:30 | -1.64 (t -1.41) | +0.93 (t +0.71) | -0.68 (t -0.56) | -0.02 (t -0.02) |
+| 09:45 | -1.38 (t -1.20) | +0.69 (t +0.54) | +0.30 (t +0.25) | -1.00 (t -0.83) |
+| **10:00** | **+0.46 (t +0.37)** | +0.47 (t +0.37) | +0.29 (t +0.24) | +0.64 (t +0.50) |
+| 10:15 | +0.99 (t +0.78) | +0.62 (t +0.49) | +0.91 (t +0.74) | +0.69 (t +0.54) |
+| 10:30 | -0.14 (t -0.12) | +0.27 (t +0.22) | +0.30 (t +0.26) | -0.18 (t -0.14) |
+| 11:00 | -0.42 (t -0.37) | -0.47 (t -0.40) | -1.96 (t -1.90) | +1.06 (t +0.84) |
+| 11:30 | -1.07 (t -0.99) | -1.62 (t -1.51) | -1.55 (t -1.49) | -1.14 (t -1.02) |
+| 12:00 | -0.48 (t -0.45) | -0.42 (t -0.38) | -1.17 (t -1.15) | +0.27 (t +0.24) |
+
+At 10:00 the signal (+0.46), its exact opposite (+0.47), a permanent long
+(+0.29) and a permanent short (+0.64) all return the same thing. Whatever
+improved between 09:30 and 10:00 improved for *every* direction rule equally,
+which is the definition of it not being the signal. No cell in the 32-cell grid
+reaches t = +0.85.
+
+**2. The bracket is still upside-down; the profit is end-of-day drift.**
+Decomposing the +107.8 point total:
+
+| outcome | trades | share | total pts | $ |
+|---|---|---|---|---|
+| target | 40 | 17.1% | +1,580.0 | +79,000 |
+| stop | 168 | 71.8% | -1,764.0 | -88,200 |
+| end of day | 26 | 11.1% | +291.8 | +14,588 |
+| **total** | **234** | | **+107.8** | **+5,388** |
+
+The bracket itself loses 184 points. Every point of profit — and then some —
+comes from the 26 sessions (11% of trades) where neither level was touched and
+price happened to drift the right way by the close. That is not the system
+described; it is a coin-flip directional position held to 16:00.
+
+**3. It is inside the noise, and one month carries it.** t = +0.37, bootstrap
+95% CI **-1.95 to +2.91** points per trade (-$22,775 to +$34,075). February 2026
+alone contributes +154.8 of the +107.8 point total (**144%**), and only 5 of 11
+months are profitable. Monthly, in points: `Oct -60, Nov -40, Dec -42, Jan -93,
+Feb +155, Mar +69, Apr +57, May -56, Jun +42, Jul +144, Aug -67`.
+
+A 56-cell stop/target sweep at the 10:00 entry puts 53 cells negative; 10/40 is
+the peak of that surface at t = +0.37. Median excursions from 10:00 are 24.0
+points favourable and 23.9 adverse — still a 10-point stop inside the noise with
+a 40-point target beyond the median reach.
+
+
 ### Fading the candle is not the answer either
 
 `--invert` returns +0.93 pts/trade (+$10,938), which looks like the inverse
