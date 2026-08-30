@@ -861,6 +861,8 @@ verdict.
 | `analyse_es_signal.py` | signal-quality test and the stop/target sweep above |
 | `backtest_es_retest.py` | the retest-of-the-level variant, four level definitions |
 | `screen_es_signals.py` | the bracket-free signal screen above |
+| `backtest_es_range_breakout.py` | the 08:00 range traded from 09:30, either timeframe |
+| `data/es1_3m_tradingview.csv` | 3-minute export, 45 sessions, used to validate resolution |
 | `data/es1_15m_tradingview.csv` | the ES 15m export the verdict rests on |
 | `data/es_trades_10_40.csv` | trade-by-trade log of the headline run |
 | `backtest_open_bracket.py` | the bracket study reported above |
