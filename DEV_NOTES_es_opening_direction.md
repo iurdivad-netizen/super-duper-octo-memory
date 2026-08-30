@@ -4,18 +4,109 @@
 direction for the day; take that direction at the 09:30 open; 10-point stop,
 40-point target.
 
-**Verdict: the bracket does not work, and the signal is not the reason.**
-A 10-point stop against a 40-point target from the 09:30 open needs the target
-to be hit first on **21%** of trades to break even. Measured on 520 sessions of
-S&P 500 RTH data, the target is hit first on **14–19%** of days under every
-direction rule that can be tested, and only **28.7%** even with perfect
-foresight of the day's direction. Every realistic rule lands within noise of
-zero (t = 0.1–0.8; 95% CI spans roughly ±$40,000 per contract over two years).
-Details, caveats and the significant data limitation are below.
+**Verdict: it loses, and both halves are broken.** Run on real ES 15m data
+(234 sessions, Oct 2025 – Aug 2026), the strategy as specified returns
+**-1.64 points per trade, -$19,150 per contract, PF 0.80, max drawdown
+-$22,925**. The 08:00 candle agrees with the session's direction **50.4%** of
+the time — a coin flip — and the 10-point stop is hit inside the 09:30 entry
+candle itself on **46%** of trades. The bracket needs a 21% target-first rate
+to break even and gets 13.2%.
+
+The proxy study that follows (520 sessions of S&P cash data) reached the same
+conclusion about the bracket before the ES data arrived, and predicted the
+target-first rate to within ~3 points.
 
 ---
 
-## The data limitation — read this first
+## Run on real ES 15m data (the definitive test)
+
+`data/es1_15m_tradingview.csv` — TradingView export of `CME_MINI:ES1!`, 15m,
+21,512 bars, 2025-09-30 → 2026-08-28, timestamps in exchange time with the DST
+offset per row. 234 sessions have both an 08:00 signal candle and an 09:30
+entry.
+
+```
+python3 backtest_es_15m.py data/es1_15m_tradingview.csv
+```
+
+| resolution | n | TP% | SL% | EOD% | E[pts] | net $ | maxDD $ | PF |
+|---|---|---|---|---|---|---|---|---|
+| pessimistic / heuristic / optimistic | 234 | 13.2 | 76.5 | 10.3 | **-1.64** | **-19,150** | -22,925 | 0.80 |
+
+All three columns are identical because **0.0%** of trades hit a 15m bar
+containing both levels — a 50-point spread rarely fits inside one ES 15m bar.
+The result is exact, not bounded.
+
+Split out:
+
+| cut | n | TP% | SL% | E[pts] | net $ |
+|---|---|---|---|---|---|
+| signal long | 121 | 11.6 | 78.5 | -2.34 | -14,138 |
+| signal short | 113 | 15.0 | 74.3 | -0.89 | -5,012 |
+| 2025 (from Oct) | 64 | 17.2 | 76.6 | -0.93 | -2,962 |
+| 2026 (to Aug) | 170 | 11.8 | 76.5 | -1.90 | -16,188 |
+
+### The 08:00 candle carries no directional information
+
+This is the half the proxy study could not measure. Measured directly, against
+the session's own 09:30-to-close direction:
+
+| | |
+|---|---|
+| signal agrees with the session direction | **50.4%** of 234 sessions (z = +0.13) |
+| mean move in the signal's direction | +0.80 pts (t = +0.27) |
+| median favourable excursion | 28.4 pts |
+| median adverse excursion | 26.5 pts |
+| **stopped out inside the 09:30 entry candle** | **46.2%** |
+
+A coin flip. And the excursion pair is the whole story in two numbers: the
+median trade goes 28.4 points your way and 26.5 points against you at some
+point in the session, so a 10-point stop with a 40-point target sits on the
+wrong side of both — it is far inside the noise and far outside the reach.
+
+### No stop/target pair rescues it
+
+Expectancy in ES points per trade, net of 0.5 points cost, 08:00 signal and
+09:30 entry held fixed:
+
+| stop \ target | 10 | 15 | 20 | 25 | 30 | 40 | 50 | 60 |
+|---|---|---|---|---|---|---|---|---|
+| 5 | -0.99 | -0.86 | -1.09 | -1.11 | -1.66 | -1.85 | -1.80 | -2.22 |
+| 10 | -0.88 | -0.94 | -0.70 | -0.68 | -1.14 | **-1.64** | -1.69 | -2.32 |
+| 15 | -0.41 | -0.68 | 0.06 | 0.40 | -0.09 | -0.56 | -0.55 | -1.17 |
+| 20 | -1.07 | -0.75 | 0.59 | *1.38* | 0.88 | 0.66 | 0.37 | 0.24 |
+| 25 | -0.98 | -0.56 | 0.61 | 1.32 | 1.01 | 0.88 | 0.38 | -0.09 |
+| 30 | -1.42 | -0.92 | -0.03 | 0.86 | 0.24 | 0.12 | -0.86 | -1.46 |
+| 40 | -1.93 | -1.45 | -0.28 | 0.59 | -0.51 | -0.59 | -1.85 | -2.26 |
+
+The best cell (20/25) is t = +0.97 and it is the best of 56 tried — that is
+what the maximum of 56 noisy draws looks like, not an edge.
+
+### Fading the candle is not the answer either
+
+`--invert` returns +0.93 pts/trade (+$10,938), which looks like the inverse
+trade works. It does not survive inspection:
+
+* t = +0.71, bootstrap 95% CI **-1.45 to +3.60** points per trade
+  (-$17,012 to +$42,138 over the sample);
+* target-first is 18.8%, still under the 21% break-even, so the money comes
+  from end-of-day exits rather than the target;
+* June 2026 alone contributes +226 points of the +219 point total — **103%**.
+  Remove one month and the edge is negative.
+
+Monthly, in points: `Oct +146, Nov +84, Dec +59, Jan +62, Feb -110, Mar -81,
+Apr +31, May -69, Jun +226, Jul -179, Aug +49`.
+
+Waiting for the 09:30 candle to close and entering at 09:45 (`--entry-mode
+close`) gives -0.96 pts/trade, and widening the signal window to the whole
+08:00–09:30 move gives -1.51. Neither changes the conclusion.
+
+
+---
+
+## The proxy study (run before the ES export arrived)
+
+### The data limitation
 
 The 08:00 ET signal candle could not be sourced in this environment:
 
@@ -162,14 +253,20 @@ zero-edge system looks like.
 
 ## What this does and does not settle
 
-**Settled:** the 10/40 bracket from the 09:30 open is not viable on the S&P in
-this sample. That conclusion does not depend on the direction rule, and it is
-what kills the idea as specified.
+**Settled on real ES data:** the 10/40 bracket from the 09:30 open is not
+viable, the 08:00 candle is a coin flip (50.4%, z = +0.13), no stop/target pair
+in a 56-cell sweep is significant, and the inverted signal's apparent profit is
+one month of luck.
 
-**Not settled:** whether the 08:00 candle carries directional information. It
-could not be measured here. But note what it would have to do: beat 21%
-target-first when perfect knowledge of the day's direction only reaches 28.7%.
-The 08:00 candle would have to be nearly as informative as knowing the close.
+**Settled by the proxy study:** the bracket fails on geometry alone,
+independently of the direction rule — which is why re-sizing the signal is not
+a way out. The proxy also called the target-first rate (14–19% predicted,
+13.2% actual) before the ES data existed.
+
+**Still open:** whether a *different* signal, at a *different* size, on this
+instrument could work. Nothing here speaks to that. What it does say is that
+the 09:30 open is a poor entry reference for a tight stop: 46% of trades were
+stopped inside the entry candle itself.
 
 **Proxy caveats:** SPY is not ES. ES trades overnight, has its own opening
 liquidity, and its RTH range is marginally wider in points; the ~10:1 ratio
@@ -230,11 +327,12 @@ So the choice is between:
   system, not this one, and one whose bracket still has to clear the 21%
   break-even hit rate documented above.
 
-## Running it on real ES data
+## Running the engine yourself
 
 `backtest_es_15m.py` implements the specification exactly — 08:00 signal candle,
-09:30 entry, 10/40 bracket, flat at the close — on a 15m ES export. A
-TradingView chart export works as is:
+09:30 entry, 10/40 bracket, flat at the close — on any 15m export. TradingView's
+format works as is (timestamps may carry a UTC offset; it is stripped so the
+exchange wall-clock is used):
 
 ```
 python3 backtest_es_15m.py ES_15m.csv
@@ -249,15 +347,20 @@ long-vs-short split. `--entry-mode close` waits for the 09:30 candle to close
 before entering; `--invert` trades against the signal; `--dollars-per-point 5`
 switches to MES.
 
-To get the file: TradingView → ES1! on a 15m chart with extended hours on →
-⋯ menu → Export chart data. A few years of 15m bars is enough to place the
-08:00 signal's hit rate inside about ±3%.
+To refresh or extend the file: TradingView → ES1! on a 15m chart with extended
+hours on → ⋯ menu → Export chart data. The 234-session sample here places the
+signal's agreement rate inside about ±6.5 points; a few years would halve that,
+but 50.4% is close enough to a coin flip that more data is unlikely to move the
+verdict.
 
 ## Files
 
 | file | what it is |
 |---|---|
 | `backtest_es_15m.py` | the specified strategy, on a real ES 15m export |
+| `analyse_es_signal.py` | signal-quality test and the stop/target sweep above |
+| `data/es1_15m_tradingview.csv` | the ES 15m export the verdict rests on |
+| `data/es_trades_10_40.csv` | trade-by-trade log of the headline run |
 | `backtest_open_bracket.py` | the bracket study reported above |
 | `data/spy_rth_sessions.csv` | 520 RTH sessions: open, am/pm high-low, close |
 | `data/spy_hourly_ambiguous.csv` | 1h bars for the 134 sessions needing finer resolution |

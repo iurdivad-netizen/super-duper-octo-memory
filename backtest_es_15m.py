@@ -43,8 +43,13 @@ def parse_timestamp(value):
     if v.isdigit() or (v.startswith("-") and v[1:].isdigit()):
         return dt.datetime.fromtimestamp(int(v), tz=dt.timezone.utc).replace(tzinfo=None)
     v = v.replace("T", " ").replace("Z", "")
-    if "+" in v[10:]:
-        v = v[:10] + v[10:].split("+")[0]
+    # strip a trailing UTC offset (+HH:MM / -HH:MM) so the wall-clock time is
+    # used as given -- a TradingView export is already stamped in exchange time
+    head, tail = v[:10], v[10:]
+    for sign in ("+", "-"):
+        if sign in tail:
+            tail = tail.split(sign)[0]
+    v = head + tail
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
                 "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%d/%m/%Y %H:%M"):
         try:
