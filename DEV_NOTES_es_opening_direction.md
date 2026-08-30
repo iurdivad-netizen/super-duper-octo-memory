@@ -232,6 +232,84 @@ close`) gives -0.96 pts/trade, and widening the signal window to the whole
 08:00–09:30 move gives -1.51. Neither changes the conclusion.
 
 
+## Signal screen: does anything predict the session's direction?
+
+`screen_es_signals.py` — fourteen candidates, no bracket, no stop, no target.
+The signal says up or down; the session goes up or down. A signal that cannot
+beat a coin flip here cannot be rescued by entry timing or trade management,
+which is the trap every earlier test in this document fell into.
+
+Outcomes: **close** (16:00 close vs the entry reference), **noon** (12:00 vs
+entry), and **first20** (did price travel +20 or -20 points first — the
+bracket-relevant one, decided on 221 of 235 sessions; the rest had both levels
+inside one 15m bar).
+
+**Scoring rule that matters:** a signal is never scored against a window
+containing its own move. Pre-open signals are measured from the 09:30 open;
+anything read off the 09:30 candle is measured from the **09:45** open — the
+first price you could actually trade once that candle has closed. Scored the
+sloppy way, the 09:30 candle "predicts" the day's close 64.8% of the time
+(z = +4.52) and first20 78.7% (z = +8.54). Both are artifacts of the candle's
+own move sitting inside the measurement window. Measured honestly they are
+51.1% and 52.7%.
+
+### Computable before 09:30
+
+| signal | n | close hit% | z | noon hit% | z | first20 hit% | z | 1st half | 2nd half |
+|---|---|---|---|---|---|---|---|---|---|
+| 08:00 candle | 232 | 50.0 | +0.00 | 47.4 | -0.78 | 52.3 | +0.67 | 56.5 | 43.6 |
+| 08:00 wide only | 80 | 51.2 | +0.22 | 48.8 | -0.22 | 55.7 | +1.01 | 68.8 | 39.6 |
+| 08:00 + gap agree | 125 | 45.6 | -0.98 | 45.2 | -1.07 | 47.5 | -0.54 | 44.3 | 46.9 |
+| 08:00–09:30 drift | 232 | 49.6 | -0.13 | 47.9 | -0.65 | 50.5 | +0.13 | 53.0 | 46.2 |
+| overnight gap | 232 | 45.3 | -1.44 | 47.4 | -0.78 | 45.0 | -1.48 | 37.4 | 53.0 |
+| open vs overnight mid | 233 | 52.4 | +0.72 | 53.2 | +0.98 | 51.1 | +0.34 | 53.4 | 51.3 |
+| overnight momentum | 233 | 46.4 | -1.11 | 49.8 | -0.07 | 47.1 | -0.87 | 47.4 | 45.3 |
+| open vs overnight mean | 233 | 51.5 | +0.46 | 53.2 | +0.98 | 49.3 | -0.20 | 51.7 | 51.3 |
+| prev day direction | 232 | 51.7 | +0.53 | 48.7 | -0.39 | 51.4 | +0.40 | 52.2 | 51.3 |
+| prev close in range | 232 | 54.3 | +1.31 | 53.0 | +0.92 | 50.9 | +0.27 | 49.6 | 59.0 |
+| 3-day momentum | 230 | 49.1 | -0.26 | 47.0 | -0.92 | 49.5 | -0.14 | 46.9 | 51.3 |
+| prior range break | 90 | 48.9 | -0.21 | 46.7 | -0.63 | 47.6 | -0.44 | 40.0 | 56.0 |
+
+### Read off the 09:30 candle, scored from 09:45
+
+| signal | n | close hit% | z | noon hit% | z | first20 hit% | z | 1st half | 2nd half |
+|---|---|---|---|---|---|---|---|---|---|
+| 09:30 candle | 235 | 51.1 | +0.33 | 54.0 | +1.24 | 52.7 | +0.81 | 53.8 | 48.3 |
+| 09:30 drive | 186 | 46.2 | -1.03 | 51.1 | +0.29 | 46.9 | -0.83 | 51.1 | 41.5 |
+
+**Nothing predicts direction.** Across 14 candidates and 3 outcomes the largest
+absolute z is 1.48, and that one is *negative* (the overnight gap, contrarian).
+With 42 comparisons a z of about 3 is the bar; nothing is close. Split-half
+stability is poor even for the better-looking rows — the 08:00 candle runs
+56.5% then 43.6%, "08:00 wide only" 68.8% then 39.6%.
+
+### What this sample could and could not have found
+
+235 sessions is a small screen. The smallest edge it can resolve at two standard
+errors is **56.4%**:
+
+| true hit rate | sessions needed (95%, 80% power) |
+|---|---|
+| 52% | ~4,900 (19 years) |
+| 53% | ~2,175 (9 years) |
+| 54% | ~1,223 (5 years) |
+| 55% | ~782 (3 years) |
+| 57% | ~398 (1.6 years) |
+
+So this screen does **not** prove no edge exists — a true 53–54% signal would
+almost certainly hide inside it. What it does prove is narrower and enough for
+the decision at hand: none of these candidates shows the kind of edge that could
+carry a 1:4 bracket, and a 53% directional signal would not either. The bracket
+needs a 21% target-first rate against the ~14% the market gives from a
+noise-level stop; that gap is not closed by a signal one or two points better
+than a coin.
+
+**If you want to keep looking**, the honest requirement is a longer export —
+three to five years of ES 15m — and a candidate that is either much stronger
+than 55% or conditioned on something structural (a scheduled event, a volatility
+regime) rather than a candle's colour.
+
+
 ---
 
 ## The proxy study (run before the ES export arrived)
@@ -490,6 +568,7 @@ verdict.
 | `backtest_es_15m.py` | the specified strategy, on a real ES 15m export |
 | `analyse_es_signal.py` | signal-quality test and the stop/target sweep above |
 | `backtest_es_retest.py` | the retest-of-the-level variant, four level definitions |
+| `screen_es_signals.py` | the bracket-free signal screen above |
 | `data/es1_15m_tradingview.csv` | the ES 15m export the verdict rests on |
 | `data/es_trades_10_40.csv` | trade-by-trade log of the headline run |
 | `backtest_open_bracket.py` | the bracket study reported above |
