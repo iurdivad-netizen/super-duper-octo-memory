@@ -146,6 +146,66 @@ points favourable and 23.9 adverse — still a 10-point stop inside the noise wi
 a 40-point target beyond the median reach.
 
 
+### Would a 20-point stop improve it?
+
+Yes, materially — and it confirms the diagnosis without producing an edge.
+09:30 entry, 08:00 signal:
+
+| bracket | break-even TP% | actual TP% | SL% | EOD% | E[pts] | E[R] | t | net $ | maxDD $ | PF |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 10/40 | 21.0 | 13.2 | 76.5 | 10.3 | -1.64 | -0.164 | -1.41 | -19,150 | -22,925 | 0.80 |
+| **20/40** | 34.2 | 24.8 | **55.1** | 20.1 | **+0.66** | +0.033 | +0.39 | **+7,775** | -22,600 | 1.06 |
+| 20/25 | 45.6 | 44.9 | 48.3 | 6.8 | +1.38 | +0.069 | +0.97 | +16,150 | -11,212 | 1.14 |
+| 20/60 | 25.6 | 12.8 | 57.7 | 29.5 | +0.24 | +0.012 | +0.12 | +2,762 | -24,125 | 1.02 |
+| 20/80 | 20.5 | 6.0 | 58.1 | 35.9 | +0.76 | +0.038 | +0.37 | +8,850 | -22,512 | 1.06 |
+| 30/60 | 33.9 | 13.7 | 46.2 | 40.2 | -1.46 | -0.049 | -0.68 | -17,100 | -39,650 | 0.90 |
+
+Doubling the stop takes the stop-out rate from **76.5% to 55.1%** and the
+headline from -$19,150 to +$7,775. That is exactly what the excursion data
+predicted: 10 points sat inside the noise, 20 points sits at its edge. The
+diagnosis was right, and the fix does what it should.
+
+It still is not an edge, for five reasons.
+
+**Per unit of risk it barely moves.** Expectancy goes from -0.164 R to +0.033 R.
+The points improve largely because each trade now risks $1,000 instead of $500;
+scaled to risk, the system is still flat.
+
+**Target-first is still under water.** At 1:2 the break-even hit rate rises to
+34.2% and the actual is 24.8%. As at every other setting, the positive total
+comes from end-of-day exits (20.1% of trades), not from the target.
+
+**It is inside the noise.** t = +0.39, bootstrap 95% CI -2.73 to +3.97 points
+per trade, i.e. **-$31,900 to +$46,425** over the sample.
+
+**The controls show mirror symmetry, not skill.** At 20/40 the signal returns
++0.66 and its inverse -0.72, while always-long (+0.04) and always-short (-0.10)
+sit at zero. When the two constant rules are flat, the signal and its inverse
+are forced to mirror each other, so a split of +0.66 / -0.72 is what a coin-flip
+signal produces. It is not evidence that the 08:00 candle contributes anything.
+
+**It does not survive changing the entry time.** At the 10:00 entry the same
+widening reverses: 10/40 gives +0.46 and 20/40 gives -1.01. A genuine fix to a
+noise-level stop should help at both entries; this helps at one and hurts at the
+other.
+
+Stability, 09:30 entry:
+
+| bracket | 1st half | 2nd half | best month as % of total | green months |
+|---|---|---|---|---|
+| 10/40 | +0.01 | -3.29 | — | 3/11 |
+| 20/40 | +2.09 | -0.76 | 201% (Feb 2026) | 5/11 |
+| 20/25 | +1.77 | +0.99 | 55% (Jul 2026) | 7/11 |
+
+**The one cell worth remembering is 20/25.** It is the only variant in this
+entire study that is positive in both halves of the sample, green in 7 of 11
+months, and not dependent on a single month, with the smallest drawdown of any
+positive variant (-$11,212). It still reaches only t = +0.97, and it was picked
+as the best of 56 cells, so it is not evidence — but it is the one hypothesis
+here that deserves a clean test on a longer export, stated in advance rather
+than selected from a sweep.
+
+
 ### Trading the retest of the 08:00 candle's level
 
 `backtest_es_retest.py` — note the 08:00 candle's direction, wait for price to
