@@ -146,6 +146,73 @@ points favourable and 23.9 adverse — still a 10-point stop inside the noise wi
 a 40-point target beyond the median reach.
 
 
+### Are the timestamps shifted? And does moving the whole thing an hour help?
+
+**The timestamps are not shifted.** The export's own volume profile settles it —
+median 15m volume by time of day:
+
+| time | median volume |
+|---|---|
+| 08:30 | 8,630 |
+| 09:15 | 13,281 |
+| **09:30** | **86,097** |
+| 09:45 | 66,430 |
+| 10:00 | 61,951 |
+| **15:45** | **113,900** |
+| 16:00 | 34,784 |
+
+Volume jumps 6.5× into the bar labelled 09:30 and peaks in the bar labelled
+15:45 — the cash-equity open and the closing bar into 16:00. If the file were an
+hour out, that spike would sit at 10:30. TradingView stamps each row with the
+exchange offset (-04:00 in EDT, -05:00 in EST, both present in this file), and
+the loader strips the offset so the wall-clock is exchange time. Anyone
+inheriting this repo can re-run the check as a data sanity test.
+
+**Moving the setup an hour earlier makes it worse.** Signal at 07:00, entry at
+08:30:
+
+| bracket | n | TP% | SL% | E[pts] | net $ | PF |
+|---|---|---|---|---|---|---|
+| 10/40 | 235 | 15.3 | 81.3 | -2.17 | -25,462 | 0.75 |
+| 20/40 | 235 | 20.4 | 67.2 | -4.92 | -57,862 | 0.65 |
+| 20/25 | 235 | 34.5 | 58.7 | -3.51 | -41,275 | 0.71 |
+
+An 08:30 entry sets its stop during quiet pre-market and then sits through the
+09:30 range expansion, so the 10-point stop-out rate rises to 81.3%.
+
+### The whole clock, tested at once
+
+Rather than keep moving the hours one at a time, every signal time against every
+entry time, expectancy in points with the t-statistic:
+
+**stop 10 / target 40**
+
+| signal \ entry | 08:30 | 09:30 | 09:45 | 10:00 | 10:30 | 11:00 |
+|---|---|---|---|---|---|---|
+| 06:00 | +0.70 (+0.53) | +1.17 (+0.89) | -0.92 (-0.76) | -0.29 (-0.24) | -0.12 (-0.10) | +0.23 (+0.19) |
+| 07:00 | -2.17 (-1.83) | -1.11 (-0.92) | -0.67 (-0.55) | +1.34 (+1.03) | +0.36 (+0.30) | -0.57 (-0.50) |
+| 08:00 | -0.60 (-0.48) | -1.64 (-1.41) | -1.38 (-1.20) | +0.46 (+0.37) | -0.14 (-0.12) | -0.42 (-0.37) |
+| 09:00 | — | +1.49 (+1.14) | +0.75 (+0.60) | +0.99 (+0.78) | +0.84 (+0.68) | +0.47 (+0.40) |
+| 09:15 | — | -1.51 (-1.28) | -1.10 (-0.95) | -0.68 (-0.58) | -1.69 (-1.58) | -2.34 (-2.20) |
+
+**stop 20 / target 25**
+
+| signal \ entry | 08:30 | 09:30 | 09:45 | 10:00 | 10:30 | 11:00 |
+|---|---|---|---|---|---|---|
+| 06:00 | +1.17 (+0.82) | +0.79 (+0.56) | -0.17 (-0.12) | -0.55 (-0.40) | -0.68 (-0.50) | -0.29 (-0.23) |
+| 07:00 | -3.51 (-2.55) | -0.86 (-0.61) | -0.27 (-0.19) | +0.87 (+0.63) | -0.85 (-0.63) | -1.06 (-0.83) |
+| 08:00 | +0.24 (+0.17) | +1.38 (+0.97) | -1.25 (-0.89) | -0.39 (-0.28) | -0.20 (-0.15) | -0.32 (-0.25) |
+| 09:00 | — | +1.64 (+1.15) | +2.02 (+1.44) | +2.20 (+1.59) | +0.76 (+0.57) | +0.54 (+0.42) |
+| 09:15 | — | -1.55 (-1.11) | -2.73 (-1.99) | -1.06 (-0.78) | -2.22 (-1.67) | -2.75 (-2.22) |
+
+**The strongest cell in 56 is t = +1.59.** Across 56 independent-ish draws of
+pure noise the largest |t| you would expect is about **2.84**, and the extremes
+here are +1.59 and -2.55. The surface is not merely insignificant — it is
+*flatter than chance would produce*, which is what a grid with no signal in it
+looks like. There is no hour of the morning where reading a 15-minute candle's
+colour predicts what follows.
+
+
 ### Would a 20-point stop improve it?
 
 Yes, materially — and it confirms the diagnosis without producing an edge.
