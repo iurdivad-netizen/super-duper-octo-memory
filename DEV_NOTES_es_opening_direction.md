@@ -389,6 +389,55 @@ here that deserves a clean test on a longer export, stated in advance rather
 than selected from a sweep.
 
 
+### Entering at the midpoint of the 08:00 candle
+
+Take the 08:00 candle's colour as the direction, wait for price to come back to
+the **midpoint of its range**, and enter there in that direction. Run on all 468
+sessions with the live bracket (20/25), entry at the next candle's open:
+
+| variant | held-out (n≈196) | selection (n≈213) | combined | t |
+|---|---|---|---|---|
+| midpoint, any touch | +0.33 | -2.13 | **-0.95** | -0.91 |
+| midpoint, level must hold | +0.74 | -0.09 | +0.30 | +0.26 |
+| **plain 09:30 entry (reference)** | **+0.96** | **+0.93** | **+0.95** | **+0.96** |
+
+The midpoint entry is worse than simply entering at 09:30, and it is unstable —
+the sign flips between the two periods on both variants, where the plain entry
+gives +0.96 and +0.93.
+
+With the 10/40 bracket the midpoint entry is the worst cell in the whole study:
+-1.92 points per trade, t = -2.31 over 409 trades.
+
+### Why: the filter discards exactly the days that pay
+
+Scoring the **plain 09:30 entry** on the two subsets — days that later revisited
+the 08:00 midpoint, and days that never did:
+
+| subset | n | E[pts] | net $ |
+|---|---|---|---|
+| pulled back to the midpoint | 409 | -1.66 | -33,862 |
+| **never pulled back** | **59** | **+18.99** | **+56,025** |
+| all sessions | 468 | +0.95 | +22,162 |
+
+**That +18.99 is not an opportunity — it is look-ahead.** "Never pulled back to
+the midpoint" can only be known at the end of the session, and for a long it
+means price stayed above that level all day, which is close to saying the day
+went up. The subset is defined by its own outcome. It belongs in the same
+category as scoring the 09:30 candle against a window containing its own move.
+
+What it legitimately shows is the *cost of the filter*. Requiring a pullback
+throws away 59 of 468 sessions (13%), and those are the sessions that trended
+away without looking back — the ones a 25-point target actually needs. You
+cannot know in advance which days those will be, so the filter is a systematic
+negative selection: it keeps the choppy days and discards the trending ones.
+
+One nuance in the other direction, and it is real. On the 409 sessions where a
+pullback did happen, entering at the midpoint returns **-0.95** against the plain
+09:30 entry's **-1.66** on those same days. So the midpoint entry does improve
+the trades it takes, by about 0.7 points. It just cannot improve them enough to
+pay for the 13% of sessions it refuses to trade.
+
+
 ### Trading the retest of the 08:00 candle's level
 
 `backtest_es_retest.py` — note the 08:00 candle's direction, wait for price to
