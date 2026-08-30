@@ -1,0 +1,230 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// ES — 08:00 CANDLE DIRECTION, 09:30 ENTRY
+// ─────────────────────────────────────────────────────────────────────────────
+// The 08:00 ET 15-minute candle's colour sets the direction; the trade is taken
+// at the 09:30 ET open with a fixed point bracket and flattened at the close.
+//
+// WHAT THE BACKTEST SAID  (ES1! 15m, 468 sessions, 2024-11-01 → 2026-08-28,
+// 0.5 points round-turn cost — see DEV_NOTES_es_opening_direction.md)
+//
+//   as originally specified, 10 stop / 40 target : −0.51 pts/trade, PF 0.93
+//   with 20 stop / 25 target (the defaults here) : +0.95 pts/trade, PF 1.10
+//
+// The 20/25 bracket was the best of a 56-cell sweep, and it did replicate on
+// 227 sessions held out from that search (+0.96 against +0.93). It is still only
+// t = +0.96 — not statistically significant — and the edge is 0.044 of one
+// trade's standard deviation, so expect a long, noisy equity curve and a
+// drawdown ($22k over the sample) far larger than the $47 expected per trade.
+//
+// The 08:00 candle agrees with the session's direction on 50.4% of days: a coin
+// flip. What the system earns comes from the bracket geometry and end-of-day
+// exits, not from the signal. Use the Direction control settings below to see
+// that for yourself — if "Always long" earns about what "Signal candle colour"
+// earns, the signal is contributing nothing.
+//
+// Trade it small, or not at all, until it is confirmed on more data.
+// ─────────────────────────────────────────────────────────────────────────────
+
+strategy("ES 08:00 Direction — 09:30 Entry", shorttitle="ES 0800→0930",
+     overlay                 = true,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 25000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.0,
+     slippage                = 1,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false,
+     max_labels_count        = 500)
+
+// ── Constants ────────────────────────────────────────────────────────────────
+TZ       = "America/New_York"
+LONG_ID  = "Long"
+SHORT_ID = "Short"
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+G_SIG = "Signal"
+i_sigSession = input.session("0800-0815", "Signal candle window (ET)", group = G_SIG,
+     tooltip = "The 15-minute candle whose colour sets the direction. It is built " +
+               "from chart bars, so it is identical on a 1, 3, 5 or 15 minute chart.")
+
+enum DirMode
+    Colour   = "Signal candle colour"
+    Inverted = "Fade the candle"
+    Long     = "Always long (control)"
+    Short    = "Always short (control)"
+
+i_dirMode = input.enum(DirMode.Colour, "Direction", group = G_SIG,
+     tooltip = "The two control settings reproduce the backtest's own check: if a " +
+               "control earns about what the signal earns, the signal adds nothing.")
+
+G_TIME = "Timing (exchange time)"
+i_entryHour = input.int(9,  "Entry hour",   minval = 0, maxval = 23, group = G_TIME, inline = "entry")
+i_entryMin  = input.int(30, ":",            minval = 0, maxval = 59, group = G_TIME, inline = "entry",
+     tooltip = "The order is placed on the bar that CLOSES at this time, so it fills " +
+               "at the next bar's open — the 09:30 print itself.")
+i_flatHour  = input.int(16, "Flatten hour", minval = 0, maxval = 23, group = G_TIME, inline = "flat")
+i_flatMin   = input.int(0,  ":",            minval = 0, maxval = 59, group = G_TIME, inline = "flat",
+     tooltip = "Anything still open is closed on the first bar after this time.")
+
+G_RISK = "Bracket"
+i_stopPts   = input.float(20.0, "Stop (points)",   minval = 0.25, step = 0.25, group = G_RISK)
+i_targetPts = input.float(25.0, "Target (points)", minval = 0.25, step = 0.25, group = G_RISK,
+     tooltip = "Best of a 56-cell sweep. The original 10/40 lost money: a 10-point " +
+               "stop sits inside the noise and was hit on 73% of sessions.")
+i_qty = input.int(1, "Contracts", minval = 1, group = G_RISK)
+
+G_VIS = "Display"
+i_showLevels = input.bool(true, "Show signal candle and trade levels", group = G_VIS)
+i_showTable  = input.bool(true, "Show status table",                   group = G_VIS)
+
+// ── Timeframe guard: the signal candle must divide into whole chart bars ─────
+tfMinutes = int(timeframe.in_seconds(timeframe.period) / 60)
+badTf = not timeframe.isintraday or tfMinutes < 1 or tfMinutes > 15 or 15 % tfMinutes != 0
+if barstate.isfirst and badTf
+    runtime.error("Use a 1, 3, 5 or 15 minute chart: the 08:00 signal candle has to " +
+                  "be built from whole bars of the chart timeframe.")
+
+// ── Clock — evaluated in exchange time, never chart time ─────────────────────
+inSignalWindow = not na(time(timeframe.period, i_sigSession, TZ))
+closeHour      = hour(time_close, TZ)
+closeMinute    = minute(time_close, TZ)
+isEntryBar     = closeHour == i_entryHour and closeMinute == i_entryMin
+isFlatBar      = closeHour == i_flatHour  and closeMinute == i_flatMin
+dayNY          = dayofmonth(time, TZ)
+newDay         = dayNY != dayNY[1]
+
+// ── Build the signal candle from chart bars ─────────────────────────────────
+var float sigOpen     = na
+var float sigHigh     = na
+var float sigLow      = na
+var float sigClose    = na
+var bool  sigReady    = false
+var bool  tradedToday = false
+
+if newDay
+    sigOpen     := na
+    sigHigh     := na
+    sigLow      := na
+    sigClose    := na
+    sigReady    := false
+    tradedToday := false
+
+if inSignalWindow
+    if na(sigOpen)
+        sigOpen := open
+        sigHigh := high
+        sigLow  := low
+    else
+        sigHigh := math.max(sigHigh, high)
+        sigLow  := math.min(sigLow, low)
+    sigClose := close
+
+// the candle is complete on the first bar after the window closes
+if not inSignalWindow and inSignalWindow[1] and not na(sigOpen)
+    sigReady := true
+
+colourDir = na(sigClose) or na(sigOpen) ? 0 : sigClose >= sigOpen ? 1 : -1
+
+tradeDir = switch i_dirMode
+    DirMode.Colour   => colourDir
+    DirMode.Inverted => -colourDir
+    DirMode.Long     => 1
+    DirMode.Short    => -1
+    => 0
+
+// ── Entry ───────────────────────────────────────────────────────────────────
+// Placed on the bar that CLOSES at the entry time, so with
+// process_orders_on_close = false it fills at the next bar's open: the 09:30
+// print. The bracket is submitted in the same block, in ticks relative to the
+// fill, so it is already live on the bar the entry fills — the backtest treats
+// the entry bar as bracketed too.
+stopTicks   = int(math.round(i_stopPts   / syminfo.mintick))
+targetTicks = int(math.round(i_targetPts / syminfo.mintick))
+
+canEnter = sigReady and not tradedToday and tradeDir != 0 and
+     strategy.position_size == 0 and isEntryBar
+
+if canEnter
+    tradedToday := true
+    if tradeDir > 0
+        strategy.entry(LONG_ID, strategy.long, qty = i_qty)
+        strategy.exit("Long bracket", from_entry = LONG_ID,
+             loss = stopTicks, profit = targetTicks)
+    else
+        strategy.entry(SHORT_ID, strategy.short, qty = i_qty)
+        strategy.exit("Short bracket", from_entry = SHORT_ID,
+             loss = stopTicks, profit = targetTicks)
+
+// ── Flat at the close ───────────────────────────────────────────────────────
+if isFlatBar and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat")
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+showSignal  = i_showLevels and sigReady
+plotSigHigh = showSignal ? sigHigh : na
+plotSigLow  = showSignal ? sigLow  : na
+
+plot(plotSigHigh, "08:00 candle high", color = color.new(color.gray, 30),
+     style = plot.style_linebr)
+plot(plotSigLow,  "08:00 candle low",  color = color.new(color.gray, 30),
+     style = plot.style_linebr)
+
+inTrade    = strategy.position_size != 0
+isLong     = strategy.position_size > 0
+entryPrice = strategy.position_avg_price
+showTrade  = i_showLevels and inTrade
+plotEntry  = showTrade ? entryPrice : na
+plotStop   = showTrade ? (isLong ? entryPrice - i_stopPts   : entryPrice + i_stopPts)   : na
+plotTarget = showTrade ? (isLong ? entryPrice + i_targetPts : entryPrice - i_targetPts) : na
+
+plot(plotEntry,  "Entry",  color = color.new(color.blue,  0), style = plot.style_linebr)
+plot(plotStop,   "Stop",   color = color.new(color.red,   0), style = plot.style_linebr)
+plot(plotTarget, "Target", color = color.new(color.green, 0), style = plot.style_linebr)
+
+bgcolor(showSignal and not inTrade and tradeDir > 0 ? color.new(color.green, 94) :
+     showSignal and not inTrade and tradeDir < 0 ? color.new(color.red, 94) : na,
+     title = "Pending direction")
+
+// ── Status table ────────────────────────────────────────────────────────────
+var table tb = table.new(position.top_right, 2, 7,
+     bgcolor = color.new(color.black, 20), border_width = 1,
+     border_color = color.new(color.gray, 60))
+
+dirText  = tradeDir > 0 ? "LONG" : tradeDir < 0 ? "SHORT" : "none"
+dirCol   = tradeDir > 0 ? color.lime : tradeDir < 0 ? color.red : color.gray
+sigRange = na(sigHigh) or na(sigLow) ? na : sigHigh - sigLow
+closed   = strategy.closedtrades
+winPct   = closed > 0 ? 100.0 * strategy.wintrades / closed : na
+avgPts   = closed > 0 and syminfo.pointvalue > 0 ?
+     strategy.netprofit / closed / syminfo.pointvalue : na
+
+if i_showTable and barstate.islast
+    table.cell(tb, 0, 0, "ES 08:00 → 09:30", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, str.format("{0}/{1} pts", i_stopPts, i_targetPts),
+         text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 1, "Signal",       text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 1, sigReady ? dirText : "waiting", text_color = dirCol, text_size = size.small)
+    table.cell(tb, 0, 2, "Candle range", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 2, na(sigRange) ? "—" : str.tostring(sigRange, format.mintick),
+         text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 3, "Position",     text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 3, inTrade ? str.tostring(strategy.position_size, "#.##") : "flat",
+         text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 4, "Trades",       text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 4, str.tostring(closed), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 5, "Win %",        text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 5, na(winPct) ? "—" : str.tostring(winPct, "#.#"),
+         text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 6, "Avg pts/trade", text_color = color.gray, text_size = size.small)
+    table.cell(tb, 1, 6, na(avgPts) ? "—" : str.tostring(avgPts, "#.##"),
+         text_color = nz(avgPts) > 0 ? color.lime : color.red, text_size = size.small)
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+entryMinStr = i_entryMin < 10 ? "0" + str.tostring(i_entryMin) : str.tostring(i_entryMin)
+
+if canEnter
+    alert(str.format("{0} {1} at the {2}:{3} open — stop {4} / target {5} pts",
+         syminfo.ticker, dirText, i_entryHour, entryMinStr, i_stopPts, i_targetPts),
+         alert.freq_once_per_bar_close)
