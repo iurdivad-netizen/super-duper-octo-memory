@@ -21,9 +21,29 @@ target-first rate to within ~3 points.
 ## Run on real ES 15m data (the definitive test)
 
 `data/es1_15m_tradingview.csv` — TradingView export of `CME_MINI:ES1!`, 15m,
-21,512 bars, 2025-09-30 → 2026-08-28, timestamps in exchange time with the DST
-offset per row. 234 sessions have both an 08:00 signal candle and an 09:30
-entry.
+**22,083 bars, 2025-09-22 → 2026-08-28**, timestamps in exchange time with the
+DST offset per row. **240 sessions** have both an 08:00 signal candle and an
+09:30 entry.
+
+The file is the merge of two TradingView exports (the second added 571 bars and
+seven calendar days at the front: 2025-09-22 to 2025-09-29). They overlapped on
+zero bars and disagreed on none, and the merged file passes the same integrity
+checks — no OHLC violations, and volume still steps 6.5× into the 09:30 bar.
+The tables below are on the merged 240 sessions; where a figure changed from the
+234-session run it is the merge, not a correction.
+
+| bracket | 234 sessions | 240 sessions |
+|---|---|---|
+| 10/40 | -1.64 pts (t -1.41), -$19,150 | **-1.86 pts (t -1.64), -$22,300** |
+| 20/40 | +0.66 (t +0.39), +$7,775 | +0.31 (t +0.19), +$3,762 |
+| 20/25 | +1.38 (t +0.97), +$16,150 | +1.02 (t +0.72), +$12,250 |
+| 25/25 | +1.32 (t +0.85), +$15,488 | +0.86 (t +0.56), +$10,338 |
+| signal agreement | 50.4% (z +0.13) | 49.6% (z -0.13) |
+
+Six extra sessions moved every positive cell *down* and the losing cell further
+down. Nothing here is stable enough for six days to be noise-free, which is the
+point: at this sample size the numbers wander by more than the effect anyone is
+hunting for.
 
 ```
 python3 backtest_es_15m.py data/es1_15m_tradingview.csv
