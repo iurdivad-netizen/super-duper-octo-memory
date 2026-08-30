@@ -146,6 +146,68 @@ points favourable and 23.9 adverse — still a 10-point stop inside the noise wi
 a 40-point target beyond the median reach.
 
 
+### A 25-point stop, across take-profits
+
+09:30 entry, 08:00 signal, stop 25:
+
+| target | break-even TP% | actual TP% | SL% | EOD% | E[pts] | E[R] | t | net $ | maxDD $ | PF | 1st half | 2nd half |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 15 | 63.8 | 59.4 | 35.5 | 5.1 | -0.56 | -0.022 | -0.45 | -6,538 | -16,050 | 0.94 | -0.32 | -0.80 |
+| 20 | 56.7 | 53.4 | 38.5 | 8.1 | +0.61 | +0.024 | +0.43 | +7,088 | -15,588 | 1.06 | +1.54 | -0.33 |
+| **25** | 51.0 | 47.9 | 41.0 | 11.1 | **+1.32** | +0.053 | +0.85 | **+15,488** | **-12,500** | 1.12 | +1.80 | +0.84 |
+| 30 | 46.4 | 39.3 | 43.6 | 17.1 | +1.01 | +0.040 | +0.61 | +11,812 | -21,475 | 1.09 | +1.93 | +0.09 |
+| 35 | 42.5 | 33.8 | 46.6 | 19.7 | +0.78 | +0.031 | +0.44 | +9,100 | -24,588 | 1.06 | +1.72 | -0.16 |
+| 40 | 39.2 | 27.4 | 47.4 | 25.2 | +0.88 | +0.035 | +0.47 | +10,238 | -26,738 | 1.07 | +2.72 | -0.97 |
+| 50 | 34.0 | 19.2 | 49.6 | 31.2 | +0.38 | +0.015 | +0.19 | +4,450 | -25,238 | 1.03 | +1.63 | -0.87 |
+| 60 | 30.0 | 13.7 | 50.9 | 35.5 | -0.09 | -0.004 | -0.05 | -1,100 | -31,338 | 0.99 | +1.80 | -1.99 |
+| 75 | 25.5 | 7.7 | 51.3 | 41.0 | +0.30 | +0.012 | +0.14 | +3,538 | -28,425 | 1.02 | +2.58 | -1.97 |
+| 100 | 20.4 | 3.0 | 51.7 | 45.3 | +0.06 | +0.002 | +0.03 | +725 | -30,400 | 1.00 | +3.43 | -3.31 |
+
+Best is 25/25 at +1.32 points (+$15,488, PF 1.12, t = +0.85), and it is one of
+only two settings in the study positive in both halves of the sample. It does
+not beat 20/25 (+1.38 pts, +0.069 R, t = +0.97, 7/11 green months) on any
+measure, so widening from 20 to 25 adds nothing.
+
+The optimum is a plateau rather than a spike, which is at least the right shape:
+
+| stop \ target | 20 | 25 | 30 |
+|---|---|---|---|
+| 15 | +0.06 (+0.05) | +0.40 (+0.32) | -0.09 (-0.06) |
+| 20 | +0.59 (+0.46) | **+1.38 (+0.97)** | +0.88 (+0.57) |
+| 25 | +0.61 (+0.43) | +1.32 (+0.85) | +1.01 (+0.61) |
+| 30 | -0.03 (-0.02) | +0.86 (+0.51) | +0.24 (+0.14) |
+
+### The stop-size curve, and what it says
+
+Holding the target at 40 and varying only the stop:
+
+| stop | SL% | TP% | EOD% | **E[R]** |
+|---|---|---|---|---|
+| 5 | 90.2 | 6.4 | 3.4 | **-0.369** |
+| 10 | 76.5 | 13.2 | 10.3 | -0.164 |
+| 15 | 65.4 | 20.1 | 14.5 | -0.038 |
+| 20 | 55.1 | 24.8 | 20.1 | **+0.033** |
+| 25 | 47.4 | 27.4 | 25.2 | +0.035 |
+| 30 | 42.3 | 28.6 | 29.1 | +0.004 |
+| 35 | 38.0 | 30.3 | 31.6 | -0.009 |
+| 40 | 33.3 | 30.8 | 35.9 | -0.015 |
+| 50 | 21.8 | 33.8 | 44.4 | +0.016 |
+
+This curve is the clearest single picture in the study. Per unit of risk the
+system climbs steeply from -0.37 R at a 5-point stop, crosses zero between 15
+and 20 points, and then **flattens along zero** — every stop from 20 to 50 sits
+within ±0.04 R of break-even.
+
+That shape is the signature of a coin-flip signal. A stop inside the noise
+imposes a penalty proportional to how far inside it sits; widening the stop
+removes that penalty and the system converges to the drift it is actually
+trading, which is zero. A real directional edge would keep climbing past zero as
+the stop stopped truncating winners. This one asymptotes at nothing.
+
+So the honest answer to "does a wider stop help": it stops the bleeding, and
+that is all it can do. 25 points is on the plateau; so is 20; 10 was below it.
+
+
 ### Are the timestamps shifted? And does moving the whole thing an hour help?
 
 **The timestamps are not shifted.** The export's own volume profile settles it —
