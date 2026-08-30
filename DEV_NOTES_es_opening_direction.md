@@ -21,37 +21,71 @@ target-first rate to within ~3 points.
 ## Run on real ES 15m data (the definitive test)
 
 `data/es1_15m_tradingview.csv` — TradingView export of `CME_MINI:ES1!`, 15m,
-**22,083 bars, 2025-09-22 → 2026-08-28**, timestamps in exchange time with the
-DST offset per row. **240 sessions** have both an 08:00 signal candle and an
+**42,945 bars, 2024-10-31 → 2026-08-28**, timestamps in exchange time with the
+DST offset per row. **468 sessions** have both an 08:00 signal candle and an
 09:30 entry.
 
-The file is the merge of two TradingView exports (the second added 571 bars and
-seven calendar days at the front: 2025-09-22 to 2025-09-29). They overlapped on
-zero bars and disagreed on none, and the merged file passes the same integrity
-checks — no OHLC violations, and volume still steps 6.5× into the 09:30 bar.
-The tables below are on the merged 240 sessions; where a figure changed from the
-234-session run it is the merge, not a correction.
+The file is the merge of three TradingView exports. Each pair overlapped on zero
+or a few hundred bars and disagreed on **none** of them, and the merged file
+passes the same integrity checks: no OHLC violations, volume still steps 6× into
+the 09:30 bar, both DST offsets present.
 
-| bracket | 234 sessions | 240 sessions |
-|---|---|---|
-| 10/40 | -1.64 pts (t -1.41), -$19,150 | **-1.86 pts (t -1.64), -$22,300** |
-| 20/40 | +0.66 (t +0.39), +$7,775 | +0.31 (t +0.19), +$3,762 |
-| 20/25 | +1.38 (t +0.97), +$16,150 | +1.02 (t +0.72), +$12,250 |
-| 25/25 | +1.32 (t +0.85), +$15,488 | +0.86 (t +0.56), +$10,338 |
-| signal agreement | 50.4% (z +0.13) | 49.6% (z -0.13) |
+**This gave a real held-out test.** The third export covers 2024-11-01 →
+2025-09-19 — 227 sessions that did not exist when 20/25 was picked out of a
+56-cell sweep. Everything before 2025-09-22 is therefore data the selection
+never saw.
 
-Six extra sessions moved every positive cell *down* and the losing cell further
-down. Nothing here is stable enough for six days to be noise-free, which is the
-point: at this sample size the numbers wander by more than the effect anyone is
-hunting for.
+| bracket | held-out (new, n=227) | selection sample (n=241) | combined (n=468) |
+|---|---|---|---|
+| 10/40 (as specified) | +0.97 (t +0.75) | **-1.89** (t -1.68) | -0.51 (t -0.59) |
+| 20/40 | +1.46 (t +0.87) | +0.23 (t +0.14) | +0.82 (t +0.70) |
+| **20/25** | **+0.96** (t +0.70) | **+0.93** (t +0.66) | **+0.95** (t +0.96) |
+| 25/25 | +0.55 (t +0.36) | +0.75 (t +0.49) | +0.66 (t +0.61) |
+| 20/30 | +1.11 (t +0.75) | +0.46 (t +0.31) | +0.78 (t +0.73) |
 
-```
-python3 backtest_es_15m.py data/es1_15m_tradingview.csv
-```
+Two things to take from that table, and they point in opposite directions.
+
+**The original specification is dead.** 10/40 swung from -1.89 in one period to
++0.97 in the other. A parameter set whose sign depends on which year you look at
+is noise around zero, and combined it is -0.51 points per trade.
+
+**20/25 replicated.** +0.93 in the sample it was selected from, **+0.96 in 227
+sessions that played no part in selecting it**. That is the first genuinely
+encouraging result in this study, because out-of-sample replication is the one
+test a curve-fit normally fails.
+
+### But it is still not significant, and here is the arithmetic
+
+| | 20/25, 468 sessions |
+|---|---|
+| target-first | 41.5% (break-even **45.6%**) |
+| expectancy | +0.95 pts/trade, +$22,162 total |
+| t-statistic | **+0.96** |
+| profit factor | 1.10 |
+| max drawdown | -$22,188 |
+| per-trade standard deviation | 21.4 pts (**$1,068**) |
+| edge as a fraction of one trade's noise | **0.044** |
+| sessions needed for t = 2 | **~2,030 (~8 years)** |
+| green months | 14/22 |
+| by year | 2024 (n=42) -1.43 · 2025 (n=256) +0.85 · 2026 (n=170) +1.68 |
+
+Doubling the sample left the effect size unchanged and moved t from +0.97 to
++0.96 — exactly what happens when a small, stable effect is measured against
+large variance. Note also that target-first is *still below* its break-even, so
+even here the positive total leans on end-of-day exits.
+
+The honest position: 20/25 is no longer a curve-fit artifact — it survived a
+clean held-out test — but it is not yet a demonstrated edge either. An
+expectancy of 0.044 of one trade's standard deviation needs roughly 2,000
+sessions to separate from zero, and a max drawdown of $22,188 against $47 of
+expected profit per trade is not a comfortable ratio to trade on faith.
+
+### The specified 10/40, on all 468 sessions
 
 | resolution | n | TP% | SL% | EOD% | E[pts] | net $ | maxDD $ | PF |
 |---|---|---|---|---|---|---|---|---|
-| pessimistic / heuristic / optimistic | 234 | 13.2 | 76.5 | 10.3 | **-1.64** | **-19,150** | -22,925 | 0.80 |
+| pessimistic | 468 | 14.7 | 73.5 | 11.8 | -0.51 | -11,838 | -29,225 | 0.93 |
+| optimistic | 468 | 15.0 | 73.3 | 11.8 | -0.40 | -9,338 | -29,225 | 0.95 |
 
 All three columns are identical because **0.0%** of trades hit a 15m bar
 containing both levels — a 50-point spread rarely fits inside one ES 15m bar.
