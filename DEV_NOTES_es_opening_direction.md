@@ -146,6 +146,72 @@ points favourable and 23.9 adverse — still a 10-point stop inside the noise wi
 a 40-point target beyond the median reach.
 
 
+### Trading the retest of the 08:00 candle's level
+
+`backtest_es_retest.py` — note the 08:00 candle's direction, wait for price to
+leave its level, then enter in that direction when price comes back and touches
+the level (a resting limit, so the fill is the level itself). "The level" is
+ambiguous, so all four readings are tested: the **breakout** side (candle high
+for a bullish candle, low for a bearish one — the usual meaning), the candle's
+**close**, its **mid**point, and the **far** edge (a deeper pullback into the
+body). A retest arrives on 85–91% of sessions, so the sample barely shrinks.
+
+10/40 bracket, entry window 09:30–15:00, heuristic resolution:
+
+| level | n | TP% | SL% | E[pts] | t | net $ | PF |
+|---|---|---|---|---|---|---|---|
+| breakout | 206 | 11.7 | 80.1 | **-3.00** | -2.57 | -30,850 | 0.65 |
+| close | 213 | 13.1 | 79.8 | -2.33 | -1.94 | -24,762 | 0.72 |
+| mid | 206 | 12.6 | 77.7 | -2.11 | -1.74 | -21,725 | 0.74 |
+| far | 199 | 17.1 | 72.4 | +0.52 | +0.38 | +5,162 | 1.07 |
+
+**This is worse than entering on the clock.** The breakout retest — the reading
+most people mean — loses 3.00 points per trade against the -1.64 of the plain
+09:30 entry, and it is the first variant in this whole study with a t past 2.
+Three of the four levels lose on every resolution, pessimistic through
+optimistic. The only non-negative cell, `far`, is t = +0.38.
+
+**The direction rule is again irrelevant.** At each level, running the same
+mechanic with the signal inverted, permanently long, and permanently short:
+
+| level | as specified | inverted | always long | always short |
+|---|---|---|---|---|
+| breakout | -3.00 | -0.77 | -1.89 | -1.98 |
+| close | -2.33 | -2.09 | -2.20 | -2.22 |
+| mid | -2.11 | -1.67 | -1.52 | -2.26 |
+| far | +0.52 | -2.91 | -0.69 | -1.70 |
+
+At the `close` and `mid` levels all four rules land within 0.7 points of each
+other. The retest *mechanic* is what loses; the 08:00 candle's direction is not
+adding or subtracting anything reliable.
+
+**A structural stop makes it worse, and shows why.** Sizing the stop beyond the
+candle's far edge instead of using a fixed 10 points — the normal way to trade a
+retest — gives, in R:
+
+| R:R | n | E[R] | t | pess .. opt |
+|---|---|---|---|---|
+| 1:1 | 206 | -0.416 | -6.35 | -0.562 .. +0.137 |
+| 1:2 | 206 | -0.356 | -4.03 | -0.538 .. +0.051 |
+| 1:3 | 206 | -0.238 | -2.13 | -0.478 .. -0.043 |
+| 1:4 | 206 | -0.262 | -2.11 | -0.533 .. -0.238 |
+
+The reason is in one number: **the median 08:00 candle spans 6.8 points**
+(p10 3.5, p90 15.2). Anchoring a stop to that candle puts it ~8 points from
+entry, against a median adverse excursion of ~24 points once RTH is running.
+The stop is inside the noise *by construction*, and at 1:2 every direction rule
+loses about the same (-0.33 to -0.40 R, t = -3.6 to -4.5).
+
+**Caveat, and it is a real one.** Unlike the fixed-time tests, which had 0%
+assumption-dependent trades, **~55% of retest trades are assumption-dependent at
+15m resolution**: once price touches the level mid-bar, that bar's remaining
+path is unknown, and a 10-point stop often sits inside it. That is why the
+pessimistic and optimistic columns diverge so far (breakout: -5.29 vs -2.75).
+Settling those trades needs 1-minute data. The conclusion survives anyway
+because even the optimistic bound is negative for three of the four levels — but
+the exact figures here carry more uncertainty than the rest of this document.
+
+
 ### Fading the candle is not the answer either
 
 `--invert` returns +0.93 pts/trade (+$10,938), which looks like the inverse
@@ -423,6 +489,7 @@ verdict.
 |---|---|
 | `backtest_es_15m.py` | the specified strategy, on a real ES 15m export |
 | `analyse_es_signal.py` | signal-quality test and the stop/target sweep above |
+| `backtest_es_retest.py` | the retest-of-the-level variant, four level definitions |
 | `data/es1_15m_tradingview.csv` | the ES 15m export the verdict rests on |
 | `data/es_trades_10_40.csv` | trade-by-trade log of the headline run |
 | `backtest_open_bracket.py` | the bracket study reported above |
