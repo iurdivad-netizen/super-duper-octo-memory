@@ -853,6 +853,43 @@ signal's agreement rate inside about ±6.5 points; a few years would halve that,
 but 50.4% is close enough to a coin flip that more data is unlikely to move the
 verdict.
 
+## The Pine Script
+
+`es_open_direction_strategy.pine` — Pine Script v6 strategy implementing the
+configuration that survived: **08:00 ET candle colour, entry at the 09:30 open,
+20-point stop, 25-point target, flat at the close.** The original 10/40 is
+available by changing two inputs, and the header carries the backtest numbers so
+nobody trades it without seeing them.
+
+Implementation notes that matter for matching the backtest:
+
+* **The signal candle is built from chart bars**, not fetched with
+  `request.security`, so it is identical on a 1, 3, 5 or 15 minute chart and
+  cannot repaint. A guard rejects timeframes that do not divide 15 minutes.
+* **Entry fills at the 09:30 print.** The order is placed on the bar that
+  *closes* at 09:30 and `process_orders_on_close` is false, so it fills at the
+  next bar's open — the 09:30 open the backtest used. Placing it on the 09:30
+  bar itself would have filled a bar late.
+* **The bracket is submitted with the entry**, in ticks relative to the fill, so
+  it is live on the bar the entry fills. The backtest treats the entry bar as
+  bracketed, and a bracket added a bar later would miss same-bar stops.
+* **All times are evaluated in `America/New_York`**, so the script behaves the
+  same whatever timezone the chart is set to, and DST is handled by the exchange
+  calendar rather than by an offset.
+* **Slippage defaults to 1 tick and commission to zero**, which reproduces the
+  0.5-point round-turn cost the backtest charged. Add your broker's real
+  commission (roughly $2–2.50 per side on ES) to see a truer figure — it will be
+  slightly worse than the backtest.
+* **The Direction input includes "Always long" and "Always short" controls.**
+  They exist so the central finding can be reproduced on the chart: if a control
+  earns about what the signal earns, the signal is contributing nothing.
+
+Expect the TradingView results to differ from this study by a small amount. The
+broker emulator resolves a bar containing both the stop and the target as a stop
+(the same pessimistic convention used here), but the end-of-day exit fills at
+the open of the bar after 16:00 rather than at the 15:45 bar's close.
+
+
 ## Files
 
 | file | what it is |
@@ -862,6 +899,7 @@ verdict.
 | `backtest_es_retest.py` | the retest-of-the-level variant, four level definitions |
 | `screen_es_signals.py` | the bracket-free signal screen above |
 | `backtest_es_range_breakout.py` | the 08:00 range traded from 09:30, either timeframe |
+| `es_open_direction_strategy.pine` | the TradingView strategy, Pine v6 |
 | `data/es1_3m_tradingview.csv` | 3-minute export, 45 sessions, used to validate resolution |
 | `data/es1_15m_tradingview.csv` | the ES 15m export the verdict rests on |
 | `data/es_trades_10_40.csv` | trade-by-trade log of the headline run |
