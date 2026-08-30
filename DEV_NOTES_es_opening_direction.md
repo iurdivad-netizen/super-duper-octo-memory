@@ -179,6 +179,57 @@ exact figures on ES will differ by a fraction of a point.
 **Costs:** 0.5 ES points ($25) round turn per contract. Cheaper fills do not
 rescue the numbers; the expectancy is near zero before costs too.
 
+## Does using cash S&P 500 data instead of futures change anything?
+
+No — and the backtest above is already the cash-index answer. When ES turned out
+to be unreachable, the whole study was run on SPY regular-hours bars, which *are*
+standard S&P 500 data. Every figure above is what SPX/SPY did.
+
+**Point sizes are interchangeable across the S&P family**, because they all track
+the same index and differ only in multiplier. The futures basis (carry minus
+dividends) shifts ES's *level* relative to SPX by tens of points but cancels out
+of a bracket measured in points from an entry:
+
+| instrument | 10-pt stop | 40-pt target | per point |
+|---|---|---|---|
+| SPX (cash index) | 10 index pts | 40 index pts | not directly tradeable |
+| ES | 10 pts | 40 pts | $50 |
+| MES | 10 pts | 40 pts | $5 |
+| SPY | 1.0 pt | 4.0 pts | $1 per share ($100 per 100 shares) |
+
+**Why the instrument cannot be the problem.** The bracket fails on its size
+relative to how far the index travels in a session, and that ratio is identical
+for SPX, SPY, ES and MES:
+
+| | p10 | median | p90 |
+|---|---|---|---|
+| session range (index pts) | 31.7 | 57.8 | 115.4 |
+| up excursion from the open | 4.3 | 25.0 | 63.3 |
+| down excursion from the open | 4.2 | 26.3 | 76.4 |
+
+The 10-point stop is 17% of a median session's entire range; the 40-point target
+is 69% of it. On **23.7%** of sessions the index never spans 40 points at all
+between its high and its low, so the target is unreachable whichever way you
+face. On **50.6%** of sessions the index travels 10 points both above *and*
+below the open, so the stop is hit whichever way you face. Roughly half the
+sample is a loss before direction is even considered.
+
+**What cash data cannot do is rescue the 08:00 signal — and here it is worse
+than futures.** SPX does not trade before 09:30 ET, so an 08:00 candle does not
+exist on the cash index; there is nothing to read. SPY has pre-market prints
+from 04:00, but they are gated on this data plan, and pre-market SPY is thin
+enough that a 15-minute candle's direction there is a weak reading of where the
+S&P actually is. ES is the *only* instrument in the family that has a real,
+liquid 08:00 candle — which is why the original specification named it.
+
+So the choice is between:
+
+* keeping ES for the signal (export 15m from TradingView, run `backtest_es_15m.py`);
+* or, if the strategy must live on cash-hours data only, replacing the 08:00
+  candle with the 09:30–09:45 opening candle and entering at 09:45 — a different
+  system, not this one, and one whose bracket still has to clear the 21%
+  break-even hit rate documented above.
+
 ## Running it on real ES data
 
 `backtest_es_15m.py` implements the specification exactly — 08:00 signal candle,

@@ -28,6 +28,7 @@ import csv
 import datetime as dt
 import math
 import random
+import statistics
 from collections import defaultdict
 
 POINTS_PER_SPY = 10.0        # ES index points per SPY point
@@ -271,6 +272,32 @@ def main():
     be = 100 * (args.stop + args.cost) / (args.stop + args.target)
     print(f"R:R 1:{args.target/args.stop:g} -- the target must be hit first on "
           f"{be:.1f}% of trades just to break even (ignoring end-of-day exits).\n")
+
+    print("--- volatility context: is 10/40 the right size for this index? ---")
+    rng, mfe, mae = [], [], []
+    for s in sessions:
+        hi = max(h for h, _ in s["segments"])
+        lo = min(l for _, l in s["segments"])
+        rng.append((hi - lo) * POINTS_PER_SPY)
+        mfe.append((hi - s["open"]) * POINTS_PER_SPY)
+        mae.append((s["open"] - lo) * POINTS_PER_SPY)
+    med = statistics.median(rng)
+    pct = lambda xs, p: statistics.quantiles(sorted(xs), n=100)[p - 1]
+    print(f"{'':<28}{'p10':>8}{'median':>9}{'p90':>8}")
+    for name, series in (("session range", rng),
+                         ("up excursion from open", mfe),
+                         ("down excursion from open", mae)):
+        print(f"{name:<28}{pct(series, 10):>8.1f}{statistics.median(series):>9.1f}"
+              f"{pct(series, 90):>8.1f}")
+    both = sum(1 for m, a in zip(mfe, mae) if m >= args.stop and a >= args.stop)
+    never = sum(1 for r in rng if r < args.target)
+    print(f"\nthe {args.stop:g}-pt stop is {100*args.stop/med:.1f}% of the median "
+          f"session range; the {args.target:g}-pt target is {100*args.target/med:.1f}%")
+    print(f"sessions whose entire range never spans {args.target:g} pts: "
+          f"{100*never/len(rng):.1f}% -- the target is out of reach there whichever "
+          f"way you face")
+    print(f"sessions that travel {args.stop:g} pts BOTH above and below the open: "
+          f"{100*both/len(rng):.1f}% -- the stop is hit there whichever way you face\n")
 
     print("--- is the edge distinguishable from zero? (heuristic, "
           "bootstrap 95% CI on expectancy) ---")
