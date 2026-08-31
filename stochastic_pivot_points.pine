@@ -452,15 +452,15 @@ bearCross = plotstochCrosses and bearSignal
 // ─── Cross triangles ────────────────────────────────────────────────────────
 shapeAtLevel = crossShapeLocation == 'At the stoch OB / OS level'
 
-bullShapeBar = bullCross and not shapeAtLevel
-bearShapeBar = bearCross and not shapeAtLevel
-bullShapeLevel = bullCross and shapeAtLevel ? xOSPrice : na
-bearShapeLevel = bearCross and shapeAtLevel ? xOBPrice : na
+// One plot per direction, whatever the placement: a separate plot per position
+// would leave a plot with no data sitting in the Style tab, and a plot that is
+// switched off there hides the signals even though the script is producing them.
+// `location` accepts an input-qualified value, so the same plot can move.
+bullShape = bullCross ? (shapeAtLevel ? xOSPrice : low) : na
+bearShape = bearCross ? (shapeAtLevel ? xOBPrice : high) : na
 
-plotshape(bullShapeBar, 'Stochastic cross Up', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
-plotshape(bearShapeBar, 'Stochastic cross Down', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.abovebar, display = display.all - display.status_line)
-plotshape(bullShapeLevel, 'Stochastic cross Up (at OS level)', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.absolute, display = display.all - display.status_line)
-plotshape(bearShapeLevel, 'Stochastic cross Down (at OB level)', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.absolute, display = display.all - display.status_line)
+plotshape(bullShape, 'Extreme cross Up', style = shape.triangleup, color = risingColor, size = size.tiny, location = shapeAtLevel ? location.absolute : location.belowbar, display = display.all - display.status_line)
+plotshape(bearShape, 'Extreme cross Down', style = shape.triangledown, color = fallingColor, size = size.tiny, location = shapeAtLevel ? location.absolute : location.abovebar, display = display.all - display.status_line)
 
 bgcolor(showCrossBg and bullCross ? color.new(risingColor, 85) : showCrossBg and bearCross ? color.new(fallingColor, 85) : na, title = 'Cross signal background')
 
