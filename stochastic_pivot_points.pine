@@ -103,8 +103,11 @@ showCrossLines = input.bool(true, title = 'Draw a horizontal line on each cross 
 
 crossLineAnchor = input.string('Cross bar close', title = 'Line price', options = ['Cross bar close', 'Cross bar extreme', 'Stoch level price'], display = display.all - display.status_line, group = gXLine, tooltip = 'Cross bar close: the close of the signal bar.\nCross bar extreme: the low of a bullish signal bar / the high of a bearish one.\nStoch level price: the price that would put the stochastic exactly on the oversold (bullish) or overbought (bearish) level.')
 
-crossLineLen = input.int(50, title = 'Line length (bars)', minval = 1, maxval = 500, display = display.all - display.status_line, group = gXLine, tooltip = 'How far to the right the line runs. Capped at 500 because Pine cannot draw further than 500 bars past the last bar.')
-crossLineExtend = input.bool(false, title = 'Extend lines to the right', group = gXLine)
+crossLineMode = input.string('Fixed length', title = 'Line behaviour', options = ['Fixed length', 'Until price crosses it', 'Extend to the right'], display = display.all - display.status_line, group = gXLine, tooltip = 'Fixed length: the line runs for the number of bars set below.\nUntil price crosses it: the line keeps growing bar by bar and stops at the bar that trades back through the level, so what is left on the chart is the untested part of each signal.\nExtend to the right: the line never ends.')
+
+crossLineStop = input.string('Wick', title = 'Price crosses the line on', options = ['Wick', 'Close'], display = display.all - display.status_line, group = gXLine, tooltip = 'Only used by "Until price crosses it".\nWick: the line stops the first time a high or low trades through the level.\nClose: it takes a close on the other side of the level.')
+
+crossLineLen = input.int(50, title = 'Line length (bars)', minval = 1, maxval = 500, display = display.all - display.status_line, group = gXLine, tooltip = 'Length for "Fixed length" mode. Capped at 500 because Pine cannot draw further than 500 bars past the last bar.')
 maxCrossLines = input.int(10, title = 'Max lines kept per direction', minval = 1, maxval = 200, display = display.all - display.status_line, group = gXLine)
 
 showCrossLineLabels = input.bool(false, title = 'Show price label on cross lines', group = gXLine)
@@ -468,34 +471,74 @@ bgcolor(showCrossBg and bullCross ? color.new(risingColor, 85) : showCrossBg and
 bullCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? low : xOSPrice
 bearCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? high : xOBPrice
 
-crossLineExtendMode = crossLineExtend ? extend.right : extend.none
+untilCrossed = crossLineMode == 'Until price crosses it'
+extendRight = crossLineMode == 'Extend to the right'
+crossLineExtendMode = extendRight ? extend.right : extend.none
+stopOnWick = crossLineStop == 'Wick'
 
-var array<line> bullCrossLines = array.new<line>()
-var array<line> bearCrossLines = array.new<line>()
-var array<label> bullCrossLabels = array.new<label>()
-var array<label> bearCrossLabels = array.new<label>()
+// A drawn level, with what is needed to know when price has taken it out.
+type CrossLine
+    line ln
+    label lb
+    float price
+    int startBar
+    bool breakDown
+    bool active
+
+// Kept alongside the line so a level that price has already gone through is
+// frozen where it was broken instead of following the chart forever.
+newCrossLine(float p, bool up) =>
+    x2 = untilCrossed ? bar_index + 1 : bar_index + crossLineLen
+    col = up ? bullCrossColor : bearCrossColor
+    ln = line.new(bar_index, p, x2, p, color = col, style = crossLineStyle, width = crossLineWidth, extend = crossLineExtendMode)
+    label lb = na
+    if showCrossLineLabels
+        lb := label.new(x2, p, str.tostring(math.round_to_mintick(p)), color = #00000000, textcolor = col, style = label.style_label_left, size = size.small)
+    // Which way price has to go to take the level out: a bullish line is
+    // support and breaks downwards, a bearish one is resistance and breaks
+    // upwards. A line drawn on the wrong side of price flips accordingly.
+    CrossLine.new(ln = ln, lb = lb, price = p, startBar = bar_index, breakDown = up ? close >= p : close > p, active = true)
+
+var array<CrossLine> bullCrossLines = array.new<CrossLine>()
+var array<CrossLine> bearCrossLines = array.new<CrossLine>()
+
+// Grow the live levels first, so a line created on this bar is never closed by
+// the bar that drew it.
+if untilCrossed
+    for cl in bullCrossLines
+        if cl.active and bar_index > cl.startBar
+            hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
+            if hit
+                cl.active := false
+            else
+                line.set_x2(cl.ln, bar_index + 1)
+                if not na(cl.lb)
+                    label.set_x(cl.lb, bar_index + 1)
+    for cl in bearCrossLines
+        if cl.active and bar_index > cl.startBar
+            hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
+            if hit
+                cl.active := false
+            else
+                line.set_x2(cl.ln, bar_index + 1)
+                if not na(cl.lb)
+                    label.set_x(cl.lb, bar_index + 1)
 
 if showCrossLines and bullCross and not na(bullCrossPrice)
-    bl = line.new(bar_index, bullCrossPrice, bar_index + crossLineLen, bullCrossPrice, color = bullCrossColor, style = crossLineStyle, width = crossLineWidth, extend = crossLineExtendMode)
-    array.push(bullCrossLines, bl)
+    array.push(bullCrossLines, newCrossLine(bullCrossPrice, true))
     if array.size(bullCrossLines) > maxCrossLines
-        line.delete(array.shift(bullCrossLines))
-    if showCrossLineLabels
-        blb = label.new(bar_index + crossLineLen, bullCrossPrice, str.tostring(math.round_to_mintick(bullCrossPrice)), color = #00000000, textcolor = bullCrossColor, style = label.style_label_left, size = size.small)
-        array.push(bullCrossLabels, blb)
-        if array.size(bullCrossLabels) > maxCrossLines
-            label.delete(array.shift(bullCrossLabels))
+        gone = array.shift(bullCrossLines)
+        line.delete(gone.ln)
+        if not na(gone.lb)
+            label.delete(gone.lb)
 
 if showCrossLines and bearCross and not na(bearCrossPrice)
-    br = line.new(bar_index, bearCrossPrice, bar_index + crossLineLen, bearCrossPrice, color = bearCrossColor, style = crossLineStyle, width = crossLineWidth, extend = crossLineExtendMode)
-    array.push(bearCrossLines, br)
+    array.push(bearCrossLines, newCrossLine(bearCrossPrice, false))
     if array.size(bearCrossLines) > maxCrossLines
-        line.delete(array.shift(bearCrossLines))
-    if showCrossLineLabels
-        brb = label.new(bar_index + crossLineLen, bearCrossPrice, str.tostring(math.round_to_mintick(bearCrossPrice)), color = #00000000, textcolor = bearCrossColor, style = label.style_label_left, size = size.small)
-        array.push(bearCrossLabels, brb)
-        if array.size(bearCrossLabels) > maxCrossLines
-            label.delete(array.shift(bearCrossLabels))
+        gone = array.shift(bearCrossLines)
+        line.delete(gone.ln)
+        if not na(gone.lb)
+            label.delete(gone.lb)
 
 // ─── Diagnostics output ─────────────────────────────────────────────────────
 plotshape(showRawCrosses and DIPcross, 'Raw cross Up (debug)', style = shape.circle, color = color.new(risingColor, 40), size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
