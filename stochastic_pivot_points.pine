@@ -515,10 +515,13 @@ updateCrossLines(array<CrossLine> arr) =>
                 if hit
                     cl.active := false
                     if dropCrossedLines
+                        // array.remove returns the element, so it cannot be
+                        // the last statement here: the branch would then be
+                        // typed CrossLine while the else branch is void.
+                        array.remove(arr, i)
                         line.delete(cl.ln)
                         if not na(cl.lb)
                             label.delete(cl.lb)
-                        array.remove(arr, i)
                 else
                     line.set_x2(cl.ln, bar_index + 1)
                     if not na(cl.lb)
