@@ -1,0 +1,431 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// @author  = NexusSignals
+// © NexusSignals
+//
+// Modified: the stochastic cross signals can now be filtered to extreme
+// (overbought / oversold) crossovers only, and each accepted crossover can
+// draw a horizontal price line on the chart.
+
+//@version=6
+indicator(title = 'Stochastic Pivot Points', shorttitle = 'NSSTOCH', overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+showTable = input.bool(true, title = 'Show Table', group = 'Table Settings')
+
+
+tablePosition = input.string('middle right', title = 'Table position', options = ['top left', 'top center', 'top right', 'middle left', 'middle center', 'middle right', 'bottom left', 'bottom center', 'bottom right'], display = display.all - display.status_line, group = 'Table Settings')
+
+
+
+styleOption2 = input.string('auto', title = 'Tabel Text Size', options = ['auto', 'small', 'tiny', 'normal', 'large'], display = display.all - display.status_line, group = 'Table Settings')
+
+
+textSize = styleOption2 == 'auto' ? size.auto : styleOption2 == 'small' ? size.small : styleOption2 == 'tiny' ? size.tiny : styleOption2 == 'normal' ? size.normal : size.large
+
+risingColor = input.color(#1a7b24, 'Rising color', group = 'Table Settings')
+fallingColor = input.color(#be0606, 'Falling color', group = 'Table Settings')
+tableTextColor = input(#ffffff, 'Text color', group = 'Table Settings')
+
+rsisource = input(close, display = display.all - display.status_line, title = 'Rsi Source', group = 'Table Settings')
+rsi_len = input.int(14, title = 'RSI Length for table calculations', display = display.all - display.status_line, group = 'Table Settings')
+
+smoothK1 = input.int(3, 'K Smoothing for table calculations', minval = 1, display = display.all - display.status_line, group = 'Table Settings')
+smoothD1 = input.int(3, 'D Smoothing for table calculations', minval = 1, display = display.all - display.status_line, group = 'Table Settings')
+lengthStoch = input.int(14, 'Stochastic Length for table calculations', minval = 1, display = display.all - display.status_line, group = 'Table Settings')
+
+periodK = 14
+smoothK = 1
+
+plotstochCrosses = input.bool(true, title = 'Show Stochastic Cross signals', group = 'Stoch Pivots Points Settings')
+
+lineStartdDistance = input.int(0, 'Line Start Distance From Current Price', display = display.all - display.status_line, group = 'Stoch Pivots Points Settings')
+
+labelDistance = input.int(15, 'Labels Distance From Current Price', display = display.all - display.status_line, group = 'Stoch Pivots Points Settings')
+
+hideLabels = input.bool(false, title = 'Hide Pivot Labels', group = 'Stoch Pivots Points Settings')
+
+hideLines = input.bool(false, title = 'Hide Lines', group = 'Stoch Pivots Points Settings')
+
+sob = input.float(title = 'Extreme OB', display = display.all - display.status_line, defval = 100, minval = 0.0, maxval = 100.0)
+ob = input.float(title = 'Overbought', display = display.all - display.status_line, defval = 80, minval = 0.0, maxval = 100.0)
+midlevel = input.float(title = 'Middle Level', display = display.all - display.status_line, defval = 50.0, minval = 0.0, maxval = 100.0)
+os = input.float(title = 'Ovesold Level', display = display.all - display.status_line, defval = 20, minval = 0.0, maxval = 100.0)
+sos = input.float(title = 'Extreme OS', display = display.all - display.status_line, defval = 0, minval = 0.0, maxval = 100.0)
+
+styleOption = input.string('dotted (┈)', title = 'Line Style', options = ['solid (─)', 'dotted (┈)', 'dashed (╌)', 'arrow left (←)', 'arrow right (→)', 'arrows both (↔)'], display = display.all - display.status_line, group = 'Stoch Pivots Points Settings')
+
+lineStyle = styleOption == 'dotted (┈)' ? line.style_dotted : styleOption == 'dashed (╌)' ? line.style_dashed : styleOption == 'arrow left (←)' ? line.style_arrow_left : styleOption == 'arrow right (→)' ? line.style_arrow_right : styleOption == 'arrows both (↔)' ? line.style_arrow_both : line.style_solid
+
+r1color = input.color(#d53e4f, 'Stoch Extreme Overbought Line Color', group = 'Stoch Pivots Points Settings')
+r2color = input.color(#fdae61, 'Stoch Overbought Line Color', group = 'Stoch Pivots Points Settings')
+nColor = input.color(#abdda4, 'Stoch Neutral line Color', group = 'Stoch Pivots Points Settings')
+r5color = input.color(#fdae61, 'Stoch Oversold Line Color', group = 'Stoch Pivots Points Settings')
+r6color = input.color(#d53e4f, 'Stoch Lowest Line Color', group = 'Stoch Pivots Points Settings')
+
+
+// ─── Cross signal filter ────────────────────────────────────────────────────
+gCross = 'Cross Signals Filter'
+
+crossFilterMode = input.string('Extreme zones only', title = 'Which crosses to show', options = ['All crosses', 'Extreme zones only'], display = display.all - display.status_line, group = gCross, tooltip = 'All crosses: every K/D cross, as before.\nExtreme zones only: bullish crosses are kept only when the stochastic is in the oversold zone, bearish crosses only when it is in the overbought zone.')
+
+useLevelsFromPivots = input.bool(true, title = 'Use the OB / OS levels from the pivot settings', group = gCross, tooltip = 'On: the "Overbought" and "Ovesold" levels above define the extreme zones.\nOff: the custom levels below are used instead.')
+
+customOB = input.float(80.0, title = 'Custom overbought level', minval = 0.0, maxval = 100.0, display = display.all - display.status_line, group = gCross)
+customOS = input.float(20.0, title = 'Custom oversold level', minval = 0.0, maxval = 100.0, display = display.all - display.status_line, group = gCross)
+
+zoneBasis = input.string('K or D', title = 'Zone test applies to', options = ['K or D', 'K and D', 'K only', 'D only'], display = display.all - display.status_line, group = gCross, tooltip = 'Which stochastic lines must sit inside the extreme zone for the cross to count. The cross bar and the bar before it are both considered, so a cross that is completed just as the lines leave the zone still counts.')
+
+// ─── Horizontal line on accepted crossovers ─────────────────────────────────
+gXLine = 'Cross Signal Lines'
+
+showCrossLines = input.bool(true, title = 'Draw a horizontal line on each cross signal', group = gXLine)
+
+crossLineAnchor = input.string('Cross bar close', title = 'Line price', options = ['Cross bar close', 'Cross bar extreme', 'Stoch level price'], display = display.all - display.status_line, group = gXLine, tooltip = 'Cross bar close: the close of the signal bar.\nCross bar extreme: the low of a bullish signal bar / the high of a bearish one.\nStoch level price: the price that would put the stochastic exactly on the oversold (bullish) or overbought (bearish) level.')
+
+crossLineLen = input.int(50, title = 'Line length (bars)', minval = 1, maxval = 500, display = display.all - display.status_line, group = gXLine, tooltip = 'How far to the right the line runs. Capped at 500 because Pine cannot draw further than 500 bars past the last bar.')
+crossLineExtend = input.bool(false, title = 'Extend lines to the right', group = gXLine)
+maxCrossLines = input.int(10, title = 'Max lines kept per direction', minval = 1, maxval = 200, display = display.all - display.status_line, group = gXLine)
+
+showCrossLineLabels = input.bool(false, title = 'Show price label on cross lines', group = gXLine)
+
+crossLineStyleOption = input.string('solid (─)', title = 'Cross Line Style', options = ['solid (─)', 'dotted (┈)', 'dashed (╌)'], display = display.all - display.status_line, group = gXLine)
+
+crossLineStyle = crossLineStyleOption == 'dotted (┈)' ? line.style_dotted : crossLineStyleOption == 'dashed (╌)' ? line.style_dashed : line.style_solid
+
+crossLineWidth = input.int(1, title = 'Cross Line Width', minval = 1, maxval = 4, display = display.all - display.status_line, group = gXLine)
+bullCrossColor = input.color(#1a7b24, 'Bullish cross color', group = gXLine)
+bearCrossColor = input.color(#be0606, 'Bearish cross color', group = gXLine)
+
+
+t00 = timeframe.period
+
+var string t1 = na
+var string t2 = na
+var string t3 = na
+
+if timeframe.period == '720'
+    t00 := '720'
+    t1 := '1D'
+    t2 := '3D'
+    t3 := '1w'
+    t3
+
+if timeframe.period == '1' or timeframe.period == '2' or timeframe.period == '3'
+    t1 := '5'
+    t2 := '15'
+    t3 := '60'
+    t3
+else if timeframe.period == '5'
+    t1 := '15'
+    t2 := '60'
+    t3 := '240'
+    t3
+else if timeframe.period == '15' or timeframe.period == '30'
+    t1 := '60'
+    t2 := '240'
+    t3 := '480'
+    t3
+else if timeframe.period == '45' or timeframe.period == '60'
+    t1 := '120'
+    t2 := '240'
+    t3 := '720'
+    t3
+else if timeframe.period == '120' or timeframe.period == '180'
+    t1 := '240'
+    t2 := '720'
+    t3 := '1D'
+    t3
+else if timeframe.period == '240'
+    t1 := '480'
+    t2 := '720'
+    t3 := '1D'
+    t3
+else if timeframe.period == '360' or timeframe.period == '480'
+    t1 := '720'
+    t2 := '1D'
+    t3 := '3D'
+    t3
+else if timeframe.period == '1D'
+    t1 := '3D'
+    t2 := '1W'
+    t3 := '1M'
+    t3
+else if timeframe.period == '1W' or timeframe.period == '2W'
+    t1 := '1M'
+    t2 := '3M'
+    t3 := '6M'
+    t3
+else if timeframe.period == '1M' or timeframe.period == '2M'
+    t1 := '3M'
+    t2 := '6M'
+    t3 := '1Y'
+    t3
+else
+    t1 := '1D'
+    t2 := '1W'
+    t3 := '1M'
+    t3
+
+
+// Stochastic RSI Calculations
+calculate() =>
+
+    rsi = ta.rsi(rsisource, rsi_len)
+    k_value = ta.sma(ta.stoch(rsi, rsi, rsi, lengthStoch), smoothK1)
+    d_value = ta.sma(k_value, smoothD1)
+    [rsi, k_value, d_value]
+
+// Transform Minutes into Hours
+transform(t) =>
+    str = ''
+    if str.contains(t, '360')
+        str := '6H'
+        str
+    else if str.contains(t, '60')
+        str := '1H'
+        str
+    else if str.contains(t, '120')
+        str := '2H'
+        str
+    else if str.contains(t, '180')
+        str := '3H'
+        str
+    else if str.contains(t, '240')
+        str := '4H'
+        str
+    else if str.contains(t, '480')
+        str := '8H'
+        str
+    else if str.contains(t, '720')
+        str := '12H'
+        str
+    else
+        str := t
+        str
+    str
+
+t_arr = array.new_string(0)
+rsi_arr = array.new_float(0)
+k_arr = array.new_float(0)
+d_arr = array.new_float(0)
+
+t01 = timeframe.period
+t02 = t1
+t03 = t2
+t04 = t3
+
+[rsi011, k011, d011] = request.security(syminfo.tickerid, t01, calculate())
+[rsi012, k012, d012] = request.security(syminfo.tickerid, t02, calculate())
+[rsi013, k013, d013] = request.security(syminfo.tickerid, t03, calculate())
+[rsi021, k021, d021] = request.security(syminfo.tickerid, t04, calculate())
+
+
+array.push(t_arr, t01)
+array.push(t_arr, t02)
+array.push(t_arr, t03)
+array.push(t_arr, t04)
+
+
+
+array.push(rsi_arr, rsi011)
+array.push(rsi_arr, rsi012)
+array.push(rsi_arr, rsi013)
+array.push(rsi_arr, rsi021)
+
+
+
+array.push(k_arr, k011)
+array.push(k_arr, k012)
+array.push(k_arr, k013)
+array.push(k_arr, k021)
+
+array.push(d_arr, d011)
+array.push(d_arr, d012)
+array.push(d_arr, d013)
+array.push(d_arr, d021)
+
+var tbl = table.new(position.middle_right, 4, 11, color.rgb(19, 23, 34), #000000, 1, #000000, 3)
+
+if showTable == true
+
+    table.cell(tbl, 0, 0, 'TMF', text_color = tableTextColor, text_size = textSize)
+    table.cell(tbl, 1, 0, 'RSI', text_color = tableTextColor, text_size = textSize)
+    table.cell(tbl, 2, 0, 'K', text_color = tableTextColor, text_size = textSize)
+    table.cell(tbl, 3, 0, 'D', text_color = tableTextColor, text_size = textSize)
+
+    for i = 0 to array.size(t_arr) - 1 by 1
+        rsi_col = array.get(rsi_arr, i) < 50 ? fallingColor : array.get(rsi_arr, i) > 50 ? risingColor : #421bde
+        k_col = array.get(k_arr, i) < array.get(d_arr, i) ? fallingColor : array.get(k_arr, i) > array.get(d_arr, i) ? risingColor : #421bde
+        d_col = array.get(k_arr, i) < array.get(d_arr, i) ? fallingColor : array.get(k_arr, i) > array.get(d_arr, i) ? risingColor : #421bde
+
+
+        table.cell(tbl, 0, i + 1, transform(array.get(t_arr, i)), text_color = tableTextColor, text_size = textSize)
+        table.cell(tbl, 1, i + 1, str.tostring(array.get(rsi_arr, i), '#.##'), bgcolor = rsi_col, text_color = tableTextColor, text_size = textSize)
+        table.cell(tbl, 2, i + 1, str.tostring(array.get(k_arr, i), '#.##'), bgcolor = k_col, text_color = tableTextColor, text_size = textSize)
+        table.cell(tbl, 3, i + 1, str.tostring(array.get(d_arr, i), '#.##'), bgcolor = d_col, text_color = tableTextColor, text_size = textSize)
+// Set the table position based on the user's choice
+if (tablePosition == 'top left')
+    table.set_position(tbl, position.top_left)
+
+else if (tablePosition == 'top center')
+    table.set_position(tbl,position.top_center )
+
+else if (tablePosition == 'top right')
+    table.set_position(tbl, position.top_right)
+
+else if (tablePosition == 'middle left')
+    table.set_position(tbl, position.middle_left)
+
+else if (tablePosition ==  'middle center')
+    table.set_position(tbl, position.middle_center)
+
+else if (tablePosition ==  'middle right')
+    table.set_position(tbl, position.middle_right)
+
+else if (tablePosition ==  'bottom left')
+    table.set_position(tbl, position.bottom_left)
+
+else if (tablePosition ==  'bottom center')
+    table.set_position(tbl, position.bottom_center)
+
+else if (tablePosition ==  'bottom right')
+    table.set_position(tbl, position.bottom_right)
+
+
+//Pivot points 
+
+var ress1 = line.new(x1 = na, y1 = na, x2 = na, y2 = na, color = r1color, style = lineStyle, width = 1)
+var ress2 = line.new(x1 = na, y1 = na, x2 = na, y2 = na, color = r2color, style = lineStyle, width = 1)
+
+var midrsi = line.new(x1 = na, y1 = na, x2 = na, y2 = na, color = nColor, style = lineStyle, width = 1)
+
+var res5 = line.new(x1 = na, y1 = na, x2 = na, y2 = na, color = r5color, style = lineStyle, width = 1)
+var res6 = line.new(x1 = na, y1 = na, x2 = na, y2 = na, color = r6color, style = lineStyle, width = 1)
+
+lowest = ta.lowest(low, periodK)
+highest = ta.highest(high, periodK)
+
+// Stochastic. It is calculated by a formula: 100 * (close - lowest(low, length)) / (highest(high, length) - lowest(low, length))
+// calculate reverse stochastic starting from formula above
+findStochPrice(level) =>
+    var float rsiRevPrice = na
+    rsiRevPricef = ta.sma(level * (highest - lowest) / 100 + lowest, smoothK)
+    rsiRevPricef
+
+topStoch = findStochPrice(sob)
+overBoughtStoch = findStochPrice(ob)
+midBandPlot = findStochPrice(midlevel)
+overSoldStoch = findStochPrice(os)
+lowStoch = findStochPrice(sos)
+
+line.set_xy1(id = ress1, x = bar_index + lineStartdDistance, y = topStoch)
+line.set_xy2(id = ress1, x = bar_index + labelDistance, y = topStoch)
+
+line.set_xy1(id = ress2, x = bar_index + lineStartdDistance, y = overBoughtStoch)
+line.set_xy2(id = ress2, x = bar_index + labelDistance, y = overBoughtStoch)
+
+line.set_xy1(id = midrsi, x = bar_index + lineStartdDistance, y = midBandPlot)
+line.set_xy2(id = midrsi, x = bar_index + labelDistance, y = midBandPlot)
+
+line.set_xy1(id = res5, x = bar_index + lineStartdDistance, y = overSoldStoch)
+line.set_xy2(id = res5, x = bar_index + labelDistance, y = overSoldStoch)
+
+line.set_xy1(id = res6, x = bar_index + lineStartdDistance, y = lowStoch)
+line.set_xy2(id = res6, x = bar_index + labelDistance, y = lowStoch)
+
+if hideLines == true
+    line.delete(ress1[1])
+    line.delete(ress2[1])
+    line.delete(midrsi[1])
+    line.delete(res5[1])
+    line.delete(res6[1])
+
+if hideLabels == false
+
+    r11 = label.new(bar_index + labelDistance, topStoch, str.tostring(math.round_to_mintick(topStoch)) + '  EOB ' + str.tostring(sob, '#.##'), color = #00000000, textcolor = r1color, style = label.style_label_left, size = size.normal)
+    r22 = label.new(bar_index + labelDistance, overBoughtStoch, str.tostring(math.round_to_mintick(overBoughtStoch)) + '  OB ' + str.tostring(ob, '#.##'), color = #00000000, textcolor = r2color, style = label.style_label_left, size = size.normal)
+    r44 = label.new(bar_index + labelDistance, midBandPlot, str.tostring(math.round_to_mintick(midBandPlot)) + '  HALF ' + str.tostring(midlevel, '#.##'), color = #00000000, textcolor = nColor, style = label.style_label_left, size = size.normal)
+    r66 = label.new(bar_index + labelDistance, overSoldStoch, str.tostring(math.round_to_mintick(overSoldStoch)) + '  OS ' + str.tostring(os, '#.##'), color = #00000000, textcolor = r5color, style = label.style_label_left, size = size.normal)
+    r77 = label.new(bar_index + labelDistance, lowStoch, str.tostring(math.round_to_mintick(lowStoch)) + '  EOS ' + str.tostring(sos, '#.##'), color = #00000000, textcolor = r6color, style = label.style_label_left, size = size.normal)
+
+    label.delete(r11[1])
+    label.delete(r22[1])
+    label.delete(r44[1])
+    label.delete(r66[1])
+    label.delete(r77[1])
+
+[rsim, km, dm] = request.security(syminfo.tickerid, timeframe.period, calculate())
+
+// Raw K/D crosses
+DIPcross = km > dm and km[1] <= dm[1]
+DINcross = km < dm and km[1] >= dm[1]
+
+// ─── Extreme zone filter ────────────────────────────────────────────────────
+// Zone boundaries: either the pivot OB/OS inputs or the custom ones.
+xOB = useLevelsFromPivots ? ob : customOB
+xOS = useLevelsFromPivots ? os : customOS
+
+// The cross bar and the bar before it are both taken into account, so a cross
+// that completes on the bar the lines leave the zone still qualifies.
+kLow = math.min(km, nz(km[1], km))
+dLow = math.min(dm, nz(dm[1], dm))
+kHigh = math.max(km, nz(km[1], km))
+dHigh = math.max(dm, nz(dm[1], dm))
+
+bullInZone = switch zoneBasis
+    'K only' => kLow <= xOS
+    'D only' => dLow <= xOS
+    'K and D' => kLow <= xOS and dLow <= xOS
+    => kLow <= xOS or dLow <= xOS
+
+bearInZone = switch zoneBasis
+    'K only' => kHigh >= xOB
+    'D only' => dHigh >= xOB
+    'K and D' => kHigh >= xOB and dHigh >= xOB
+    => kHigh >= xOB or dHigh >= xOB
+
+extremeOnly = crossFilterMode == 'Extreme zones only'
+
+bullCross = plotstochCrosses and DIPcross and (not extremeOnly or bullInZone)
+bearCross = plotstochCrosses and DINcross and (not extremeOnly or bearInZone)
+
+plotshape(bullCross, 'Stochastic cross Up', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
+plotshape(bearCross, 'Stochastic cross Down', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.abovebar, display = display.all - display.status_line)
+
+// ─── Horizontal lines on the accepted crossovers ────────────────────────────
+xOSPrice = findStochPrice(xOS)
+xOBPrice = findStochPrice(xOB)
+
+bullCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? low : xOSPrice
+bearCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? high : xOBPrice
+
+crossLineExtendMode = crossLineExtend ? extend.right : extend.none
+
+var array<line> bullCrossLines = array.new<line>()
+var array<line> bearCrossLines = array.new<line>()
+var array<label> bullCrossLabels = array.new<label>()
+var array<label> bearCrossLabels = array.new<label>()
+
+if showCrossLines and bullCross and not na(bullCrossPrice)
+    bl = line.new(bar_index, bullCrossPrice, bar_index + crossLineLen, bullCrossPrice, color = bullCrossColor, style = crossLineStyle, width = crossLineWidth, extend = crossLineExtendMode)
+    array.push(bullCrossLines, bl)
+    if array.size(bullCrossLines) > maxCrossLines
+        line.delete(array.shift(bullCrossLines))
+    if showCrossLineLabels
+        blb = label.new(bar_index + crossLineLen, bullCrossPrice, str.tostring(math.round_to_mintick(bullCrossPrice)), color = #00000000, textcolor = bullCrossColor, style = label.style_label_left, size = size.small)
+        array.push(bullCrossLabels, blb)
+        if array.size(bullCrossLabels) > maxCrossLines
+            label.delete(array.shift(bullCrossLabels))
+
+if showCrossLines and bearCross and not na(bearCrossPrice)
+    br = line.new(bar_index, bearCrossPrice, bar_index + crossLineLen, bearCrossPrice, color = bearCrossColor, style = crossLineStyle, width = crossLineWidth, extend = crossLineExtendMode)
+    array.push(bearCrossLines, br)
+    if array.size(bearCrossLines) > maxCrossLines
+        line.delete(array.shift(bearCrossLines))
+    if showCrossLineLabels
+        brb = label.new(bar_index + crossLineLen, bearCrossPrice, str.tostring(math.round_to_mintick(bearCrossPrice)), color = #00000000, textcolor = bearCrossColor, style = label.style_label_left, size = size.small)
+        array.push(bearCrossLabels, brb)
+        if array.size(bearCrossLabels) > maxCrossLines
+            label.delete(array.shift(bearCrossLabels))
+
+alertcondition(bullCross, 'Stoch cross up (filtered)', 'Stochastic K crossed above D')
+alertcondition(bearCross, 'Stoch cross down (filtered)', 'Stochastic K crossed below D')
