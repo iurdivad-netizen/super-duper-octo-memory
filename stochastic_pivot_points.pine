@@ -110,7 +110,9 @@ crossLineStop = input.string('Wick', title = 'Price crosses the line on', option
 crossLineLen = input.int(50, title = 'Line length (bars)', minval = 1, maxval = 500, display = display.all - display.status_line, group = gXLine, tooltip = 'Length for "Fixed length" mode. Capped at 500 because Pine cannot draw further than 500 bars past the last bar.')
 maxCrossLines = input.int(10, title = 'Number of lines to keep (per direction)', minval = 0, maxval = 200, display = display.all - display.status_line, group = gXLine, tooltip = 'How many signal lines stay on the chart for each direction; the oldest is removed when a new one is drawn. 10 means the last 10 bullish and the last 10 bearish lines.\n0 keeps every line, in which case TradingView itself starts dropping the oldest drawings once the script reaches 500 of them.')
 
-dropCrossedLines = input.bool(false, title = 'Drop lines once price crosses them', group = gXLine, tooltip = 'Only used by "Until price crosses it". On: a level is deleted the moment price trades through it, so only levels that still hold are on the chart and the count above applies to those. Off: the broken line stays, frozen at the bar that took it out.')
+crossedAction = input.string('Stop it there', title = 'When price crosses the line', options = ['Stop it there', 'Keep extending it', 'Delete it'], display = display.all - display.status_line, group = gXLine, tooltip = 'Only used by "Until price crosses it".\nStop it there: the line ends at the bar that traded through the level.\nKeep extending it: the line carries on past the cross and keeps growing, so the level stays on the chart as a reference after it was tested.\nDelete it: the level is removed on the cross, leaving only the ones that still hold.')
+
+fadeCrossedLines = input.bool(true, title = 'Fade the continuation after the cross', group = gXLine, tooltip = 'Only applies to "Keep extending it". The stretch before the cross keeps the solid signal line and the continuation is drawn dotted and semi-transparent, so where price took the level out stays readable and a tested level does not look like a live one.')
 
 showCrossLineLabels = input.bool(false, title = 'Show price label on cross lines', group = gXLine)
 
@@ -477,15 +479,19 @@ untilCrossed = crossLineMode == 'Until price crosses it'
 extendRight = crossLineMode == 'Extend to the right'
 crossLineExtendMode = extendRight ? extend.right : extend.none
 stopOnWick = crossLineStop == 'Wick'
+deleteOnCross = crossedAction == 'Delete it'
+keepAfterCross = crossedAction == 'Keep extending it'
 
 // A drawn level, with what is needed to know when price has taken it out.
 type CrossLine
     line ln
+    line ln2
     label lb
     float price
     int startBar
     bool breakDown
-    bool active
+    bool crossed
+    color col
 
 // Kept alongside the line so a level that price has already gone through is
 // frozen where it was broken instead of following the chart forever.
@@ -499,7 +505,7 @@ newCrossLine(float p, bool up) =>
     // Which way price has to go to take the level out: a bullish line is
     // support and breaks downwards, a bearish one is resistance and breaks
     // upwards. A line drawn on the wrong side of price flips accordingly.
-    CrossLine.new(ln = ln, lb = lb, price = p, startBar = bar_index, breakDown = up ? close >= p : close > p, active = true)
+    CrossLine.new(ln = ln, ln2 = na, lb = lb, price = p, startBar = bar_index, breakDown = up ? close >= p : close > p, crossed = false, col = col)
 
 var array<CrossLine> bullCrossLines = array.new<CrossLine>()
 var array<CrossLine> bearCrossLines = array.new<CrossLine>()
@@ -510,20 +516,29 @@ updateCrossLines(array<CrossLine> arr) =>
     if array.size(arr) > 0
         for i = array.size(arr) - 1 to 0
             cl = array.get(arr, i)
-            if cl.active and bar_index > cl.startBar
-                hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
-                if hit
-                    cl.active := false
-                    if dropCrossedLines
-                        // array.remove returns the element, so it cannot be
-                        // the last statement here: the branch would then be
-                        // typed CrossLine while the else branch is void.
-                        array.remove(arr, i)
-                        line.delete(cl.ln)
-                        if not na(cl.lb)
-                            label.delete(cl.lb)
-                else
-                    line.set_x2(cl.ln, bar_index + 1)
+            if bar_index > cl.startBar
+                if not cl.crossed
+                    hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
+                    if hit
+                        cl.crossed := true
+                        // A line carries one colour and one style, so the
+                        // faded continuation has to be a second line: the
+                        // original is left ending at the crossing bar.
+                        if keepAfterCross and fadeCrossedLines
+                            cl.ln2 := line.new(bar_index, cl.price, bar_index + 1, cl.price, color = color.new(cl.col, 55), style = line.style_dotted, width = crossLineWidth)
+                            line.set_x2(cl.ln, bar_index)
+                if cl.crossed and deleteOnCross
+                    // array.remove returns the element, so it cannot be the
+                    // last statement here: the branch would then be typed
+                    // CrossLine while the other branch is void.
+                    array.remove(arr, i)
+                    line.delete(cl.ln)
+                    if not na(cl.ln2)
+                        line.delete(cl.ln2)
+                    if not na(cl.lb)
+                        label.delete(cl.lb)
+                else if keepAfterCross or not cl.crossed
+                    line.set_x2(na(cl.ln2) ? cl.ln : cl.ln2, bar_index + 1)
                     if not na(cl.lb)
                         label.set_x(cl.lb, bar_index + 1)
 
@@ -532,6 +547,8 @@ trimCrossLines(array<CrossLine> arr) =>
     if maxCrossLines > 0 and array.size(arr) > maxCrossLines
         gone = array.shift(arr)
         line.delete(gone.ln)
+        if not na(gone.ln2)
+            line.delete(gone.ln2)
         if not na(gone.lb)
             label.delete(gone.lb)
 
