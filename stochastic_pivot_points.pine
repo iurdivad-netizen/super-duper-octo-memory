@@ -74,12 +74,23 @@ customOS = input.float(20.0, title = 'Custom oversold level', minval = 0.0, maxv
 
 zoneBasis = input.string('K or D', title = 'Zone test applies to', options = ['K or D', 'K and D', 'K only', 'D only'], display = display.all - display.status_line, group = gCross, tooltip = 'Which stochastic lines must sit inside the extreme zone for the cross to count. The cross bar and the bar before it are both considered, so a cross that is completed just as the lines leave the zone still counts.')
 
+zoneLookback = input.int(2, title = 'Zone lookback (bars)', minval = 1, maxval = 20, display = display.all - display.status_line, group = gCross, tooltip = 'How far back from the cross the stochastic is allowed to have been inside the zone.\n1 = the cross bar only (strictest).\n2 = the cross bar or the one before it (default).\nRaise it if the stochastic tends to leave the zone a bar or two before K and D actually cross.')
+
 crossShapeLocation = input.string('Above / below the bar', title = 'Triangle position', options = ['Above / below the bar', 'At the stoch OB / OS level'], display = display.all - display.status_line, group = gCross, tooltip = 'Above / below the bar: the usual placement next to the signal candle.\nAt the stoch OB / OS level: the triangle is drawn at the price that matches the oversold level (bullish) or the overbought level (bearish), so the signals sit in the extreme band instead of on the candles.')
 
 // ─── Alerts ─────────────────────────────────────────────────────────────────
 gAlert = 'Alerts'
 
 alertFilterMode = input.string('Follow the chart filter', title = 'Alert on', options = ['Follow the chart filter', 'Extreme zones only', 'All crosses'], display = display.all - display.status_line, group = gAlert, tooltip = 'Which crosses fire the "Stoch cross up / down" alert conditions.\nFollow the chart filter: whatever the Cross Signals Filter is set to.\nExtreme zones only: alert only on crosses inside the oversold / overbought zones, even if every cross is shown on the chart.\nAll crosses: alert on every cross.\nAlerts ignore the "Show Stochastic Cross signals" toggle, so you can alert without the triangles on screen.')
+
+showCrossBg = input.bool(false, title = 'Highlight signal bars with a background band', group = gCross, tooltip = 'Colours the whole bar column on an accepted cross. The triangles are size.tiny and easy to lose on a busy chart; this makes the signals impossible to miss.')
+
+// ─── Diagnostics ────────────────────────────────────────────────────────────
+gDebug = 'Diagnostics'
+
+showRawCrosses = input.bool(false, title = 'Mark every unfiltered cross with a dot', group = gDebug, tooltip = 'Plots a small dot on every raw K/D cross, whatever the filter is set to. If the dots appear but the triangles do not, the extreme filter is rejecting the crosses; if no dots appear either, the stochastic itself is producing no crosses on this symbol / timeframe.')
+
+showDebugTable = input.bool(false, title = 'Show the signal diagnostics table', group = gDebug, tooltip = 'Bottom-left table with the live K and D values, the zone levels in use, and how many crosses were found and how many survived the filter over the chart history.')
 
 // ─── Horizontal line on accepted crossovers ─────────────────────────────────
 gXLine = 'Cross Signal Lines'
@@ -371,12 +382,12 @@ DINcross = km < dm and km[1] >= dm[1]
 xOB = useLevelsFromPivots ? ob : customOB
 xOS = useLevelsFromPivots ? os : customOS
 
-// The cross bar and the bar before it are both taken into account, so a cross
-// that completes on the bar the lines leave the zone still qualifies.
-kLow = math.min(km, nz(km[1], km))
-dLow = math.min(dm, nz(dm[1], dm))
-kHigh = math.max(km, nz(km[1], km))
-dHigh = math.max(dm, nz(dm[1], dm))
+// The zone test looks back over `zoneLookback` bars (the cross bar included),
+// so a cross that completes just as the lines leave the zone still qualifies.
+kLow = ta.lowest(km, zoneLookback)
+dLow = ta.lowest(dm, zoneLookback)
+kHigh = ta.highest(km, zoneLookback)
+dHigh = ta.highest(dm, zoneLookback)
 
 bullInZone = switch zoneBasis
     'K only' => kLow <= xOS
@@ -414,6 +425,8 @@ plotshape(bearShapeBar, 'Stochastic cross Down', style = shape.triangledown, col
 plotshape(bullShapeLevel, 'Stochastic cross Up (at OS level)', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.absolute, display = display.all - display.status_line)
 plotshape(bearShapeLevel, 'Stochastic cross Down (at OB level)', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.absolute, display = display.all - display.status_line)
 
+bgcolor(showCrossBg and bullCross ? color.new(risingColor, 85) : showCrossBg and bearCross ? color.new(fallingColor, 85) : na, title = 'Cross signal background')
+
 // ─── Horizontal lines on the accepted crossovers ────────────────────────────
 bullCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? low : xOSPrice
 bearCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? high : xOBPrice
@@ -446,6 +459,49 @@ if showCrossLines and bearCross and not na(bearCrossPrice)
         array.push(bearCrossLabels, brb)
         if array.size(bearCrossLabels) > maxCrossLines
             label.delete(array.shift(bearCrossLabels))
+
+// ─── Diagnostics output ─────────────────────────────────────────────────────
+plotshape(showRawCrosses and DIPcross, 'Raw cross Up (debug)', style = shape.circle, color = color.new(risingColor, 40), size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
+plotshape(showRawCrosses and DINcross, 'Raw cross Down (debug)', style = shape.circle, color = color.new(fallingColor, 40), size = size.tiny, location = location.abovebar, display = display.all - display.status_line)
+
+var int rawUpCount = 0
+var int rawDnCount = 0
+var int sigUpCount = 0
+var int sigDnCount = 0
+
+if DIPcross
+    rawUpCount += 1
+if DINcross
+    rawDnCount += 1
+if DIPcross and (not extremeOnly or bullInZone)
+    sigUpCount += 1
+if DINcross and (not extremeOnly or bearInZone)
+    sigDnCount += 1
+
+// ta.* has to run on every bar, so the counters are resolved outside the table.
+barsSinceUp = nz(ta.barssince(bullCross), 99999)
+barsSinceDn = nz(ta.barssince(bearCross), 99999)
+barsSinceSig = math.min(barsSinceUp, barsSinceDn)
+
+var table dbg = table.new(position.bottom_left, 2, 8, color.rgb(19, 23, 34), #000000, 1, #000000, 2)
+
+if showDebugTable and barstate.islast
+    table.cell(dbg, 0, 0, 'K / D now', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 0, str.tostring(km, '#.##') + ' / ' + str.tostring(dm, '#.##'), text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 1, 'Zone OS / OB', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 1, str.tostring(xOS, '#.##') + ' / ' + str.tostring(xOB, '#.##'), text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 2, 'K low / high (' + str.tostring(zoneLookback) + ')', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 2, str.tostring(kLow, '#.##') + ' / ' + str.tostring(kHigh, '#.##'), text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 3, 'Filter', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 3, crossFilterMode, text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 4, 'Raw crosses up / down', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 4, str.tostring(rawUpCount) + ' / ' + str.tostring(rawDnCount), text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 5, 'Kept up / down', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 5, str.tostring(sigUpCount) + ' / ' + str.tostring(sigDnCount), bgcolor = sigUpCount + sigDnCount > 0 ? risingColor : fallingColor, text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 6, 'Triangles', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 6, plotstochCrosses ? crossShapeLocation : 'OFF (Show Stochastic Cross signals)', bgcolor = plotstochCrosses ? risingColor : fallingColor, text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 0, 7, 'Bars since last kept', text_color = tableTextColor, text_size = size.small)
+    table.cell(dbg, 1, 7, sigUpCount + sigDnCount > 0 ? str.tostring(barsSinceSig) : 'n/a', text_color = tableTextColor, text_size = size.small)
 
 // ─── Alert conditions ───────────────────────────────────────────────────────
 // Independent of the chart filter and of the "Show Stochastic Cross signals"
