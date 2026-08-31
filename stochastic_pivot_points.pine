@@ -108,7 +108,9 @@ crossLineMode = input.string('Fixed length', title = 'Line behaviour', options =
 crossLineStop = input.string('Wick', title = 'Price crosses the line on', options = ['Wick', 'Close'], display = display.all - display.status_line, group = gXLine, tooltip = 'Only used by "Until price crosses it".\nWick: the line stops the first time a high or low trades through the level.\nClose: it takes a close on the other side of the level.')
 
 crossLineLen = input.int(50, title = 'Line length (bars)', minval = 1, maxval = 500, display = display.all - display.status_line, group = gXLine, tooltip = 'Length for "Fixed length" mode. Capped at 500 because Pine cannot draw further than 500 bars past the last bar.')
-maxCrossLines = input.int(10, title = 'Max lines kept per direction', minval = 1, maxval = 200, display = display.all - display.status_line, group = gXLine)
+maxCrossLines = input.int(10, title = 'Number of lines to keep (per direction)', minval = 0, maxval = 200, display = display.all - display.status_line, group = gXLine, tooltip = 'How many signal lines stay on the chart for each direction; the oldest is removed when a new one is drawn. 10 means the last 10 bullish and the last 10 bearish lines.\n0 keeps every line, in which case TradingView itself starts dropping the oldest drawings once the script reaches 500 of them.')
+
+dropCrossedLines = input.bool(false, title = 'Drop lines once price crosses them', group = gXLine, tooltip = 'Only used by "Until price crosses it". On: a level is deleted the moment price trades through it, so only levels that still hold are on the chart and the count above applies to those. Off: the broken line stays, frozen at the bar that took it out.')
 
 showCrossLineLabels = input.bool(false, title = 'Show price label on cross lines', group = gXLine)
 
@@ -502,43 +504,47 @@ newCrossLine(float p, bool up) =>
 var array<CrossLine> bullCrossLines = array.new<CrossLine>()
 var array<CrossLine> bearCrossLines = array.new<CrossLine>()
 
+// Extends every level that still holds and closes the ones price went
+// through. Walked backwards so a dropped line can be removed in place.
+updateCrossLines(array<CrossLine> arr) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            cl = array.get(arr, i)
+            if cl.active and bar_index > cl.startBar
+                hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
+                if hit
+                    cl.active := false
+                    if dropCrossedLines
+                        line.delete(cl.ln)
+                        if not na(cl.lb)
+                            label.delete(cl.lb)
+                        array.remove(arr, i)
+                else
+                    line.set_x2(cl.ln, bar_index + 1)
+                    if not na(cl.lb)
+                        label.set_x(cl.lb, bar_index + 1)
+
+// Trims the oldest line once the array is over the keep count. 0 = keep all.
+trimCrossLines(array<CrossLine> arr) =>
+    if maxCrossLines > 0 and array.size(arr) > maxCrossLines
+        gone = array.shift(arr)
+        line.delete(gone.ln)
+        if not na(gone.lb)
+            label.delete(gone.lb)
+
 // Grow the live levels first, so a line created on this bar is never closed by
 // the bar that drew it.
 if untilCrossed
-    for cl in bullCrossLines
-        if cl.active and bar_index > cl.startBar
-            hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
-            if hit
-                cl.active := false
-            else
-                line.set_x2(cl.ln, bar_index + 1)
-                if not na(cl.lb)
-                    label.set_x(cl.lb, bar_index + 1)
-    for cl in bearCrossLines
-        if cl.active and bar_index > cl.startBar
-            hit = cl.breakDown ? (stopOnWick ? low : close) < cl.price : (stopOnWick ? high : close) > cl.price
-            if hit
-                cl.active := false
-            else
-                line.set_x2(cl.ln, bar_index + 1)
-                if not na(cl.lb)
-                    label.set_x(cl.lb, bar_index + 1)
+    updateCrossLines(bullCrossLines)
+    updateCrossLines(bearCrossLines)
 
 if showCrossLines and bullCross and not na(bullCrossPrice)
     array.push(bullCrossLines, newCrossLine(bullCrossPrice, true))
-    if array.size(bullCrossLines) > maxCrossLines
-        gone = array.shift(bullCrossLines)
-        line.delete(gone.ln)
-        if not na(gone.lb)
-            label.delete(gone.lb)
+    trimCrossLines(bullCrossLines)
 
 if showCrossLines and bearCross and not na(bearCrossPrice)
     array.push(bearCrossLines, newCrossLine(bearCrossPrice, false))
-    if array.size(bearCrossLines) > maxCrossLines
-        gone = array.shift(bearCrossLines)
-        line.delete(gone.ln)
-        if not na(gone.lb)
-            label.delete(gone.lb)
+    trimCrossLines(bearCrossLines)
 
 // ─── Diagnostics output ─────────────────────────────────────────────────────
 plotshape(showRawCrosses and DIPcross, 'Raw cross Up (debug)', style = shape.circle, color = color.new(risingColor, 40), size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
