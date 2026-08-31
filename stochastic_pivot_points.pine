@@ -114,7 +114,7 @@ crossedAction = input.string('Stop it there', title = 'When price crosses the li
 
 fadeCrossedLines = input.bool(true, title = 'Fade the continuation after the cross', group = gXLine, tooltip = 'Only applies to "Keep extending it". The stretch before the cross keeps the solid signal line and the continuation is drawn dotted and semi-transparent, so where price took the level out stays readable and a tested level does not look like a live one.')
 
-showCrossLineLabels = input.bool(false, title = 'Show price label on cross lines', group = gXLine)
+crossLineLabels = input.string('Active lines only', title = 'Show the price on the lines', options = ['Off', 'Active lines only', 'All lines'], display = display.all - display.status_line, group = gXLine, tooltip = 'Prints the level at the right-hand end of each signal line.\nActive lines only: the price is dropped as soon as price crosses the level, so only levels that still hold carry a number. Same as "All lines" in the fixed-length and extend-right modes, where nothing is ever marked as crossed.\nAll lines: crossed levels keep their price too.')
 
 crossLineStyleOption = input.string('solid (─)', title = 'Cross Line Style', options = ['solid (─)', 'dotted (┈)', 'dashed (╌)'], display = display.all - display.status_line, group = gXLine)
 
@@ -479,6 +479,8 @@ untilCrossed = crossLineMode == 'Until price crosses it'
 extendRight = crossLineMode == 'Extend to the right'
 crossLineExtendMode = extendRight ? extend.right : extend.none
 stopOnWick = crossLineStop == 'Wick'
+labelsOn = crossLineLabels != 'Off'
+labelsActiveOnly = crossLineLabels == 'Active lines only'
 deleteOnCross = crossedAction == 'Delete it'
 keepAfterCross = crossedAction == 'Keep extending it'
 
@@ -500,7 +502,7 @@ newCrossLine(float p, bool up) =>
     col = up ? bullCrossColor : bearCrossColor
     ln = line.new(bar_index, p, x2, p, color = col, style = crossLineStyle, width = crossLineWidth, extend = crossLineExtendMode)
     label lb = na
-    if showCrossLineLabels
+    if labelsOn
         lb := label.new(x2, p, str.tostring(math.round_to_mintick(p)), color = #00000000, textcolor = col, style = label.style_label_left, size = size.small)
     // Which way price has to go to take the level out: a bullish line is
     // support and breaks downwards, a bearish one is resistance and breaks
@@ -527,6 +529,12 @@ updateCrossLines(array<CrossLine> arr) =>
                         if keepAfterCross and fadeCrossedLines
                             cl.ln2 := line.new(bar_index, cl.price, bar_index + 1, cl.price, color = color.new(cl.col, 55), style = line.style_dotted, width = crossLineWidth)
                             line.set_x2(cl.ln, bar_index)
+                        // The price belongs to a level that still holds, so it
+                        // goes when the level is taken out.
+                        if labelsActiveOnly and not na(cl.lb)
+                            gone = cl.lb
+                            cl.lb := na
+                            label.delete(gone)
                 if cl.crossed and deleteOnCross
                     // array.remove returns the element, so it cannot be the
                     // last statement here: the branch would then be typed
