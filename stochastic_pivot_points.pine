@@ -74,6 +74,13 @@ customOS = input.float(20.0, title = 'Custom oversold level', minval = 0.0, maxv
 
 zoneBasis = input.string('K or D', title = 'Zone test applies to', options = ['K or D', 'K and D', 'K only', 'D only'], display = display.all - display.status_line, group = gCross, tooltip = 'Which stochastic lines must sit inside the extreme zone for the cross to count. The cross bar and the bar before it are both considered, so a cross that is completed just as the lines leave the zone still counts.')
 
+crossShapeLocation = input.string('Above / below the bar', title = 'Triangle position', options = ['Above / below the bar', 'At the stoch OB / OS level'], display = display.all - display.status_line, group = gCross, tooltip = 'Above / below the bar: the usual placement next to the signal candle.\nAt the stoch OB / OS level: the triangle is drawn at the price that matches the oversold level (bullish) or the overbought level (bearish), so the signals sit in the extreme band instead of on the candles.')
+
+// ─── Alerts ─────────────────────────────────────────────────────────────────
+gAlert = 'Alerts'
+
+alertFilterMode = input.string('Follow the chart filter', title = 'Alert on', options = ['Follow the chart filter', 'Extreme zones only', 'All crosses'], display = display.all - display.status_line, group = gAlert, tooltip = 'Which crosses fire the "Stoch cross up / down" alert conditions.\nFollow the chart filter: whatever the Cross Signals Filter is set to.\nExtreme zones only: alert only on crosses inside the oversold / overbought zones, even if every cross is shown on the chart.\nAll crosses: alert on every cross.\nAlerts ignore the "Show Stochastic Cross signals" toggle, so you can alert without the triangles on screen.')
+
 // ─── Horizontal line on accepted crossovers ─────────────────────────────────
 gXLine = 'Cross Signal Lines'
 
@@ -385,16 +392,29 @@ bearInZone = switch zoneBasis
 
 extremeOnly = crossFilterMode == 'Extreme zones only'
 
-bullCross = plotstochCrosses and DIPcross and (not extremeOnly or bullInZone)
-bearCross = plotstochCrosses and DINcross and (not extremeOnly or bearInZone)
-
-plotshape(bullCross, 'Stochastic cross Up', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
-plotshape(bearCross, 'Stochastic cross Down', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.abovebar, display = display.all - display.status_line)
-
-// ─── Horizontal lines on the accepted crossovers ────────────────────────────
+// Price of the two zone boundaries, using the same reverse-stochastic math as
+// the pivot lines. Also used to place the triangles inside the extreme band.
 xOSPrice = findStochPrice(xOS)
 xOBPrice = findStochPrice(xOB)
 
+// Signals that drive the on-chart triangles and the cross lines.
+bullCross = plotstochCrosses and DIPcross and (not extremeOnly or bullInZone)
+bearCross = plotstochCrosses and DINcross and (not extremeOnly or bearInZone)
+
+// ─── Cross triangles ────────────────────────────────────────────────────────
+shapeAtLevel = crossShapeLocation == 'At the stoch OB / OS level'
+
+bullShapeBar = bullCross and not shapeAtLevel
+bearShapeBar = bearCross and not shapeAtLevel
+bullShapeLevel = bullCross and shapeAtLevel ? xOSPrice : na
+bearShapeLevel = bearCross and shapeAtLevel ? xOBPrice : na
+
+plotshape(bullShapeBar, 'Stochastic cross Up', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.belowbar, display = display.all - display.status_line)
+plotshape(bearShapeBar, 'Stochastic cross Down', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.abovebar, display = display.all - display.status_line)
+plotshape(bullShapeLevel, 'Stochastic cross Up (at OS level)', style = shape.triangleup, color = risingColor, size = size.tiny, location = location.absolute, display = display.all - display.status_line)
+plotshape(bearShapeLevel, 'Stochastic cross Down (at OB level)', style = shape.triangledown, color = fallingColor, size = size.tiny, location = location.absolute, display = display.all - display.status_line)
+
+// ─── Horizontal lines on the accepted crossovers ────────────────────────────
 bullCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? low : xOSPrice
 bearCrossPrice = crossLineAnchor == 'Cross bar close' ? close : crossLineAnchor == 'Cross bar extreme' ? high : xOBPrice
 
@@ -427,5 +447,15 @@ if showCrossLines and bearCross and not na(bearCrossPrice)
         if array.size(bearCrossLabels) > maxCrossLines
             label.delete(array.shift(bearCrossLabels))
 
-alertcondition(bullCross, 'Stoch cross up (filtered)', 'Stochastic K crossed above D')
-alertcondition(bearCross, 'Stoch cross down (filtered)', 'Stochastic K crossed below D')
+// ─── Alert conditions ───────────────────────────────────────────────────────
+// Independent of the chart filter and of the "Show Stochastic Cross signals"
+// toggle, so the extreme crosses can be alerted on while every cross is shown,
+// or vice versa.
+alertExtremeOnly = alertFilterMode == 'Extreme zones only' or (alertFilterMode == 'Follow the chart filter' and extremeOnly)
+
+bullAlertSignal = DIPcross and (not alertExtremeOnly or bullInZone)
+bearAlertSignal = DINcross and (not alertExtremeOnly or bearInZone)
+
+alertcondition(bullAlertSignal, 'Stoch cross up', 'Stochastic K crossed above D')
+alertcondition(bearAlertSignal, 'Stoch cross down', 'Stochastic K crossed below D')
+alertcondition(bullAlertSignal or bearAlertSignal, 'Stoch cross (any direction)', 'Stochastic K/D cross')
