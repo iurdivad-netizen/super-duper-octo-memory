@@ -39,11 +39,45 @@ Symbols (verified on TradingView):
 
 | Preset | Symbol |
 |--------|--------|
+| Auto | resolved from the chart symbol — below |
 | NYSE | `USI:TICK` |
 | Nasdaq | `USI:TICKQ` |
 | Dow | `USI:TICKI` |
 | All US stocks | `USI:TICK.US` |
 | Custom | whatever you type |
+
+### Auto (the default)
+
+`f_autoTick()` picks the index the chart symbol actually belongs to, so the pane stays
+right when you flip from NVDA to ES. Resolution order, first match wins:
+
+| Test | Result |
+|------|--------|
+| Ticker/root in `NQ, MNQ, QQQ, QQQM, NDX, IXIC, ONEQ` | `USI:TICKQ` |
+| Ticker/root in `YM, MYM, DIA, DJI, DJIA, INDU` | `USI:TICKI` |
+| Ticker/root in `ES, MES, SPX, SPY, IVV, VOO, RTY, M2K, RUT, IWM, VTI, NYA` | `USI:TICK` |
+| Exchange prefix contains `NASDAQ` | `USI:TICKQ` |
+| Exchange prefix contains `NYSE` / `AMEX` / `ARCA` | `USI:TICK` |
+| Exchange prefix contains `BATS` / `CBOE` / `EDG` | `USI:TICK.US` |
+| anything else | the `Auto fallback` input |
+
+The explicit ticker map runs **before** the exchange rules on purpose: SPY is `AMEX:SPY`
+and DIA is `AMEX:DIA` on TradingView, so venue alone would file both under NYSE TICK and
+DIA would lose its Dow index. A US composite feed (BATS/CBOE/EDGX) tells you the symbol
+is US-listed but not *where*, so it gets the all-US index rather than a coin flip between
+NYSE and Nasdaq.
+
+Two implementation choices worth keeping:
+
+- **Built on `syminfo.ticker`, not `syminfo.root`.** `root` is documented to return the
+  ticker for non-derivatives, but a `na` root would poison every string operation
+  downstream. Futures roots are recovered from the ticker's first two or three characters
+  instead (`ES1!` → `ES`, `MNQ1!` → `MNQ`).
+- **That head-matching is gated on `syminfo.type == "futures"`.** Without the gate, the
+  Nasdaq-listed stock `ESTC` matches the `ES` futures root and gets handed NYSE TICK.
+
+The table's first row shows the resolved symbol with `(auto)` appended, so the choice is
+never invisible.
 
 **This is the one real limitation.** TICK is an index feed. If a plan does not carry it,
 `request.security` returns `na` on every bar and the pane is simply empty — which looks

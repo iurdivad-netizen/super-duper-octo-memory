@@ -27,6 +27,11 @@
 //   * A session stats table: last, session high/low, cumulative, and how many
 //     bars have tagged each extreme today.
 //
+// The index defaults to Auto: it reads the chart symbol and pulls the exchange
+// that actually drives it — Nasdaq-listed names and NQ/QQQ get the Nasdaq TICK,
+// NYSE names and ES/SPY the NYSE TICK — so the pane stays right when you switch
+// symbols. The stats table shows which index it landed on.
+//
 // Data note: TICK is an index feed (USI:TICK and friends). If your TradingView
 // plan does not carry it, the pane will be empty and the script says so on the
 // chart instead of failing silently. The index only prints during the regular
@@ -59,18 +64,27 @@ G_TBL = "Stats table"
 G_COL = "Colours"
 
 // --- source -----------------------------------------------------------------
+I_AUTO   = "Auto  (match the chart symbol)"
 I_NYSE   = "NYSE  ($TICK / USI:TICK)"
 I_NDQ    = "Nasdaq  ($TICKQ / USI:TICKQ)"
 I_DOW    = "Dow  ($TIKI / USI:TICKI)"
 I_US     = "All US stocks  (USI:TICK.US)"
 I_CUSTOM = "Custom symbol"
 
-i_index  = input.string(I_NYSE, "Index",
-     options = [I_NYSE, I_NDQ, I_DOW, I_US, I_CUSTOM],
+i_index  = input.string(I_AUTO, "Index",
+     options = [I_AUTO, I_NYSE, I_NDQ, I_DOW, I_US, I_CUSTOM],
      group = G_SRC,
-     tooltip = "Which breadth index to pull. USI:TICK (NYSE) is the classic read; " +
-               "USI:TICKQ or USI:TICK.US suit Nasdaq-listed names. Pick " +
-               "'Custom symbol' to use any ticker your data plan carries.")
+     tooltip = "Which breadth index to pull. 'Auto' reads the chart symbol and " +
+               "picks the exchange that actually drives it: Nasdaq-listed names " +
+               "and NQ/QQQ get USI:TICKQ, Dow names and YM/DIA get USI:TICKI, " +
+               "NYSE-listed names and ES/SPY get USI:TICK. Anything it cannot " +
+               "place falls back to the symbol set below.")
+i_autoFb = input.string(I_NYSE, "Auto fallback",
+     options = [I_NYSE, I_NDQ, I_DOW, I_US], group = G_SRC,
+     tooltip = "Used by 'Auto' when the chart symbol is not a US equity, index or " +
+               "index future it recognises — a European stock, an FX pair, crypto. " +
+               "USI:TICK.US is the broadest choice; USI:TICK is the most widely " +
+               "carried.")
 i_custom = input.symbol("USI:TICK", "Custom symbol", group = G_SRC,
      tooltip = "Only used when Index is set to 'Custom symbol'.")
 i_hideNa = input.bool(true, "Hide bars with no new TICK data", group = G_SRC,
@@ -165,6 +179,60 @@ i_cMA     = input.color(#42a5f5,            "Moving average",   group = G_COL)
 f_fmt(float v) =>
     na(v) ? "n/a" : str.tostring(v, "#")
 
+// Comma-delimited membership test: the list is padded with commas at both ends
+// so "ES" cannot match inside "MES".
+f_inCsv(string csv, string key) =>
+    str.contains(csv, "," + key + ",")
+
+f_presetSym(string label) =>
+    switch label
+        I_NDQ => "USI:TICKQ"
+        I_DOW => "USI:TICKI"
+        I_US  => "USI:TICK.US"
+        => "USI:TICK"
+
+// Pick the index the chart symbol actually belongs to.
+//
+// Deliberately built on syminfo.ticker rather than syminfo.root: root is
+// documented to fall back to the ticker for non-derivatives, but it is not
+// worth betting the whole resolver on that, and a na root would poison every
+// string operation downstream. Futures roots are recovered from the ticker's
+// first two or three characters instead — gated on syminfo.type == "futures",
+// because otherwise a Nasdaq stock like ESTC would match the "ES" root and be
+// handed the wrong index.
+f_autoTick(string fbSym) =>
+    tkr   = str.upper(syminfo.ticker)
+    pfx   = str.upper(syminfo.prefix)
+    isFut = syminfo.type == "futures"
+    h2    = str.length(tkr) >= 2 ? str.substring(tkr, 0, 2) : tkr
+    h3    = str.length(tkr) >= 3 ? str.substring(tkr, 0, 3) : tkr
+
+    ndqK = ",NQ,MNQ,QQQ,QQQM,NDX,IXIC,ONEQ,"
+    dowK = ",YM,MYM,DIA,DJI,DJIA,INDU,"
+    nysK = ",ES,MES,SPX,SPY,IVV,VOO,RTY,M2K,RUT,IWM,VTI,NYA,"
+
+    isNdq = f_inCsv(ndqK, tkr) or (isFut and (f_inCsv(ndqK, h3) or f_inCsv(ndqK, h2)))
+    isDow = f_inCsv(dowK, tkr) or (isFut and (f_inCsv(dowK, h3) or f_inCsv(dowK, h2)))
+    isNys = f_inCsv(nysK, tkr) or (isFut and (f_inCsv(nysK, h3) or f_inCsv(nysK, h2)))
+
+    // Listing venue, for everything the explicit map does not name.
+    onNdq = str.contains(pfx, "NASDAQ")
+    onNys = str.contains(pfx, "NYSE") or str.contains(pfx, "AMEX") or
+             str.contains(pfx, "ARCA")
+    // A US composite feed says the symbol is US-listed but not where, so the
+    // all-US index is the honest answer rather than a guess at NYSE or Nasdaq.
+    onUsComposite = str.contains(pfx, "BATS") or str.contains(pfx, "CBOE") or
+             str.contains(pfx, "EDG")
+
+    switch
+        isNdq         => "USI:TICKQ"
+        isDow         => "USI:TICKI"
+        isNys         => "USI:TICK"
+        onNdq         => "USI:TICKQ"
+        onNys         => "USI:TICK"
+        onUsComposite => "USI:TICK.US"
+        => fbSym
+
 // "7 above*" — the star marks a run that has reached N.
 f_streak(int n, int target) =>
     n == 0 ? "0" :
@@ -188,12 +256,13 @@ f_tblSize(string s) =>
 // -----------------------------------------------------------------------------
 // SOURCE DATA
 // -----------------------------------------------------------------------------
+isAuto  = i_index == I_AUTO
+autoSym = f_autoTick(f_presetSym(i_autoFb))
+
 tickSym = switch i_index
-    I_NYSE => "USI:TICK"
-    I_NDQ  => "USI:TICKQ"
-    I_DOW  => "USI:TICKI"
-    I_US   => "USI:TICK.US"
-    => i_custom
+    I_AUTO   => autoSym
+    I_CUSTOM => i_custom
+    => f_presetSym(i_index)
 
 // One request, one tuple — the four values must come from the same call so they
 // belong to the same bar of the index.
@@ -383,7 +452,9 @@ if barstate.islast and i_showTbl
     txt = color.new(color.white, 0)
 
     table.cell(tbl, 0, 0, "TICK", text_color = txt, text_size = tsz)
-    table.cell(tbl, 1, 0, str.replace(tickSym, "USI:", "", 0), text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 0,
+         str.replace(tickSym, "USI:", "", 0) + (isAuto ? "  (auto)" : ""),
+         text_color = txt, text_size = tsz)
 
     table.cell(tbl, 0, 1, "Last", text_color = txt, text_size = tsz)
     table.cell(tbl, 1, 1, f_fmt(tC), text_size = tsz,
