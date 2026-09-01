@@ -74,12 +74,47 @@ var int   nExtUp, nExtDn
   trends up on a day of persistent buying even when individual readings look ordinary.
   It is its own plot style (`Cumulative (session)`) rather than an overlay, because its
   scale is thousands and it would flatten the bars into a stripe.
+- `streak`, `maxStkUp`, `maxStkDn` — the zero-line run counter, below.
 - `nExtUp` / `nExtDn` — how many bars have tagged the outer band today, counted on the
   bar's **range**, not its close: a bar that traded to +1000 tagged the extreme even if it
   closed back at +200.
 
 On a daily-or-higher chart every bar is a new day, so the stats collapse to that one bar's
 values. Coherent, just not very interesting — this is an intraday tool.
+
+## Consecutive bars on one side of zero
+
+Off by default; `Zero-line streak` group turns it on. A single TICK bar above zero says
+nothing — a run of them is the tape leaning one way for a sustained stretch, and that is
+what the run counter measures.
+
+State is one signed integer:
+
+```
+var int streak = 0        // +n = n bars in a row above zero, -n = n below
+streak := switch
+    stkAbove => streak > 0 ? streak + 1 : 1
+    stkBelow => streak < 0 ? streak - 1 : -1
+    => 0                  // a bar sitting on zero breaks the run
+```
+
+- **Basis** (`Side of zero measured on`) — `Close` counts a bar as above zero if it closed
+  above zero. `Whole bar (high/low)` is much stricter: `low > 0`, so no part of the bar
+  traded negative. Runs under the strict rule are rarer and mean more.
+- **Bars without data do not break a run.** The whole block is inside `if hasTick`, so
+  pre/post-market `na` bars are skipped rather than counted as a zero. The overnight
+  boundary is handled deliberately by `Reset the count each session` (on by default)
+  rather than accidentally by a gap.
+- `stkQualUp` / `stkQualDn` are true for *every* bar of a run at or beyond N — they drive
+  the pane shading, so the whole run is visible as a block.
+- `stkJustUp` / `stkJustDn` fire on the *single* bar that reaches exactly N
+  (`streak == i_stkN`). That is the alert and the dot on the zero line. Because `streak`
+  only passes through N once per run, these cannot repeat mid-run.
+- `maxStkUp` / `maxStkDn` track the longest run each way today; the table shows the live
+  run (starred once it qualifies) and the day's best in each direction.
+
+Note the shading is suppressed in `Cumulative (session)` mode, where a zero-line run is
+not what the plot is showing.
 
 ## v6 traps this script had to route around
 
@@ -117,7 +152,11 @@ visible in every mode.
 ## Alerts
 
 `TICK extreme high` / `TICK extreme low` (outer band tagged), `TICK crossed above zero` /
-`TICK crossed below zero`. All `alertcondition`, so they show up in the alert dialog.
+`TICK crossed below zero`, and `TICK run above/below zero reached N`. All
+`alertcondition`, so they show up in the alert dialog.
+
+`alertcondition` messages must be compile-time constants, so the run alerts say "N
+consecutive bars" rather than interpolating the configured number.
 
 ## What it deliberately does not do
 
