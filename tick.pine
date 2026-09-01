@@ -18,6 +18,9 @@
 //   * TICK OHLC bars (or candles / line / histogram) for each chart bar.
 //   * Zero line plus two pairs of extreme bands (default ±600 and ±1000).
 //   * Optional markers on bars that reach the outer band.
+//   * Optional tracking of N consecutive bars on one side of zero — the pane is
+//     shaded for as long as the run holds, so a stretch of persistent one-way
+//     breadth reads as a block rather than as a row of individual bars.
 //   * Optional moving average of the TICK close (the "smoothed tick").
 //   * Optional cumulative TICK — the running sum of TICK closes since the
 //     session open, which trends with the day's net breadth.
@@ -50,6 +53,7 @@ indicator("Tick",
 G_SRC = "Source"
 G_DSP = "Display"
 G_LVL = "Levels"
+G_STK = "Zero-line streak"
 G_MA  = "Moving average"
 G_TBL = "Stats table"
 G_COL = "Colours"
@@ -108,6 +112,27 @@ i_ext2    = input.int(1000, "Outer band (extreme)",  minval = 1, maxval = 5000,
      tooltip = "Plotted at +/- this value. 1000 is the classic climax reading.")
 i_fillExt = input.bool(true, "Shade between the bands", group = G_LVL)
 
+// --- zero-line streak -------------------------------------------------------
+B_CLOSE = "Close"
+B_BAR   = "Whole bar (high/low)"
+
+i_showStk = input.bool(false, "Track consecutive bars on one side of zero", group = G_STK)
+i_stkN    = input.int(5, "N consecutive bars", minval = 2, maxval = 500, group = G_STK,
+     tooltip = "The run qualifies once N bars in a row have closed on the same " +
+               "side of zero. A short run is noise; a long one is the tape " +
+               "leaning one way for a sustained stretch.")
+i_stkBase = input.string(B_CLOSE, "Side of zero measured on",
+     options = [B_CLOSE, B_BAR], group = G_STK,
+     tooltip = "'Close' counts a bar as above zero if it closed above zero. " +
+               "'Whole bar' is far stricter: the bar's entire range must be " +
+               "above zero (low > 0), so no part of it traded negative.")
+i_stkBg   = input.bool(true, "Shade the pane while a run is qualified", group = G_STK)
+i_stkTr   = input.int(88, "Shade transparency", minval = 0, maxval = 100, group = G_STK)
+i_stkDot  = input.bool(true, "Dot on the bar the run qualifies", group = G_STK)
+i_stkRst  = input.bool(true, "Reset the count each session", group = G_STK,
+     tooltip = "On: a run cannot carry across the overnight gap. Off: the count " +
+               "survives into the next session as long as the side does not flip.")
+
 // --- moving average ---------------------------------------------------------
 i_showMA = input.bool(false, "Show moving average of TICK close", group = G_MA)
 i_maType = input.string("EMA", "Type", options = ["EMA", "SMA"], group = G_MA)
@@ -139,6 +164,12 @@ i_cMA     = input.color(#42a5f5,            "Moving average",   group = G_COL)
 // -----------------------------------------------------------------------------
 f_fmt(float v) =>
     na(v) ? "n/a" : str.tostring(v, "#")
+
+// "7 above*" — the star marks a run that has reached N.
+f_streak(int n, int target) =>
+    n == 0 ? "0" :
+     str.tostring(math.abs(n)) + (n > 0 ? " above" : " below") +
+     (math.abs(n) >= target ? "  *" : "")
 
 f_tblPos(string s) =>
     switch s
@@ -199,19 +230,42 @@ var int   nExtUp  = 0
 var int   nExtDn  = 0
 var int   firstValidBar = na
 
+// Signed run length: +n = n bars in a row above zero, -n = n below, 0 = the
+// last bar with data sat on zero (or was neutral under the 'whole bar' rule).
+var int   streak    = 0
+var int   maxStkUp  = 0
+var int   maxStkDn  = 0
+
 if newDay
     sesHigh := na
     sesLow  := na
     cumTick := na
     nExtUp  := 0
     nExtDn  := 0
+    maxStkUp := 0
+    maxStkDn := 0
+    if i_stkRst
+        streak := 0
 
 // Outer-band tags, evaluated on the bar's range rather than its close: a bar
 // that traded to +1000 tagged the extreme even if it closed back at +200.
 tagUp = hasTick and tH >=  i_ext2
 tagDn = hasTick and tL <= -i_ext2
 
+// Above/below zero, on the close or on the whole range depending on the basis.
+// Bars with no TICK data (pre/post-market) neither extend nor break a run —
+// they are skipped, and the session reset handles the overnight boundary.
+onCloseBasis = i_stkBase == B_CLOSE
+stkAbove = hasTick and (onCloseBasis ? tC > 0 : tL > 0)
+stkBelow = hasTick and (onCloseBasis ? tC < 0 : tH < 0)
+
 if hasTick
+    streak := switch
+        stkAbove => streak > 0 ? streak + 1 : 1
+        stkBelow => streak < 0 ? streak - 1 : -1
+        => 0
+    maxStkUp := streak > maxStkUp ? streak : maxStkUp
+    maxStkDn := streak < maxStkDn ? streak : maxStkDn
     sesHigh := na(sesHigh) ? tH : math.max(sesHigh, tH)
     sesLow  := na(sesLow)  ? tL : math.min(sesLow,  tL)
     cumTick := nz(cumTick) + tC
@@ -222,6 +276,13 @@ if hasTick
 
 zeroUp   = hasTick and xUp
 zeroDown = hasTick and xDn
+
+// Qualified while the run is at least N long; "just" fires on the single bar
+// that reaches N, which is the one worth an alert.
+stkQualUp   = i_showStk and streak >=  i_stkN
+stkQualDn   = i_showStk and streak <= -i_stkN
+stkJustUp   = i_showStk and hasTick and streak ==  i_stkN
+stkJustDn   = i_showStk and hasTick and streak == -i_stkN
 
 
 // -----------------------------------------------------------------------------
@@ -274,6 +335,19 @@ plot(showCum ? cumTick : na, "Cumulative TICK",
 plot(i_showMA and hasTick and not showCum ? maVal : na, "TICK MA",
      color = i_cMA, linewidth = 2)
 
+// Zero-line run: the shading shows how long the run has been on, the dot marks
+// the single bar it reached N.
+plotshape(i_stkDot and stkJustUp and not showCum ? 0 : na, "Streak qualified up",
+     style = shape.circle, location = location.absolute,
+     color = i_cUp, size = size.tiny)
+plotshape(i_stkDot and stkJustDn and not showCum ? 0 : na, "Streak qualified down",
+     style = shape.circle, location = location.absolute,
+     color = i_cDn, size = size.tiny)
+
+bgcolor(i_stkBg and not showCum and stkQualUp ? color.new(i_cUp, i_stkTr) :
+     i_stkBg and not showCum and stkQualDn ? color.new(i_cDn, i_stkTr) : na,
+     title = "Zero-line run shading")
+
 plotchar(i_marks and tagUp and not showCum ? 1 : na, "Extreme high tag",
      "▲", location.top, color = i_cExtUp, size = size.tiny)
 plotchar(i_marks and tagDn and not showCum ? 1 : na, "Extreme low tag",
@@ -300,7 +374,7 @@ fill(hD1, hD2, color = fillOn ? color.new(i_cDn, 92) : color.new(color.gray, 100
 // -----------------------------------------------------------------------------
 // STATS TABLE
 // -----------------------------------------------------------------------------
-var table tbl = table.new(f_tblPos(i_tblPos), 2, 7,
+var table tbl = table.new(f_tblPos(i_tblPos), 2, 9,
      bgcolor = color.new(color.black, 80), border_color = color.new(color.gray, 60),
      border_width = 1)
 
@@ -331,6 +405,16 @@ if barstate.islast and i_showTbl
     table.cell(tbl, 0, 6, "Bars <= -" + str.tostring(i_ext2), text_color = txt, text_size = tsz)
     table.cell(tbl, 1, 6, str.tostring(nExtDn), text_color = i_cExtDn, text_size = tsz)
 
+    if i_showStk
+        table.cell(tbl, 0, 7, "Run vs zero", text_color = txt, text_size = tsz)
+        table.cell(tbl, 1, 7, f_streak(streak, i_stkN), text_size = tsz,
+             text_color = streak > 0 ? i_cUp : streak < 0 ? i_cDn : txt)
+
+        table.cell(tbl, 0, 8, "Longest run", text_color = txt, text_size = tsz)
+        table.cell(tbl, 1, 8,
+             "+" + str.tostring(maxStkUp) + " / " + str.tostring(maxStkDn),
+             text_color = txt, text_size = tsz)
+
 
 // -----------------------------------------------------------------------------
 // NO-DATA WARNING
@@ -358,3 +442,7 @@ alertcondition(tagDn, "TICK extreme low",
      "TICK reached the outer band - one-sided selling / possible exhaustion")
 alertcondition(zeroUp,   "TICK crossed above zero", "TICK close crossed above zero")
 alertcondition(zeroDown, "TICK crossed below zero", "TICK close crossed below zero")
+alertcondition(stkJustUp, "TICK run above zero reached N",
+     "TICK has held above zero for N consecutive bars")
+alertcondition(stkJustDn, "TICK run below zero reached N",
+     "TICK has held below zero for N consecutive bars")
