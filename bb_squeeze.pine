@@ -1,0 +1,280 @@
+// =============================================================================
+// BB Squeeze — Bollinger Bands inside Keltner Channel
+// -----------------------------------------------------------------------------
+// A "squeeze" happens when volatility contracts far enough that the Bollinger
+// Bands are fully contained inside the Keltner Channel:
+//
+//     BB Upper < KC Upper   AND   BB Lower > KC Lower
+//
+// Because BB width is driven by standard deviation and KC width by ATR/True
+// Range, containment means realized dispersion has fallen below the channel's
+// average-range envelope — the classic pre-expansion coil.
+//
+// The objective of this script is the *persistence* filter: a squeeze is only
+// marked/colored/signalled once it has held for at least N consecutive bars.
+// One-bar containment is noise; N-bar containment is a setup.
+//
+// What it draws:
+//   * Bollinger Bands + Keltner Channel (both optional).
+//   * Background + bar coloring while a QUALIFIED squeeze (>= N bars) is on.
+//   * A dot on every squeeze bar, sized/colored by whether it has qualified yet.
+//   * A triangle on the bar the squeeze qualifies (the N-th consecutive bar).
+//   * A box spanning the ENTIRE squeeze — including the first N-1 bars, which
+//     background coloring cannot paint retroactively.
+//   * A "fired" marker when a qualified squeeze releases, colored by the sign
+//     of a linear-regression momentum read (direction hint, not a signal).
+//   * A status table (state, consecutive bars, BB/KC width ratio, momentum).
+//
+// Repainting note: intrabar the squeeze state can flip until the bar closes.
+// Enable "Confirmed bars only" to gate every marker/alert on barstate.isconfirmed
+// so nothing appears (or alerts) before the bar is final.
+// =============================================================================
+
+//@version=6
+
+indicator("BB Squeeze",
+     shorttitle = "BB SQZ",
+     overlay    = true,
+     max_boxes_count  = 500,
+     max_labels_count = 500)
+
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+G_BB  = "Bollinger Bands"
+G_KC  = "Keltner Channel"
+G_SQZ = "Squeeze"
+G_STY = "Display"
+
+i_src     = input.source(close, "Source",                group = G_BB)
+i_bbLen   = input.int(20,  "BB Length",   minval = 2, maxval = 500, group = G_BB)
+i_bbMult  = input.float(2.0, "BB StdDev Multiplier", minval = 0.1, step = 0.1, group = G_BB)
+
+i_kcLen   = input.int(20,  "KC Length",   minval = 2, maxval = 500, group = G_KC)
+i_kcMult  = input.float(1.5, "KC Range Multiplier",  minval = 0.1, step = 0.1, group = G_KC,
+     tooltip = "1.5 is the TTM/LazyBear convention. Use 1.0 for a tighter, rarer squeeze.")
+i_kcMA    = input.string("EMA", "KC Basis MA", options = ["EMA", "SMA"], group = G_KC)
+i_kcRange = input.string("True Range (ATR)", "KC Range Basis",
+     options = ["True Range (ATR)", "High-Low Range"], group = G_KC,
+     tooltip = "ATR includes gaps; High-Low ignores them. ATR is the standard.")
+
+i_minBars = input.int(6, "Minimum consecutive squeeze bars (N)", minval = 1, maxval = 500,
+     group = G_SQZ,
+     tooltip = "The squeeze is only marked once BB has been inside KC for this " +
+               "many consecutive bars. This is the core filter of the indicator.")
+i_confirm = input.bool(true, "Confirmed bars only (no intrabar repaint)", group = G_SQZ)
+i_momLen  = input.int(20, "Momentum length (release direction)", minval = 2, maxval = 500,
+     group = G_SQZ,
+     tooltip = "Linear-regression momentum used to color the release marker. " +
+               "It is a direction hint, not an entry signal.")
+
+i_showBB    = input.bool(true,  "Show Bollinger Bands",       group = G_STY)
+i_showKC    = input.bool(true,  "Show Keltner Channel",       group = G_STY)
+i_showDots  = input.bool(true,  "Show squeeze dots",          group = G_STY)
+i_showZone  = input.bool(true,  "Shade full squeeze zone (box)", group = G_STY)
+i_showBg    = input.bool(true,  "Background on qualified squeeze", group = G_STY)
+i_colorBars = input.bool(false, "Color bars on qualified squeeze", group = G_STY)
+i_showFire  = input.bool(true,  "Show release (fired) markers", group = G_STY)
+i_showLbl   = input.bool(true,  "Label release with bar count", group = G_STY)
+i_showTable = input.bool(true,  "Show status table",           group = G_STY)
+
+i_cOn    = input.color(color.new(color.orange, 82), "Qualified squeeze", group = G_STY)
+i_cPre   = input.color(color.new(color.gray,   50), "Unqualified squeeze", group = G_STY)
+i_cUp    = input.color(color.new(color.lime,   0),  "Release up",   group = G_STY)
+i_cDn    = input.color(color.new(color.red,    0),  "Release down", group = G_STY)
+
+
+// -----------------------------------------------------------------------------
+// CORE CALCULATIONS  (all ta.* calls unconditional — required by Pine)
+// -----------------------------------------------------------------------------
+bbBasis  = ta.sma(i_src, i_bbLen)
+bbDev    = i_bbMult * ta.stdev(i_src, i_bbLen)
+bbUpper  = bbBasis + bbDev
+bbLower  = bbBasis - bbDev
+
+kcBasisE = ta.ema(i_src, i_kcLen)
+kcBasisS = ta.sma(i_src, i_kcLen)
+kcBasis  = i_kcMA == "EMA" ? kcBasisE : kcBasisS
+
+kcRangeA = ta.atr(i_kcLen)                  // Wilder-smoothed True Range
+kcRangeH = ta.ema(high - low, i_kcLen)      // classic high-low range
+kcRange  = i_kcRange == "True Range (ATR)" ? kcRangeA : kcRangeH
+
+kcUpper  = kcBasis + i_kcMult * kcRange
+kcLower  = kcBasis - i_kcMult * kcRange
+
+// LazyBear-style linear-regression momentum: source minus the midpoint of the
+// Donchian mid and the SMA. Sign is used only to color the release marker.
+momSrc   = i_src - math.avg(math.avg(ta.highest(high, i_momLen), ta.lowest(low, i_momLen)),
+     ta.sma(i_src, i_momLen))
+mom      = ta.linreg(momSrc, i_momLen, 0)
+
+bbWidth  = bbUpper - bbLower
+kcWidth  = kcUpper - kcLower
+widthRatio = kcWidth != 0 ? bbWidth / kcWidth : na   // < 1 while squeezing
+
+
+// -----------------------------------------------------------------------------
+// SQUEEZE STATE
+// -----------------------------------------------------------------------------
+warmedUp  = bar_index >= math.max(i_bbLen, math.max(i_kcLen, i_momLen))
+dataOk    = warmedUp and not na(bbUpper) and not na(kcUpper)
+
+// BB fully contained inside KC
+inSqueeze = dataOk and bbUpper < kcUpper and bbLower > kcLower
+
+// Consecutive-bar counter (resets to 0 the moment containment breaks)
+var int sqzBars = 0
+sqzBars := inSqueeze ? sqzBars + 1 : 0
+
+qualified    = sqzBars >= i_minBars                       // the N-bar filter
+justQualified = qualified and not qualified[1]            // the exact N-th bar
+
+// A qualified squeeze ends: containment broke on a squeeze that had qualified
+released      = not inSqueeze and inSqueeze[1] and sqzBars[1] >= i_minBars
+int releasedBars = released ? sqzBars[1] : na
+releaseUp     = released and mom > 0
+releaseDown   = released and mom <= 0
+
+// Gate everything visual / alert-worthy on bar confirmation when requested
+confirmOk       = not i_confirm or barstate.isconfirmed
+sigQualified    = justQualified and confirmOk
+sigReleased     = released      and confirmOk
+sigReleaseUp    = releaseUp     and confirmOk
+sigReleaseDown  = releaseDown   and confirmOk
+
+
+// -----------------------------------------------------------------------------
+// SQUEEZE ZONE BOXES
+// -----------------------------------------------------------------------------
+// Background coloring cannot paint bars that are already in the past, so the
+// first N-1 bars of a squeeze would otherwise stay unmarked. A box anchored at
+// the squeeze's true start covers the whole run once it qualifies.
+var box   sqzBox   = na
+var int   sqzStart = na
+var float sqzHi    = na
+var float sqzLo    = na
+
+if inSqueeze
+    if not inSqueeze[1]
+        sqzStart := bar_index
+        sqzHi    := high
+        sqzLo    := low
+    else
+        sqzHi    := math.max(sqzHi, high)
+        sqzLo    := math.min(sqzLo, low)
+
+if i_showZone
+    if justQualified
+        sqzBox := box.new(left = sqzStart, top = sqzHi, right = bar_index, bottom = sqzLo,
+             border_color = color.new(color.orange, 40),
+             bgcolor      = i_cOn,
+             xloc         = xloc.bar_index)
+    else if qualified and not na(sqzBox)
+        box.set_right(sqzBox,  bar_index)
+        box.set_top(sqzBox,    sqzHi)
+        box.set_bottom(sqzBox, sqzLo)
+
+if released
+    sqzBox := na    // finalize: leave the drawn box in place, stop extending it
+
+
+// -----------------------------------------------------------------------------
+// PLOTS  (all at global scope — conditional values, never conditional plots)
+// -----------------------------------------------------------------------------
+pBBu = plot(i_showBB ? bbUpper : na, "BB Upper", color = color.new(color.blue, 0))
+pBBl = plot(i_showBB ? bbLower : na, "BB Lower", color = color.new(color.blue, 0))
+plot(i_showBB ? bbBasis : na, "BB Basis", color = color.new(color.blue, 60))
+
+pKCu = plot(i_showKC ? kcUpper : na, "KC Upper",
+     color = color.new(color.teal, 0), style = plot.style_linebr)
+pKCl = plot(i_showKC ? kcLower : na, "KC Lower",
+     color = color.new(color.teal, 0), style = plot.style_linebr)
+
+fill(pBBu, pBBl, color = qualified ? i_cOn : color.new(color.blue, 94), title = "BB Fill")
+fill(pKCu, pKCl, color = color.new(color.teal, 96), title = "KC Fill")
+
+// Dot on every squeeze bar: dim while it is still short of N, solid once qualified
+plotshape(i_showDots and inSqueeze and not qualified, title = "Squeeze (building)",
+     style = shape.circle, location = location.bottom, size = size.tiny, color = i_cPre)
+plotshape(i_showDots and inSqueeze and qualified, title = "Squeeze (qualified)",
+     style = shape.circle, location = location.bottom, size = size.tiny,
+     color = color.new(color.orange, 0))
+
+// The bar the squeeze reaches N consecutive bars
+plotshape(sigQualified, title = "Squeeze qualified",
+     style = shape.triangleup, location = location.belowbar, size = size.tiny,
+     color = color.new(color.orange, 0), text = "SQZ")
+
+// Release of a qualified squeeze, colored by momentum sign
+plotshape(i_showFire and sigReleaseUp, title = "Squeeze fired up",
+     style = shape.triangleup, location = location.belowbar, size = size.small,
+     color = i_cUp)
+plotshape(i_showFire and sigReleaseDown, title = "Squeeze fired down",
+     style = shape.triangledown, location = location.abovebar, size = size.small,
+     color = i_cDn)
+
+bgcolor(i_showBg and qualified ? i_cOn : na, title = "Qualified squeeze background")
+barcolor(i_colorBars and qualified ? color.new(color.orange, 30) : na, title = "Squeeze bars")
+
+if i_showLbl and sigReleased
+    label.new(bar_index, releaseUp ? low : high,
+         text      = str.format("{0} bars", releasedBars),
+         style     = releaseUp ? label.style_label_up : label.style_label_down,
+         color     = releaseUp ? i_cUp : i_cDn,
+         textcolor = color.white,
+         size      = size.tiny)
+
+
+// -----------------------------------------------------------------------------
+// STATUS TABLE
+// -----------------------------------------------------------------------------
+var table tb = table.new(position.top_right, 2, 5,
+     bgcolor = color.new(color.black, 20), border_width = 1, border_color = color.new(color.gray, 60))
+
+stateTxt  = qualified ? "SQUEEZE ON" : inSqueeze ? "building" : "off"
+stateCol  = qualified ? color.orange : inSqueeze ? color.gray : color.new(color.white, 40)
+
+if i_showTable and barstate.islast
+    table.cell(tb, 0, 0, "BB Squeeze  (N = " + str.tostring(i_minBars) + ")",
+         text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, "")
+    table.merge_cells(tb, 0, 0, 1, 0)
+
+    table.cell(tb, 0, 1, "State",     text_color = color.new(color.white, 30), text_size = size.tiny)
+    table.cell(tb, 1, 1, stateTxt,    text_color = stateCol,                   text_size = size.tiny)
+
+    table.cell(tb, 0, 2, "Bars",      text_color = color.new(color.white, 30), text_size = size.tiny)
+    table.cell(tb, 1, 2, str.tostring(sqzBars) + " / " + str.tostring(i_minBars),
+         text_color = color.white, text_size = size.tiny)
+
+    table.cell(tb, 0, 3, "BB/KC",     text_color = color.new(color.white, 30), text_size = size.tiny)
+    table.cell(tb, 1, 3, str.tostring(widthRatio, "#.###"),
+         text_color = widthRatio < 1 ? color.orange : color.new(color.white, 20), text_size = size.tiny)
+
+    table.cell(tb, 0, 4, "Momentum",  text_color = color.new(color.white, 30), text_size = size.tiny)
+    table.cell(tb, 1, 4, str.tostring(mom, "#.####"),
+         text_color = mom > 0 ? color.lime : color.red, text_size = size.tiny)
+
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(sigQualified, "BB Squeeze — qualified",
+     "BB Squeeze: Bollinger Bands have been inside the Keltner Channel for the required number of bars.")
+alertcondition(sigReleased, "BB Squeeze — fired",
+     "BB Squeeze: a qualified squeeze has released (BB expanded outside the Keltner Channel).")
+alertcondition(sigReleaseUp, "BB Squeeze — fired up",
+     "BB Squeeze: qualified squeeze released with positive momentum.")
+alertcondition(sigReleaseDown, "BB Squeeze — fired down",
+     "BB Squeeze: qualified squeeze released with negative momentum.")
+
+if sigQualified
+    alert(str.format("BB Squeeze ON — {0} {1}: BB inside KC for {2} bars",
+         syminfo.ticker, timeframe.period, sqzBars), alert.freq_once_per_bar_close)
+
+if sigReleased
+    alert(str.format("BB Squeeze FIRED {0} — {1} {2}: after {3} bars, momentum {4}",
+         releaseUp ? "UP" : "DOWN", syminfo.ticker, timeframe.period,
+         releasedBars, str.tostring(mom, "#.####")), alert.freq_once_per_bar_close)
