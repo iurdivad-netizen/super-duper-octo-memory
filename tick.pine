@@ -1,0 +1,360 @@
+// =============================================================================
+// Tick — NYSE / Nasdaq TICK index in its own pane
+// -----------------------------------------------------------------------------
+// This is the ThinkOrSwim `Comparison($TICK)` lower study rebuilt for
+// TradingView: for every bar on your chart it pulls the OHLC of a market
+// breadth TICK index and draws it as bars in a separate pane, with a zero line
+// and extreme bands.
+//
+// What TICK is: the number of NYSE-listed issues trading on an uptick minus
+// those on a downtick, sampled continuously. It is a *breadth* reading, not a
+// price. Around zero the tape is mixed; +1000 means almost everything is being
+// lifted at once (buying climax / exhaustion), -1000 the mirror image. The
+// per-bar high and low matter as much as the close, which is why the default
+// display is OHLC bars rather than a line — a bar that spiked to +900 and
+// closed at +50 is a very different tape from one that ground up to +50.
+//
+// What it draws:
+//   * TICK OHLC bars (or candles / line / histogram) for each chart bar.
+//   * Zero line plus two pairs of extreme bands (default ±600 and ±1000).
+//   * Optional markers on bars that reach the outer band.
+//   * Optional moving average of the TICK close (the "smoothed tick").
+//   * Optional cumulative TICK — the running sum of TICK closes since the
+//     session open, which trends with the day's net breadth.
+//   * A session stats table: last, session high/low, cumulative, and how many
+//     bars have tagged each extreme today.
+//
+// Data note: TICK is an index feed (USI:TICK and friends). If your TradingView
+// plan does not carry it, the pane will be empty and the script says so on the
+// chart instead of failing silently. The index only prints during the regular
+// cash session, so pre/post-market bars are blank by design.
+//
+// Repainting note: the current bar's TICK values update live, exactly like the
+// current price bar. Historical bars are fixed — request.security is called
+// with lookahead_off, so no future data is used.
+// =============================================================================
+
+//@version=6
+
+indicator("Tick",
+     shorttitle = "TICK",
+     overlay    = false,
+     format     = format.price,
+     precision  = 0,
+     max_labels_count = 500)
+
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+G_SRC = "Source"
+G_DSP = "Display"
+G_LVL = "Levels"
+G_MA  = "Moving average"
+G_TBL = "Stats table"
+G_COL = "Colours"
+
+// --- source -----------------------------------------------------------------
+I_NYSE   = "NYSE  ($TICK / USI:TICK)"
+I_NDQ    = "Nasdaq  ($TICKQ / USI:TICKQ)"
+I_DOW    = "Dow  ($TIKI / USI:TICKI)"
+I_US     = "All US stocks  (USI:TICK.US)"
+I_CUSTOM = "Custom symbol"
+
+i_index  = input.string(I_NYSE, "Index",
+     options = [I_NYSE, I_NDQ, I_DOW, I_US, I_CUSTOM],
+     group = G_SRC,
+     tooltip = "Which breadth index to pull. USI:TICK (NYSE) is the classic read; " +
+               "USI:TICKQ or USI:TICK.US suit Nasdaq-listed names. Pick " +
+               "'Custom symbol' to use any ticker your data plan carries.")
+i_custom = input.symbol("USI:TICK", "Custom symbol", group = G_SRC,
+     tooltip = "Only used when Index is set to 'Custom symbol'.")
+i_hideNa = input.bool(true, "Hide bars with no new TICK data", group = G_SRC,
+     tooltip = "On: bars where the index did not print (pre/post-market, holidays) " +
+               "are left blank. Off: the last known value is carried forward, which " +
+               "draws flat bars outside the cash session.")
+i_warn   = input.bool(true, "Warn on chart if no data is returned", group = G_SRC)
+
+// --- display ----------------------------------------------------------------
+M_BARS = "OHLC bars"
+M_CNDL = "Candles"
+M_LINE = "Line (close)"
+M_HIST = "Histogram (close)"
+M_CUM  = "Cumulative (session)"
+
+i_mode = input.string(M_BARS, "Plot style",
+     options = [M_BARS, M_CNDL, M_LINE, M_HIST, M_CUM], group = G_DSP,
+     tooltip = "OHLC bars match the ThinkOrSwim study. Cumulative replaces the " +
+               "bars with the running sum of TICK closes since the session open.")
+
+C_SINGLE = "Single colour"
+C_SIGN   = "Close sign (+ / -)"
+C_DIR    = "Bar direction (close vs open)"
+C_EXT    = "Extremes only"
+
+i_colMode = input.string(C_SINGLE, "Colour by",
+     options = [C_SINGLE, C_SIGN, C_DIR, C_EXT], group = G_DSP,
+     tooltip = "'Extremes only' greys out normal bars so the outliers stand out.")
+i_hiExt   = input.bool(true, "Highlight bars that reach the outer band", group = G_DSP)
+i_marks   = input.bool(false, "Mark outer-band bars with a triangle", group = G_DSP)
+
+// --- levels -----------------------------------------------------------------
+i_showLvl = input.bool(true, "Show extreme bands", group = G_LVL)
+i_ext1    = input.int(600,  "Inner band (extended)", minval = 1, maxval = 5000,
+     step = 50, group = G_LVL,
+     tooltip = "Plotted at +/- this value. 600 is the usual 'tape is one-sided' line.")
+i_ext2    = input.int(1000, "Outer band (extreme)",  minval = 1, maxval = 5000,
+     step = 50, group = G_LVL,
+     tooltip = "Plotted at +/- this value. 1000 is the classic climax reading.")
+i_fillExt = input.bool(true, "Shade between the bands", group = G_LVL)
+
+// --- moving average ---------------------------------------------------------
+i_showMA = input.bool(false, "Show moving average of TICK close", group = G_MA)
+i_maType = input.string("EMA", "Type", options = ["EMA", "SMA"], group = G_MA)
+i_maLen  = input.int(14, "Length", minval = 1, maxval = 500, group = G_MA,
+     tooltip = "A smoothed TICK is a slower breadth read: persistently above " +
+               "zero is broad accumulation, below zero broad distribution.")
+
+// --- table ------------------------------------------------------------------
+i_showTbl = input.bool(true, "Show stats table", group = G_TBL)
+i_tblPos  = input.string("Top right", "Position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = G_TBL)
+i_tblSize = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"],
+     group = G_TBL)
+
+// --- colours ----------------------------------------------------------------
+i_cSingle = input.color(#5b5bd6,            "Single / neutral", group = G_COL)
+i_cUp     = input.color(#26a69a,            "Positive",         group = G_COL)
+i_cDn     = input.color(#ef5350,            "Negative",         group = G_COL)
+i_cExtUp  = input.color(#00e676,            "Extreme positive", group = G_COL)
+i_cExtDn  = input.color(#ff1744,            "Extreme negative", group = G_COL)
+i_cMuted  = input.color(color.new(#787b86, 40), "Muted (extremes-only mode)", group = G_COL)
+i_cLevel  = input.color(color.new(#787b86, 30), "Bands",         group = G_COL)
+i_cCum    = input.color(#ffa726,            "Cumulative line",  group = G_COL)
+i_cMA     = input.color(#42a5f5,            "Moving average",   group = G_COL)
+
+
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+f_fmt(float v) =>
+    na(v) ? "n/a" : str.tostring(v, "#")
+
+f_tblPos(string s) =>
+    switch s
+        "Top left"     => position.top_left
+        "Bottom right" => position.bottom_right
+        "Bottom left"  => position.bottom_left
+        => position.top_right
+
+f_tblSize(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+
+// -----------------------------------------------------------------------------
+// SOURCE DATA
+// -----------------------------------------------------------------------------
+tickSym = switch i_index
+    I_NYSE => "USI:TICK"
+    I_NDQ  => "USI:TICKQ"
+    I_DOW  => "USI:TICKI"
+    I_US   => "USI:TICK.US"
+    => i_custom
+
+// One request, one tuple — the four values must come from the same call so they
+// belong to the same bar of the index.
+[tO, tH, tL, tC] = request.security(tickSym, timeframe.period,
+     [open, high, low, close],
+     i_hideNa ? barmerge.gaps_on : barmerge.gaps_off,
+     barmerge.lookahead_off)
+
+hasTick = not na(tC) and not na(tO) and not na(tH) and not na(tL)
+
+// The MA has to see a continuous series, so forward-fill the holes before
+// smoothing and only reveal the result on bars that actually have data.
+maSrc  = fixnan(tC)
+maEma  = ta.ema(maSrc, i_maLen)
+maSma  = ta.sma(maSrc, i_maLen)
+maVal  = i_maType == "EMA" ? maEma : maSma
+
+// ta.* has to run on every bar: in v6 `and`/`or` short-circuit, so a ta.* call
+// on the right of an `and` would be skipped on some bars and its state would
+// drift. Compute the crosses here, gate them later.
+xUp      = ta.crossover(maSrc, 0)
+xDn      = ta.crossunder(maSrc, 0)
+
+
+// -----------------------------------------------------------------------------
+// SESSION STATE
+// -----------------------------------------------------------------------------
+newDay = timeframe.change("D")
+
+var float sesHigh = na
+var float sesLow  = na
+var float cumTick = na
+var int   nExtUp  = 0
+var int   nExtDn  = 0
+var int   firstValidBar = na
+
+if newDay
+    sesHigh := na
+    sesLow  := na
+    cumTick := na
+    nExtUp  := 0
+    nExtDn  := 0
+
+// Outer-band tags, evaluated on the bar's range rather than its close: a bar
+// that traded to +1000 tagged the extreme even if it closed back at +200.
+tagUp = hasTick and tH >=  i_ext2
+tagDn = hasTick and tL <= -i_ext2
+
+if hasTick
+    sesHigh := na(sesHigh) ? tH : math.max(sesHigh, tH)
+    sesLow  := na(sesLow)  ? tL : math.min(sesLow,  tL)
+    cumTick := nz(cumTick) + tC
+    nExtUp  += tagUp ? 1 : 0
+    nExtDn  += tagDn ? 1 : 0
+    firstValidBar := na(firstValidBar) ? bar_index : firstValidBar
+
+
+zeroUp   = hasTick and xUp
+zeroDown = hasTick and xDn
+
+
+// -----------------------------------------------------------------------------
+// COLOURS
+// -----------------------------------------------------------------------------
+inner   = hasTick and (tH >= i_ext1 or tL <= -i_ext1)
+innerUp = hasTick and tH >=  i_ext1
+outer   = tagUp or tagDn
+
+baseCol = switch i_colMode
+    C_SINGLE => i_cSingle
+    C_SIGN   => tC > 0 ? i_cUp : tC < 0 ? i_cDn : i_cSingle
+    C_DIR    => tC >= tO ? i_cUp : i_cDn
+    => inner ? (innerUp ? i_cUp : i_cDn) : i_cMuted
+
+plotCol = i_hiExt and outer ? (tagUp ? i_cExtUp : i_cExtDn) : baseCol
+
+
+// -----------------------------------------------------------------------------
+// PLOTS
+// -----------------------------------------------------------------------------
+// Every style is wired to the same data; the unselected ones resolve to na and
+// draw nothing. plot()/plotbar() cannot live inside an if block, so the choice
+// is made in the values, not in the control flow.
+showBars = i_mode == M_BARS
+showCndl = i_mode == M_CNDL
+showCum  = i_mode == M_CUM
+
+plotbar(showBars and hasTick ? tO : na,
+     showBars and hasTick ? tH : na,
+     showBars and hasTick ? tL : na,
+     showBars and hasTick ? tC : na,
+     title = "TICK bars", color = plotCol)
+
+plotcandle(showCndl and hasTick ? tO : na,
+     showCndl and hasTick ? tH : na,
+     showCndl and hasTick ? tL : na,
+     showCndl and hasTick ? tC : na,
+     title = "TICK candles", color = plotCol, wickcolor = plotCol, bordercolor = plotCol)
+
+plot(i_mode == M_LINE and hasTick ? tC : na, "TICK close",
+     color = plotCol, linewidth = 2, style = plot.style_line)
+
+plot(i_mode == M_HIST and hasTick ? tC : na, "TICK histogram",
+     color = plotCol, style = plot.style_columns)
+
+plot(showCum ? cumTick : na, "Cumulative TICK",
+     color = i_cCum, linewidth = 2, style = plot.style_line)
+
+plot(i_showMA and hasTick and not showCum ? maVal : na, "TICK MA",
+     color = i_cMA, linewidth = 2)
+
+plotchar(i_marks and tagUp and not showCum ? 1 : na, "Extreme high tag",
+     "▲", location.top, color = i_cExtUp, size = size.tiny)
+plotchar(i_marks and tagDn and not showCum ? 1 : na, "Extreme low tag",
+     "▼", location.bottom, color = i_cExtDn, size = size.tiny)
+
+// Bands. hline() takes input-qualified values only, so visibility is handled by
+// swapping in a fully transparent colour rather than by branching.
+lvlOn    = i_showLvl and i_mode != M_CUM
+lvlCol   = lvlOn ? i_cLevel : color.new(color.gray, 100)
+
+hZero = hline(0, "Zero", color = i_cLevel, linestyle = hline.style_solid, linewidth = 1)
+hU1   = hline(i_ext1,  "Inner band +", color = lvlCol, linestyle = hline.style_dashed)
+hD1   = hline(-i_ext1, "Inner band -", color = lvlCol, linestyle = hline.style_dashed)
+hU2   = hline(i_ext2,  "Outer band +", color = lvlCol, linestyle = hline.style_dotted)
+hD2   = hline(-i_ext2, "Outer band -", color = lvlCol, linestyle = hline.style_dotted)
+
+fillOn  = i_fillExt and lvlOn
+fill(hU1, hU2, color = fillOn ? color.new(i_cUp, 92) : color.new(color.gray, 100),
+     title = "Upper extreme zone")
+fill(hD1, hD2, color = fillOn ? color.new(i_cDn, 92) : color.new(color.gray, 100),
+     title = "Lower extreme zone")
+
+
+// -----------------------------------------------------------------------------
+// STATS TABLE
+// -----------------------------------------------------------------------------
+var table tbl = table.new(f_tblPos(i_tblPos), 2, 7,
+     bgcolor = color.new(color.black, 80), border_color = color.new(color.gray, 60),
+     border_width = 1)
+
+if barstate.islast and i_showTbl
+    tsz = f_tblSize(i_tblSize)
+    txt = color.new(color.white, 0)
+
+    table.cell(tbl, 0, 0, "TICK", text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 0, str.replace(tickSym, "USI:", "", 0), text_color = txt, text_size = tsz)
+
+    table.cell(tbl, 0, 1, "Last", text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 1, f_fmt(tC), text_size = tsz,
+         text_color = na(tC) ? txt : tC > 0 ? i_cUp : tC < 0 ? i_cDn : txt)
+
+    table.cell(tbl, 0, 2, "Session high", text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 2, f_fmt(sesHigh), text_color = i_cUp, text_size = tsz)
+
+    table.cell(tbl, 0, 3, "Session low", text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 3, f_fmt(sesLow), text_color = i_cDn, text_size = tsz)
+
+    table.cell(tbl, 0, 4, "Cumulative", text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 4, f_fmt(cumTick), text_size = tsz,
+         text_color = na(cumTick) ? txt : cumTick > 0 ? i_cUp : cumTick < 0 ? i_cDn : txt)
+
+    table.cell(tbl, 0, 5, "Bars >= +" + str.tostring(i_ext2), text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 5, str.tostring(nExtUp), text_color = i_cExtUp, text_size = tsz)
+
+    table.cell(tbl, 0, 6, "Bars <= -" + str.tostring(i_ext2), text_color = txt, text_size = tsz)
+    table.cell(tbl, 1, 6, str.tostring(nExtDn), text_color = i_cExtDn, text_size = tsz)
+
+
+// -----------------------------------------------------------------------------
+// NO-DATA WARNING
+// -----------------------------------------------------------------------------
+// If the symbol never returned a single value the pane just looks broken, so
+// say why: it is almost always a data-plan or symbol-name problem.
+var label warnLbl = na
+
+if barstate.islast and i_warn
+    label.delete(warnLbl)
+    if na(firstValidBar)
+        warnLbl := label.new(bar_index, 0,
+             "No data for " + tickSym + "\nCheck the symbol name, or that your " +
+             "TradingView plan carries this index feed.",
+             style = label.style_label_center, color = color.new(color.red, 20),
+             textcolor = color.white, size = size.small)
+
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(tagUp, "TICK extreme high",
+     "TICK reached the outer band - one-sided buying / possible exhaustion")
+alertcondition(tagDn, "TICK extreme low",
+     "TICK reached the outer band - one-sided selling / possible exhaustion")
+alertcondition(zeroUp,   "TICK crossed above zero", "TICK close crossed above zero")
+alertcondition(zeroDown, "TICK crossed below zero", "TICK close crossed below zero")
