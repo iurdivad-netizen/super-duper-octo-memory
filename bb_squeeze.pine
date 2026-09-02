@@ -45,6 +45,7 @@ indicator("BB Squeeze",
 G_BB  = "Bollinger Bands"
 G_KC  = "Keltner Channel"
 G_SQZ = "Squeeze"
+G_OSC = "Oscillator cross filter (OB / OS)"
 G_STY = "Display"
 
 i_src     = input.source(close, "Source",                group = G_BB)
@@ -68,6 +69,47 @@ i_momLen  = input.int(20, "Momentum length (release direction)", minval = 2, max
      group = G_SQZ,
      tooltip = "Linear-regression momentum used to color the release marker. " +
                "It is a direction hint, not an entry signal.")
+
+i_useOsc   = input.bool(false, "Require an oscillator K/D cross", group = G_OSC,
+     tooltip = "Off: the release marker is colored by linear-regression momentum and " +
+               "every release of a qualified squeeze is signalled.\n" +
+               "On: a release is only signalled when the oscillator has crossed inside " +
+               "the overbought / oversold zone, and the cross decides the direction.")
+i_oscType  = input.string("Stochastic", "Oscillator",
+     options = ["Stochastic", "Stochastic RSI"], group = G_OSC)
+i_oscLen   = input.int(14, "%K Length",   minval = 1, maxval = 500, group = G_OSC)
+i_oscSmK   = input.int(3,  "%K Smoothing", minval = 1, maxval = 100, group = G_OSC)
+i_oscSmD   = input.int(3,  "%D Smoothing", minval = 1, maxval = 100, group = G_OSC)
+i_rsiLen   = input.int(14, "RSI Length (Stochastic RSI only)", minval = 1, maxval = 500,
+     group = G_OSC)
+
+i_ob       = input.float(80.0, "Overbought level", minval = 0.0, maxval = 100.0, group = G_OSC)
+i_os       = input.float(20.0, "Oversold level",   minval = 0.0, maxval = 100.0, group = G_OSC)
+
+i_zoneBasis = input.string("K and D", "Lines required inside the zone",
+     options = ["K and D", "K or D", "K only", "D only"], group = G_OSC,
+     tooltip = "Which oscillator lines must sit inside the extreme zone for the cross " +
+               "to count.\nK and D: BOTH lines must be in the zone — the strictest, " +
+               "and the default.\nK or D: either line is enough.")
+i_zoneSame  = input.bool(true, "Both lines in the zone on the same bar", group = G_OSC,
+     tooltip = "Only applies to \"K and D\".\nOn: K and D must be inside the zone " +
+               "together, on one bar.\nOff: each line only has to have visited the zone " +
+               "somewhere inside the lookback window, so they may qualify on different bars.")
+i_zoneLook  = input.int(1, "Zone lookback (bars)", minval = 1, maxval = 20, group = G_OSC,
+     tooltip = "How far back from the cross the oscillator may have been inside the zone.\n" +
+               "1 = the cross bar itself must be in the zone (strictest). Higher values " +
+               "also accept a cross that lands a bar or two after the lines left the zone.")
+
+i_sigMode   = input.string("Gate the squeeze release", "Signal fires on",
+     options = ["Gate the squeeze release", "The oscillator cross"], group = G_OSC,
+     tooltip = "Gate the squeeze release: the marker stays on the release bar, but only " +
+               "when a qualifying cross happened within the window below.\n" +
+               "The oscillator cross: the marker moves to the cross bar itself, as long as " +
+               "the squeeze is qualified (or released within the window).")
+i_sigWindow = input.int(3, "Cross / release window (bars)", minval = 0, maxval = 50,
+     group = G_OSC,
+     tooltip = "How far apart the cross and the squeeze release may be and still pair up. " +
+               "0 = they must land on the same bar.")
 
 i_showBB    = input.bool(true,  "Show Bollinger Bands",       group = G_STY)
 i_showKC    = input.bool(true,  "Show Keltner Channel",       group = G_STY)
@@ -110,6 +152,21 @@ momSrc   = i_src - math.avg(math.avg(ta.highest(high, i_momLen), ta.lowest(low, 
      ta.sma(i_src, i_momLen))
 mom      = ta.linreg(momSrc, i_momLen, 0)
 
+// --- Oscillator (K/D) used by the optional OB/OS cross filter -----------------
+// Both variants are computed on every bar and then selected, so each ta.* call
+// keeps a clean, uninterrupted history regardless of which one is in use.
+stochKr  = ta.stoch(close, high, low, i_oscLen)
+stochK   = ta.sma(stochKr, i_oscSmK)
+stochD   = ta.sma(stochK,  i_oscSmD)
+
+rsiVal   = ta.rsi(i_src, i_rsiLen)
+srsiKr   = ta.stoch(rsiVal, rsiVal, rsiVal, i_oscLen)
+srsiK    = ta.sma(srsiKr, i_oscSmK)
+srsiD    = ta.sma(srsiK,  i_oscSmD)
+
+oscK     = i_oscType == "Stochastic" ? stochK : srsiK
+oscD     = i_oscType == "Stochastic" ? stochD : srsiD
+
 bbWidth  = bbUpper - bbLower
 kcWidth  = kcUpper - kcLower
 widthRatio = kcWidth != 0 ? bbWidth / kcWidth : na   // < 1 while squeezing
@@ -133,16 +190,88 @@ justQualified = qualified and not qualified[1]            // the exact N-th bar
 
 // A qualified squeeze ends: containment broke on a squeeze that had qualified
 released      = not inSqueeze and inSqueeze[1] and sqzBars[1] >= i_minBars
-int releasedBars = released ? sqzBars[1] : na
-releaseUp     = released and mom > 0
-releaseDown   = released and mom <= 0
+
+// Length of the squeeze the current signal refers to
+var int lastSqzBars = na
+if released
+    lastSqzBars := sqzBars[1]
+int sigBars = released ? sqzBars[1] : qualified ? sqzBars : lastSqzBars
+
+
+// -----------------------------------------------------------------------------
+// OPTIONAL OB / OS CROSS FILTER
+// -----------------------------------------------------------------------------
+// A squeeze says expansion is coming but not which way. This filter borrows the
+// direction from an oscillator K/D cross that happens inside an extreme zone:
+// K crossing above D while oversold => upside, K crossing below D while
+// overbought => downside.
+//
+// "Lines required inside the zone" decides how strict the zone test is. The
+// default, "K and D", demands that BOTH lines are in the zone — and with
+// "same bar" on, both on one bar rather than each having merely visited the
+// zone somewhere inside the lookback window.
+
+kLow  = ta.lowest(oscK,  i_zoneLook)
+dLow  = ta.lowest(oscD,  i_zoneLook)
+kHigh = ta.highest(oscK, i_zoneLook)
+dHigh = ta.highest(oscD, i_zoneLook)
+
+// Both lines inside the zone together, on a single bar
+bothOSbar = oscK <= i_os and oscD <= i_os
+bothOBbar = oscK >= i_ob and oscD >= i_ob
+int bsOS  = ta.barssince(bothOSbar)
+int bsOB  = ta.barssince(bothOBbar)
+bothOSRecent = not na(bsOS) and bsOS < i_zoneLook
+bothOBRecent = not na(bsOB) and bsOB < i_zoneLook
+
+bullZone = switch i_zoneBasis
+    "K only"  => kLow <= i_os
+    "D only"  => dLow <= i_os
+    "K and D" => i_zoneSame ? bothOSRecent : kLow <= i_os and dLow <= i_os
+    =>           kLow <= i_os or dLow <= i_os
+
+bearZone = switch i_zoneBasis
+    "K only"  => kHigh >= i_ob
+    "D only"  => dHigh >= i_ob
+    "K and D" => i_zoneSame ? bothOBRecent : kHigh >= i_ob and dHigh >= i_ob
+    =>           kHigh >= i_ob or dHigh >= i_ob
+
+// ta.crossover/crossunder sit on the LEFT of the `and` so they still evaluate on
+// every bar under v6 lazy evaluation.
+bullCross = ta.crossover(oscK, oscD)  and bullZone
+bearCross = ta.crossunder(oscK, oscD) and bearZone
+
+// Pairing window between the cross and the squeeze release
+int bsBull = ta.barssince(bullCross)
+int bsBear = ta.barssince(bearCross)
+int bsRel  = ta.barssince(released)
+bullRecent = not na(bsBull) and bsBull <= i_sigWindow
+bearRecent = not na(bsBear) and bsBear <= i_sigWindow
+relRecent  = not na(bsRel)  and bsRel  <= i_sigWindow
+sqzContext = qualified or relRecent
+
+crossMode = i_sigMode == "The oscillator cross"
+
+// Final directional signals. With the filter off the behaviour is unchanged:
+// every release fires, colored by momentum.
+fireUp = switch
+    not i_useOsc => released and mom > 0
+    crossMode    => bullCross and sqzContext
+    =>              released and bullRecent
+
+fireDown = switch
+    not i_useOsc => released and mom <= 0
+    crossMode    => bearCross and sqzContext
+    =>              released and bearRecent
+
+fired = fireUp or fireDown
 
 // Gate everything visual / alert-worthy on bar confirmation when requested
 confirmOk       = not i_confirm or barstate.isconfirmed
 sigQualified    = justQualified and confirmOk
-sigReleased     = released      and confirmOk
-sigReleaseUp    = releaseUp     and confirmOk
-sigReleaseDown  = releaseDown   and confirmOk
+sigReleased     = fired         and confirmOk
+sigReleaseUp    = fireUp        and confirmOk
+sigReleaseDown  = fireDown      and confirmOk
 
 
 // -----------------------------------------------------------------------------
@@ -219,10 +348,10 @@ bgcolor(i_showBg and qualified ? i_cOn : na, title = "Qualified squeeze backgrou
 barcolor(i_colorBars and qualified ? color.new(color.orange, 30) : na, title = "Squeeze bars")
 
 if i_showLbl and sigReleased
-    label.new(bar_index, releaseUp ? low : high,
-         text      = str.format("{0} bars", releasedBars),
-         style     = releaseUp ? label.style_label_up : label.style_label_down,
-         color     = releaseUp ? i_cUp : i_cDn,
+    label.new(bar_index, fireUp ? low : high,
+         text      = str.format("{0} bars", sigBars),
+         style     = fireUp ? label.style_label_up : label.style_label_down,
+         color     = fireUp ? i_cUp : i_cDn,
          textcolor = color.white,
          size      = size.tiny)
 
@@ -276,5 +405,5 @@ if sigQualified
 
 if sigReleased
     alert(str.format("BB Squeeze FIRED {0} — {1} {2}: after {3} bars, momentum {4}",
-         releaseUp ? "UP" : "DOWN", syminfo.ticker, timeframe.period,
-         releasedBars, str.tostring(mom, "#.####")), alert.freq_once_per_bar_close)
+         fireUp ? "UP" : "DOWN", syminfo.ticker, timeframe.period,
+         sigBars, str.tostring(mom, "#.####")), alert.freq_once_per_bar_close)
