@@ -1,0 +1,709 @@
+//@version=6
+// =============================================================================
+// Naked POC Levels  --  measurement indicator
+// =============================================================================
+// Builds a session volume profile (default: ES RTH 09:30-16:00 ET, 5m chart),
+// extracts the POC / VAH / VAL at session close, and maintains a stack of
+// "naked" (untested) POCs from prior sessions.
+//
+// PURPOSE: this is a MEASUREMENT tool, not a trading system. It exists to answer
+// four questions before any entry logic is written:
+//   1. How long does an nPOC survive before it is tested?
+//   2. Does POC strength (its share of session volume) predict that?
+//   3. Does distance-at-creation predict that?
+//   4. What fraction are never tested inside the horizon?
+//
+// DESIGN NOTE -- the POC bin CENTRE is the canonical price for all naked/tested
+// bookkeeping. The zone is used only for drawing and as an entry tolerance.
+// If "tested" depended on the zone edge, changing the zone width would silently
+// rewrite the whole dataset and no two runs would be comparable.
+//
+// DESIGN NOTE -- deliberately NO distance-based pruning of the stack. Pruning
+// far levels would censor exactly the records that answer question 3. Use the
+// stats this produces to choose a bound for the strategy, not the other way round.
+// =============================================================================
+
+indicator("Naked POC Levels", "nPOC", overlay = true,
+     max_bars_back    = 5000,
+     max_lines_count  = 500,
+     max_boxes_count  = 500,
+     max_labels_count = 100)
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+const int   MAX_DENSE_BINS   = 1000    // safety cap on the dense histogram
+const int   MAX_SPAN_BINS    = 500     // safety cap on per-bar volume spreading
+const string GRP_SESS        = "1 - Session & Profile"
+const string GRP_ZONE        = "2 - POC Zone"
+const string GRP_STACK       = "3 - Naked POC Stack"
+const string GRP_DD          = "4 - Double Distribution"
+const string GRP_STATS       = "5 - Statistics"
+const string GRP_DISP        = "6 - Display"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+i_sess      = input.session("0930-1600", "Session", group = GRP_SESS,
+     tooltip = "RTH for index futures. The profile is built only from bars inside this window.")
+i_tz        = input.string("America/New_York", "Session timezone", group = GRP_SESS)
+i_bins      = input.int(50, "Target bins per session", minval = 10, maxval = 300, group = GRP_SESS,
+     tooltip = "Bin size is derived from the rolling average session range divided by this number, then rounded to a whole tick.")
+i_binLook   = input.int(20, "Sessions in range/volume average", minval = 2, maxval = 100, group = GRP_SESS)
+i_dist      = input.string("Uniform over range", "Volume distribution", options = ["Uniform over range", "HLC3 point"], group = GRP_SESS,
+     tooltip = "Uniform spreads each bar's volume evenly across its high-low. HLC3 point puts the whole bar's volume in one bin (cheaper, TPO-like, noisier POC).")
+i_vaPct     = input.float(70.0, "Value area %", minval = 30.0, maxval = 95.0, step = 1.0, group = GRP_SESS)
+
+i_zoneMode  = input.string("Volume expansion", "POC zone mode",
+     options = ["Line only", "Fixed ticks", "ATR fraction", "Bin width", "Volume expansion"], group = GRP_ZONE,
+     tooltip = "Volume expansion grows out from the POC bin while neighbouring bins still hold at least X% of the POC bin's volume. The resulting WIDTH is itself a signal: narrow = sharp acceptance price, wide = broad plateau.")
+i_zoneExp   = input.float(70.0, "Volume expansion threshold %", minval = 10.0, maxval = 99.0, step = 5.0, group = GRP_ZONE)
+i_zoneTicks = input.float(4.0, "Fixed zone half-width (ticks)", minval = 0.0, step = 1.0, group = GRP_ZONE)
+i_zoneAtr   = input.float(0.05, "ATR zone half-width (x daily ATR)", minval = 0.0, step = 0.01, group = GRP_ZONE)
+
+i_maxStack  = input.int(40, "Max stored naked POCs", minval = 5, maxval = 120, group = GRP_STACK,
+     tooltip = "Oldest is evicted when exceeded. Evictions of unresolved records are reported as 'censored' in the stats table.")
+i_testTol   = input.float(0.0, "Test tolerance (ticks)", minval = 0.0, step = 1.0, group = GRP_STACK,
+     tooltip = "0 = the bar's high/low must actually reach the POC price.")
+i_testRth   = input.bool(false, "Only count tests during the session", group = GRP_STACK,
+     tooltip = "Off = an overnight/ETH touch also tests the level (standard Market Profile reading).")
+i_testNext  = input.bool(true, "Testing starts next session", group = GRP_STACK,
+     tooltip = "Prevents a level being marked tested by the bars immediately following its own session close.")
+i_keepTest  = input.bool(false, "Keep tested levels on chart", group = GRP_STACK,
+     tooltip = "Off by default: with ~250 sessions/year, keeping them will hit the 500-line limit and Pine will FIFO-delete the oldest.")
+
+i_ddOn      = input.bool(true, "Detect double distribution", group = GRP_DD,
+     tooltip = "Flags sessions with two separated volume lobes -- the one case where the POC alone actively misleads you. The separating low-volume bin is the session's meaningful LVN.")
+i_ddValley  = input.float(35.0, "Valley max % of POC volume", minval = 5.0, maxval = 80.0, step = 5.0, group = GRP_DD)
+i_ddPeak    = input.float(60.0, "Both peaks min % of POC volume", minval = 20.0, maxval = 100.0, step = 5.0, group = GRP_DD)
+
+i_horizon   = input.int(60, "Stats horizon (sessions)", minval = 5, maxval = 500, group = GRP_STATS,
+     tooltip = "A level still untested after this many sessions is resolved as 'not tested'. This is the censoring rule for every percentage in the table.")
+i_atrLen    = input.int(14, "Daily ATR length", minval = 2, maxval = 100, group = GRP_STATS)
+i_showStats = input.bool(true, "Show statistics table", group = GRP_STATS)
+i_statsPos  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = GRP_STATS)
+
+i_showLines = input.bool(true, "Draw naked POC lines", group = GRP_DISP)
+i_showZones = input.bool(true, "Draw POC zones", group = GRP_DISP)
+i_showVA    = input.bool(true, "Plot prior session VAH/VAL", group = GRP_DISP)
+i_showDD    = input.bool(true, "Plot prior session LVN (double dist.)", group = GRP_DISP)
+i_lineWidth = input.int(1, "Line width", minval = 1, maxval = 4, group = GRP_DISP)
+i_colWeak   = input.color(color.new(color.gray, 30), "Weak POC colour", group = GRP_DISP)
+i_colStrong = input.color(color.new(color.orange, 0), "Strong POC colour", group = GRP_DISP)
+i_zoneOpac  = input.int(88, "Zone fill transparency", minval = 50, maxval = 99, group = GRP_DISP)
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+type SessionProfile
+    float poc       = na
+    float vah       = na
+    float val       = na
+    float pocShare  = 0.0
+    float totalVol  = 0.0
+    float zoneTop   = na
+    float zoneBot   = na
+    bool  dblDist   = false
+    float ddValley  = na
+
+// -----------------------------------------------------------------------------
+// Helper functions (top level -- Pine forbids nested function definitions)
+// -----------------------------------------------------------------------------
+
+// Bin index for a price. Anchored at 0 so indices stay stable within a session.
+f_binIdx(float price, float bsize) =>
+    int(math.floor(price / bsize))
+
+// Percentile of a float array (nearest-rank on a sorted copy). Non-destructive.
+f_pct(array<float> a, float p) =>
+    float res = na
+    int n = a.size()
+    if n > 0
+        c = a.copy()
+        c.sort(order.ascending)
+        idx = int(math.round(p * (n - 1)))
+        res := c.get(math.max(0, math.min(n - 1, idx)))
+    res
+
+// Safe number formatting for table cells.
+f_num(float v, string fmt) =>
+    na(v) ? "--" : str.tostring(v, fmt)
+
+// Build the completed session's profile from the bin map.
+// Pure function -- no var state, so it is safe to call from a conditional block.
+f_buildProfile(map<int, float> binMap, float bsize, float vaPct, string zoneMode,
+     float zTicks, float zAtrMult, float zExpPct, float atrD,
+     bool ddOn, float ddValleyPct, float ddPeakPct) =>
+
+    SessionProfile p = SessionProfile.new()
+    keys = binMap.keys()
+
+    if keys.size() > 0
+        keys.sort(order.ascending)
+        int minK = keys.get(0)
+        int maxK = keys.get(keys.size() - 1)
+        int m    = maxK - minK + 1
+
+        if m >= 1 and m <= MAX_DENSE_BINS
+            // Dense histogram: absent keys are genuine zero-volume bins and must
+            // be represented, otherwise value-area expansion and valley detection
+            // would step straight over the strongest low-volume nodes.
+            vols  = array.new<float>(m, 0.0)
+            float total = 0.0
+            for k in keys
+                v = nz(binMap.get(k))
+                vols.set(k - minK, v)
+                total += v
+            p.totalVol := total
+
+            // ---- POC -------------------------------------------------------
+            int   pocI = 0
+            float pocV = vols.get(0)
+            if m > 1
+                for i = 1 to m - 1
+                    vi = vols.get(i)
+                    if vi > pocV
+                        pocV := vi
+                        pocI := i
+            p.poc      := (minK + pocI + 0.5) * bsize
+            p.pocShare := total > 0.0 ? pocV / total : 0.0
+
+            // ---- Value area: expand from the POC, taking the richer side ----
+            float target  = total * vaPct / 100.0
+            float covered = pocV
+            int   hi = pocI
+            int   lo = pocI
+            for _iter = 0 to m
+                if covered >= target or (hi >= m - 1 and lo <= 0)
+                    break
+                float vUp = hi < m - 1 ? vols.get(hi + 1) : -1.0
+                float vDn = lo > 0     ? vols.get(lo - 1) : -1.0
+                if vUp >= vDn
+                    hi      += 1
+                    covered += vUp
+                else
+                    lo      -= 1
+                    covered += vDn
+            p.vah := (minK + hi + 1) * bsize
+            p.val := (minK + lo) * bsize
+
+            // ---- Zone ------------------------------------------------------
+            float half = 0.0
+            if zoneMode == "Fixed ticks"
+                half := zTicks * syminfo.mintick
+            else if zoneMode == "ATR fraction"
+                half := nz(atrD) * zAtrMult
+            else if zoneMode == "Bin width"
+                half := bsize / 2.0
+
+            if zoneMode == "Volume expansion"
+                // Contiguous shelf: stop at the first bin that fails the test.
+                float thr  = pocV * zExpPct / 100.0
+                int   hiE  = pocI
+                int   loE  = pocI
+                for _iu = 0 to m
+                    if hiE >= m - 1 or vols.get(hiE + 1) < thr
+                        break
+                    hiE += 1
+                for _id = 0 to m
+                    if loE <= 0 or vols.get(loE - 1) < thr
+                        break
+                    loE -= 1
+                p.zoneTop := (minK + hiE + 1) * bsize
+                p.zoneBot := (minK + loE) * bsize
+            else
+                p.zoneTop := p.poc + half
+                p.zoneBot := p.poc - half
+
+            // ---- Double distribution ---------------------------------------
+            // Prefix/suffix maxima give an O(n) test for "a deep valley with a
+            // real peak on BOTH sides" -- the cheap, robust subset of LVN
+            // detection, with no peak-finding or smoothing parameters.
+            if ddOn and m >= 3
+                pre = array.new<float>(m, 0.0)
+                suf = array.new<float>(m, 0.0)
+                float run = 0.0
+                for i = 0 to m - 1
+                    pre.set(i, run)
+                    run := math.max(run, vols.get(i))
+                run := 0.0
+                for i = m - 1 to 0
+                    suf.set(i, run)
+                    run := math.max(run, vols.get(i))
+
+                float valleyTh = pocV * ddValleyPct / 100.0
+                float peakTh   = pocV * ddPeakPct   / 100.0
+                int   bestI    = -1
+                float bestV    = na
+                for i = 1 to m - 2
+                    vi = vols.get(i)
+                    if vi <= valleyTh and pre.get(i) >= peakTh and suf.get(i) >= peakTh
+                        if bestI == -1 or vi < bestV
+                            bestI := i
+                            bestV := vi
+                if bestI >= 0
+                    p.dblDist  := true
+                    p.ddValley := (minK + bestI + 0.5) * bsize
+    p
+
+// -----------------------------------------------------------------------------
+// Global series (must be evaluated unconditionally, every bar)
+// -----------------------------------------------------------------------------
+atrDaily = request.security(syminfo.tickerid, "D", ta.atr(i_atrLen),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+inSess    = not na(time(timeframe.period, i_sess, i_tz))
+sessStart = inSess and not inSess[1]
+sessEnd   = not inSess and inSess[1]
+
+// -----------------------------------------------------------------------------
+// Session accumulation state
+// -----------------------------------------------------------------------------
+var map<int, float> binMap  = map.new<int, float>()
+var bool   sessOpen    = false
+var float  sessBinSize = na
+var float  sessHigh    = na
+var float  sessLow     = na
+var float  sessVol     = 0.0
+var int    sessLastBar = 0
+var int    sessCount   = 0     // completed sessions (profiles built)
+var int    sessStartCnt = 0     // sessions OPENED -- the clock for level age
+var int    ddCount     = 0
+
+var array<float> rangeHist = array.new<float>()
+var array<float> volHist   = array.new<float>()
+
+// Prior-session levels, plotted as steplines (cheap, and non-repainting because
+// they only ever update on the bar after the session closes).
+var float lastPoc = na
+var float lastVah = na
+var float lastVal = na
+var float lastLvn = na
+
+// -----------------------------------------------------------------------------
+// Naked POC stack (parallel arrays, insertion order = oldest first)
+// -----------------------------------------------------------------------------
+var array<float> npPrice   = array.new<float>()
+var array<float> npTop     = array.new<float>()
+var array<float> npBot     = array.new<float>()
+var array<int>   npSess    = array.new<int>()
+var array<float> npShare   = array.new<float>()
+var array<float> npDistAtk = array.new<float>()
+var array<bool>  npDone    = array.new<bool>()
+var array<line>  npLine    = array.new<line>()
+var array<box>   npBox     = array.new<box>()
+
+// Resolved records -- one entry per nPOC that was either tested or aged out.
+var array<bool>  resTested = array.new<bool>()
+var array<float> resAge    = array.new<float>()
+var array<float> resShare  = array.new<float>()
+var array<float> resDist   = array.new<float>()
+var int censored = 0
+
+// -----------------------------------------------------------------------------
+// 1. Session start -- reset the profile and fix the bin size for this session
+// -----------------------------------------------------------------------------
+if sessStart
+    binMap.clear()
+    sessOpen := true
+    // Age and test-eligibility are measured in sessions OPENED, not sessions
+    // completed: a level born at the close of session N must become testable at
+    // the OPEN of session N+1, which is before sessCount next increments.
+    sessStartCnt += 1
+    sessHigh := high
+    sessLow  := low
+    sessVol  := 0.0
+
+    // Bin size from the rolling average session range so that a session lands on
+    // roughly i_bins buckets. Falls back to daily ATR before history exists.
+    float avgRange = rangeHist.size() > 0 ? rangeHist.avg() : nz(atrDaily, high - low)
+    float raw      = avgRange / i_bins
+    sessBinSize := math.max(math.round(raw / syminfo.mintick) * syminfo.mintick, syminfo.mintick)
+
+// -----------------------------------------------------------------------------
+// 2. In-session accumulation
+// -----------------------------------------------------------------------------
+if inSess and sessOpen and not na(sessBinSize) and sessBinSize > 0.0
+    sessHigh := math.max(nz(sessHigh, high), high)
+    sessLow  := math.min(nz(sessLow, low), low)
+    sessVol  += nz(volume)
+    sessLastBar := bar_index
+
+    float v = nz(volume)
+    if v > 0.0
+        int hiI  = f_binIdx(high, sessBinSize)
+        int loI  = f_binIdx(low,  sessBinSize)
+        int span = hiI - loI + 1
+        if i_dist == "HLC3 point" or span <= 1 or span > MAX_SPAN_BINS
+            int k = f_binIdx(hlc3, sessBinSize)
+            binMap.put(k, nz(binMap.get(k)) + v)
+        else
+            float per = v / span
+            for k = loI to hiI
+                binMap.put(k, nz(binMap.get(k)) + per)
+
+// -----------------------------------------------------------------------------
+// 3. Session end -- finalise the profile and push onto the naked stack
+// -----------------------------------------------------------------------------
+if sessEnd and sessOpen
+    sessOpen := false
+    prof = f_buildProfile(binMap, sessBinSize, i_vaPct, i_zoneMode,
+         i_zoneTicks, i_zoneAtr, i_zoneExp, atrDaily,
+         i_ddOn, i_ddValley, i_ddPeak)
+
+    if not na(prof.poc)
+        sessCount += 1
+
+        // Rolling history for the next session's bin sizing / relative volume.
+        rangeHist.push(nz(sessHigh, high) - nz(sessLow, low))
+        if rangeHist.size() > i_binLook
+            rangeHist.shift()
+        volHist.push(sessVol)
+        if volHist.size() > i_binLook
+            volHist.shift()
+
+        lastPoc := prof.poc
+        lastVah := prof.vah
+        lastVal := prof.val
+        lastLvn := prof.ddValley
+        if prof.dblDist
+            ddCount += 1
+
+        // Distance at creation, in daily-ATR units, measured from the session's
+        // closing price (close[1] -- this bar is already outside the session).
+        float distAtk = not na(atrDaily) and atrDaily > 0.0 ? math.abs(prof.poc - close[1]) / atrDaily : na
+
+        npPrice.push(prof.poc)
+        npTop.push(prof.zoneTop)
+        npBot.push(prof.zoneBot)
+        npSess.push(sessStartCnt)
+        npShare.push(prof.pocShare)
+        npDistAtk.push(distAtk)
+        npDone.push(false)
+
+        // Colour carries POC strength: share of session volume held by the bin.
+        color lvlCol = color.from_gradient(prof.pocShare, 0.02, 0.10, i_colWeak, i_colStrong)
+
+        line ln = na
+        if i_showLines
+            ln := line.new(sessLastBar, prof.poc, sessLastBar + 1, prof.poc,
+                 xloc = xloc.bar_index, extend = extend.right,
+                 color = lvlCol, width = i_lineWidth,
+                 style = prof.dblDist ? line.style_dashed : line.style_solid)
+        npLine.push(ln)
+
+        box bx = na
+        if i_showZones and i_zoneMode != "Line only" and prof.zoneTop > prof.zoneBot
+            bx := box.new(sessLastBar, prof.zoneTop, sessLastBar + 1, prof.zoneBot,
+                 xloc = xloc.bar_index, extend = extend.right,
+                 border_color = color.new(lvlCol, 60), border_width = 1,
+                 bgcolor = color.new(lvlCol, i_zoneOpac))
+        npBox.push(bx)
+
+        // Evict the oldest once the cap is reached. An unresolved eviction is
+        // reported as censored so the reader knows the stats are truncated.
+        while npPrice.size() > i_maxStack
+            if not npDone.get(0)
+                censored += 1
+            l0 = npLine.get(0)
+            b0 = npBox.get(0)
+            if not na(l0)
+                line.delete(l0)
+            if not na(b0)
+                box.delete(b0)
+            npPrice.remove(0)
+            npTop.remove(0)
+            npBot.remove(0)
+            npSess.remove(0)
+            npShare.remove(0)
+            npDistAtk.remove(0)
+            npDone.remove(0)
+            npLine.remove(0)
+            npBox.remove(0)
+
+    // Age-out: resolve as "not tested" once past the horizon. The level stays on
+    // the stack and can still be drawn and tested -- it just cannot be counted
+    // twice. This is the censoring rule behind every % in the table.
+    if npPrice.size() > 0
+        for i = 0 to npPrice.size() - 1
+            if not npDone.get(i) and (sessStartCnt - npSess.get(i)) > i_horizon
+                npDone.set(i, true)
+                resTested.push(false)
+                resAge.push(na)
+                resShare.push(npShare.get(i))
+                resDist.push(npDistAtk.get(i))
+
+// -----------------------------------------------------------------------------
+// 4. Test detection -- iterate BACKWARDS, removal shifts every later index
+// -----------------------------------------------------------------------------
+bool testedThisBar = false
+float testedPrice  = na
+
+float tol     = i_testTol * syminfo.mintick
+bool  canTest = i_testRth ? inSess : true
+
+if canTest and npPrice.size() > 0
+    for i = npPrice.size() - 1 to 0
+        // A level is testable once a LATER session has opened, so the bars
+        // immediately following its own session close cannot test it.
+        bool eligible = not i_testNext or npSess.get(i) < sessStartCnt
+        if eligible
+            float p = npPrice.get(i)
+            if low - tol <= p and high + tol >= p
+                testedThisBar := true
+                testedPrice   := p
+
+                if not npDone.get(i)
+                    resTested.push(true)
+                    resAge.push(math.max(0, sessStartCnt - npSess.get(i)))
+                    resShare.push(npShare.get(i))
+                    resDist.push(npDistAtk.get(i))
+
+                l = npLine.get(i)
+                b = npBox.get(i)
+                if i_keepTest
+                    if not na(l)
+                        line.set_extend(l, extend.none)
+                        line.set_x2(l, bar_index)
+                        line.set_color(l, color.new(color.gray, 55))
+                        line.set_style(l, line.style_dotted)
+                    if not na(b)
+                        box.set_extend(b, extend.none)
+                        box.set_right(b, bar_index)
+                        box.set_bgcolor(b, color.new(color.gray, 92))
+                else
+                    if not na(l)
+                        line.delete(l)
+                    if not na(b)
+                        box.delete(b)
+
+                npPrice.remove(i)
+                npTop.remove(i)
+                npBot.remove(i)
+                npSess.remove(i)
+                npShare.remove(i)
+                npDistAtk.remove(i)
+                npDone.remove(i)
+                npLine.remove(i)
+                npBox.remove(i)
+
+// -----------------------------------------------------------------------------
+// 5. Prior-session context plots (global scope -- plot() cannot be conditional)
+// -----------------------------------------------------------------------------
+plot(i_showVA  and not na(lastVah) ? lastVah : na, "Prior VAH", color = color.new(color.teal, 25),
+     style = plot.style_stepline, linewidth = 1)
+plot(i_showVA  and not na(lastVal) ? lastVal : na, "Prior VAL", color = color.new(color.teal, 25),
+     style = plot.style_stepline, linewidth = 1)
+plot(i_showDD  and not na(lastLvn) ? lastLvn : na, "Prior LVN", color = color.new(color.fuchsia, 20),
+     style = plot.style_stepline, linewidth = 1)
+
+// -----------------------------------------------------------------------------
+// 6. Statistics table
+// -----------------------------------------------------------------------------
+tablePos = switch i_statsPos
+    "Top left"      => position.top_left
+    "Bottom right"  => position.bottom_right
+    "Bottom left"   => position.bottom_left
+    "Middle right"  => position.middle_right
+    => position.top_right
+
+var table stTbl = table.new(tablePos, 5, 21,
+     bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
+
+if barstate.islast and i_showStats
+    int nRes = resTested.size()
+
+    // ---- overall -----------------------------------------------------------
+    int   nTested = 0
+    allAges = array.new<float>()
+    if nRes > 0
+        for i = 0 to nRes - 1
+            if resTested.get(i)
+                nTested += 1
+                allAges.push(resAge.get(i))
+    float pctAll = nRes > 0 ? 100.0 * nTested / nRes : na
+
+    // ---- strength quartile thresholds --------------------------------------
+    float q1 = f_pct(resShare, 0.25)
+    float q2 = f_pct(resShare, 0.50)
+    float q3 = f_pct(resShare, 0.75)
+
+    // ---- bucket counters ---------------------------------------------------
+    qN     = array.new<int>(4, 0)
+    qT     = array.new<int>(4, 0)
+    qA0    = array.new<float>()
+    qA1    = array.new<float>()
+    qA2    = array.new<float>()
+    qA3    = array.new<float>()
+    dN     = array.new<int>(5, 0)
+    dT     = array.new<int>(5, 0)
+    dA0    = array.new<float>()
+    dA1    = array.new<float>()
+    dA2    = array.new<float>()
+    dA3    = array.new<float>()
+    dA4    = array.new<float>()
+
+    if nRes > 0
+        for i = 0 to nRes - 1
+            bool t   = resTested.get(i)
+            float sh = resShare.get(i)
+            float ds = resDist.get(i)
+            float ag = resAge.get(i)
+
+            int qi = na(sh) ? 0 : sh <= q1 ? 0 : sh <= q2 ? 1 : sh <= q3 ? 2 : 3
+            qN.set(qi, qN.get(qi) + 1)
+            if t
+                qT.set(qi, qT.get(qi) + 1)
+                if qi == 0
+                    qA0.push(ag)
+                else if qi == 1
+                    qA1.push(ag)
+                else if qi == 2
+                    qA2.push(ag)
+                else
+                    qA3.push(ag)
+
+            if not na(ds)
+                int di = ds < 0.5 ? 0 : ds < 1.0 ? 1 : ds < 1.5 ? 2 : ds < 2.0 ? 3 : 4
+                dN.set(di, dN.get(di) + 1)
+                if t
+                    dT.set(di, dT.get(di) + 1)
+                    if di == 0
+                        dA0.push(ag)
+                    else if di == 1
+                        dA1.push(ag)
+                    else if di == 2
+                        dA2.push(ag)
+                    else if di == 3
+                        dA3.push(ag)
+                    else
+                        dA4.push(ag)
+
+    // ---- nearest live levels ----------------------------------------------
+    float nearAbove = na
+    float nearBelow = na
+    if npPrice.size() > 0
+        for i = 0 to npPrice.size() - 1
+            float p = npPrice.get(i)
+            if p > close and (na(nearAbove) or p < nearAbove)
+                nearAbove := p
+            if p < close and (na(nearBelow) or p > nearBelow)
+                nearBelow := p
+
+    color hdrBg  = color.new(color.gray, 55)
+    color secBg  = color.new(color.blue, 70)
+    color txt    = color.white
+    string SZ    = size.small
+
+    // Cells are never merged: on a realtime bar this block re-runs on every
+    // tick, and re-merging an already-merged cell is undefined behaviour in
+    // Pine. Header bands are faked by giving each cell in the row one bgcolor.
+    table.cell(stTbl, 0, 0, "NAKED POC",                           text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 1, 0, str.tostring(sessCount) + " sess",     text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 2, 0, "bin " + f_num(sessBinSize, "#.####"), text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 3, 0, "hzn " + str.tostring(i_horizon),      text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 4, 0, "dd " + str.tostring(ddCount),         text_color = txt, bgcolor = hdrBg, text_size = SZ)
+
+    table.cell(stTbl, 0, 1, "",          text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 1, 1, "N",         text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 2, 1, "% tested",  text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 3, 1, "med sess",  text_color = txt, bgcolor = hdrBg, text_size = SZ)
+    table.cell(stTbl, 4, 1, "p75 / p90", text_color = txt, bgcolor = hdrBg, text_size = SZ)
+
+    table.cell(stTbl, 0, 2, "All resolved",              text_color = txt, text_size = SZ)
+    table.cell(stTbl, 1, 2, str.tostring(nRes),          text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 2, f_num(pctAll, "#.#") + "%",  text_color = txt, text_size = SZ)
+    table.cell(stTbl, 3, 2, f_num(f_pct(allAges, 0.50), "#.#"), text_color = txt, text_size = SZ)
+    table.cell(stTbl, 4, 2, f_num(f_pct(allAges, 0.75), "#.#") + " / " +
+         f_num(f_pct(allAges, 0.90), "#.#"),             text_color = txt, text_size = SZ)
+
+    table.cell(stTbl, 0, 3, "BY POC STRENGTH (share of session volume)", text_color = txt, bgcolor = secBg, text_size = SZ)
+    for c = 1 to 4
+        table.cell(stTbl, c, 3, "", bgcolor = secBg)
+
+    qLabels = array.from("Q1 weakest", "Q2", "Q3", "Q4 strongest")
+    for qi = 0 to 3
+        subA = qi == 0 ? qA0 : qi == 1 ? qA1 : qi == 2 ? qA2 : qA3
+        int   qn = qN.get(qi)
+        float qp = qn > 0 ? 100.0 * qT.get(qi) / qn : na
+        table.cell(stTbl, 0, 4 + qi, qLabels.get(qi),         text_color = txt, text_size = SZ)
+        table.cell(stTbl, 1, 4 + qi, str.tostring(qn),        text_color = txt, text_size = SZ)
+        table.cell(stTbl, 2, 4 + qi, f_num(qp, "#.#") + "%",  text_color = txt, text_size = SZ)
+        table.cell(stTbl, 3, 4 + qi, f_num(f_pct(subA, 0.50), "#.#"), text_color = txt, text_size = SZ)
+        table.cell(stTbl, 4, 4 + qi, f_num(f_pct(subA, 0.75), "#.#") + " / " +
+             f_num(f_pct(subA, 0.90), "#.#"),                 text_color = txt, text_size = SZ)
+
+    table.cell(stTbl, 0, 8, "BY DISTANCE AT CREATION (x daily ATR)", text_color = txt, bgcolor = secBg, text_size = SZ)
+    for c = 1 to 4
+        table.cell(stTbl, c, 8, "", bgcolor = secBg)
+
+    dLabels = array.from("< 0.5", "0.5 - 1.0", "1.0 - 1.5", "1.5 - 2.0", "> 2.0")
+    for di = 0 to 4
+        subD = di == 0 ? dA0 : di == 1 ? dA1 : di == 2 ? dA2 : di == 3 ? dA3 : dA4
+        int   dn = dN.get(di)
+        float dp = dn > 0 ? 100.0 * dT.get(di) / dn : na
+        table.cell(stTbl, 0, 9 + di, dLabels.get(di),         text_color = txt, text_size = SZ)
+        table.cell(stTbl, 1, 9 + di, str.tostring(dn),        text_color = txt, text_size = SZ)
+        table.cell(stTbl, 2, 9 + di, f_num(dp, "#.#") + "%",  text_color = txt, text_size = SZ)
+        table.cell(stTbl, 3, 9 + di, f_num(f_pct(subD, 0.50), "#.#"), text_color = txt, text_size = SZ)
+        table.cell(stTbl, 4, 9 + di, f_num(f_pct(subD, 0.75), "#.#") + " / " +
+             f_num(f_pct(subD, 0.90), "#.#"),                 text_color = txt, text_size = SZ)
+
+    table.cell(stTbl, 0, 14, "LIVE STATE", text_color = txt, bgcolor = secBg, text_size = SZ)
+    for c = 1 to 4
+        table.cell(stTbl, c, 14, "", bgcolor = secBg)
+
+    table.cell(stTbl, 0, 15, "Live naked POCs", text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 15, "")
+    table.cell(stTbl, 3, 15, "")
+    table.cell(stTbl, 4, 15, "")
+    table.cell(stTbl, 1, 15, str.tostring(npPrice.size()), text_color = txt, text_size = SZ)
+
+    table.cell(stTbl, 0, 16, "Nearest above", text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 16, "")
+    table.cell(stTbl, 3, 16, "")
+    table.cell(stTbl, 4, 16, "")
+    table.cell(stTbl, 1, 16, f_num(nearAbove, format.mintick) +
+         (na(nearAbove) ? "" : "   (+" + f_num(nearAbove - close, "#.##") + ")"),
+         text_color = color.new(color.lime, 0), text_size = SZ)
+
+    table.cell(stTbl, 0, 17, "Nearest below", text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 17, "")
+    table.cell(stTbl, 3, 17, "")
+    table.cell(stTbl, 4, 17, "")
+    table.cell(stTbl, 1, 17, f_num(nearBelow, format.mintick) +
+         (na(nearBelow) ? "" : "   (-" + f_num(close - nearBelow, "#.##") + ")"),
+         text_color = color.new(color.red, 0), text_size = SZ)
+
+    table.cell(stTbl, 0, 18, "Double-dist. sessions", text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 18, "")
+    table.cell(stTbl, 3, 18, "")
+    table.cell(stTbl, 4, 18, "")
+    table.cell(stTbl, 1, 18, str.tostring(ddCount) + "  (" +
+         f_num(sessCount > 0 ? 100.0 * ddCount / sessCount : na, "#.#") + "%)",
+         text_color = txt, text_size = SZ)
+
+    table.cell(stTbl, 0, 19, "Censored (evicted)", text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 19, "")
+    table.cell(stTbl, 3, 19, "")
+    table.cell(stTbl, 4, 19, "")
+    table.cell(stTbl, 1, 19, str.tostring(censored) +
+         (censored > 0 ? "  -- raise Max stored" : ""),
+         text_color = censored > 0 ? color.new(color.orange, 0) : txt, text_size = SZ)
+
+    table.cell(stTbl, 0, 20, "Prior POC / VAH / VAL", text_color = txt, text_size = SZ)
+    table.cell(stTbl, 2, 20, "")
+    table.cell(stTbl, 3, 20, "")
+    table.cell(stTbl, 4, 20, "")
+    table.cell(stTbl, 1, 20, f_num(lastPoc, format.mintick) + " / " +
+         f_num(lastVah, format.mintick) + " / " + f_num(lastVal, format.mintick),
+         text_color = txt, text_size = SZ)
+
+// -----------------------------------------------------------------------------
+// 7. Alerts
+// -----------------------------------------------------------------------------
+alertcondition(testedThisBar, "Naked POC tested", "Price has reached a previously untested POC")
+
+if testedThisBar
+    alert(str.format("{0} tested naked POC at {1}", syminfo.ticker,
+         str.tostring(testedPrice, format.mintick)), alert.freq_once_per_bar)
