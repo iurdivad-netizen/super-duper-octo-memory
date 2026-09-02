@@ -1,0 +1,1016 @@
+//@version=6
+// =============================================================================
+// Naked POC Strategy  --  naked POCs as TARGETS
+// =============================================================================
+// Companion to naked_poc_levels.pine. The profile engine (sections 1-4) is
+// byte-identical to the indicator so this strategy trades exactly the levels
+// that indicator measures. Do not edit one without the other.
+//
+// THESIS: a magnet is a good place to CLOSE a position and a poor reason to
+// OPEN one. So naked POCs are used as take-profit targets only. Entries come
+// from a pullback into the prior session's POC / value area, filtered by a
+// regime classifier built from the profile itself.
+//
+// STRUCTURAL LIMIT worth understanding before reading any backtest: naked POCs
+// only exist where price has ALREADY traded. In an uptrend making new highs
+// there are no naked POCs above, so a long has no nPOC target available and
+// must use the fallback ladder. Target availability is therefore correlated
+// with trade direction and regime. The dashboard splits every result by target
+// source (nPOC vs fallback) for exactly this reason -- without that split a
+// backtest cannot tell nPOC edge from fallback edge.
+//
+// CALIBRATION: min/max target distance and the risk caps are PLACEHOLDERS.
+// Set them from the tables produced by naked_poc_levels.pine, not by fitting
+// them here.
+// =============================================================================
+
+strategy("Naked POC Strategy", "nPOC Str", overlay = true,
+     default_qty_type       = strategy.fixed,
+     default_qty_value      = 1,
+     initial_capital        = 50000,
+     commission_type        = strategy.commission.cash_per_contract,
+     commission_value       = 2.50,
+     slippage               = 2,
+     pyramiding             = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick     = false,
+     max_bars_back          = 5000,
+     max_lines_count        = 500,
+     max_boxes_count        = 500,
+     max_labels_count       = 500)
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+const int   MAX_DENSE_BINS   = 1000    // safety cap on the dense histogram
+const int   MAX_SPAN_BINS    = 500     // safety cap on per-bar volume spreading
+const string GRP_SESS        = "1 - Session & Profile"
+const string GRP_ZONE        = "2 - POC Zone"
+const string GRP_STACK       = "3 - Naked POC Stack"
+const string GRP_DD          = "4 - Double Distribution"
+const string GRP_STATS       = "5 - Statistics"
+const string GRP_DISP        = "6 - Display"
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+i_sess      = input.session("0930-1600", "Session", group = GRP_SESS,
+     tooltip = "RTH for index futures. The profile is built only from bars inside this window.")
+i_tz        = input.string("America/New_York", "Session timezone", group = GRP_SESS)
+i_bins      = input.int(50, "Target bins per session", minval = 10, maxval = 300, group = GRP_SESS,
+     tooltip = "Bin size is derived from the rolling average session range divided by this number, then rounded to a whole tick.")
+i_binLook   = input.int(20, "Sessions in range/volume average", minval = 2, maxval = 100, group = GRP_SESS)
+i_dist      = input.string("Uniform over range", "Volume distribution", options = ["Uniform over range", "HLC3 point"], group = GRP_SESS,
+     tooltip = "Uniform spreads each bar's volume evenly across its high-low. HLC3 point puts the whole bar's volume in one bin (cheaper, TPO-like, noisier POC).")
+i_vaPct     = input.float(70.0, "Value area %", minval = 30.0, maxval = 95.0, step = 1.0, group = GRP_SESS)
+
+i_zoneMode  = input.string("Volume expansion", "POC zone mode",
+     options = ["Line only", "Fixed ticks", "ATR fraction", "Bin width", "Volume expansion"], group = GRP_ZONE,
+     tooltip = "Volume expansion grows out from the POC bin while neighbouring bins still hold at least X% of the POC bin's volume. The resulting WIDTH is itself a signal: narrow = sharp acceptance price, wide = broad plateau.")
+i_zoneExp   = input.float(70.0, "Volume expansion threshold %", minval = 10.0, maxval = 99.0, step = 5.0, group = GRP_ZONE)
+i_zoneTicks = input.float(4.0, "Fixed zone half-width (ticks)", minval = 0.0, step = 1.0, group = GRP_ZONE)
+i_zoneAtr   = input.float(0.05, "ATR zone half-width (x daily ATR)", minval = 0.0, step = 0.01, group = GRP_ZONE)
+
+i_maxStack  = input.int(40, "Max stored naked POCs", minval = 5, maxval = 120, group = GRP_STACK,
+     tooltip = "Oldest is evicted when exceeded. Evictions of unresolved records are reported as 'censored' in the stats table.")
+i_testTol   = input.float(0.0, "Test tolerance (ticks)", minval = 0.0, step = 1.0, group = GRP_STACK,
+     tooltip = "0 = the bar's high/low must actually reach the POC price.")
+i_testRth   = input.bool(false, "Only count tests during the session", group = GRP_STACK,
+     tooltip = "Off = an overnight/ETH touch also tests the level (standard Market Profile reading).")
+i_testNext  = input.bool(true, "Testing starts next session", group = GRP_STACK,
+     tooltip = "Prevents a level being marked tested by the bars immediately following its own session close.")
+i_keepTest  = input.bool(false, "Keep tested levels on chart", group = GRP_STACK,
+     tooltip = "Off by default: with ~250 sessions/year, keeping them will hit the 500-line limit and Pine will FIFO-delete the oldest.")
+
+i_ddOn      = input.bool(true, "Detect double distribution", group = GRP_DD,
+     tooltip = "Flags sessions with two separated volume lobes -- the one case where the POC alone actively misleads you. The separating low-volume bin is the session's meaningful LVN.")
+i_ddValley  = input.float(35.0, "Valley max % of POC volume", minval = 5.0, maxval = 80.0, step = 5.0, group = GRP_DD)
+i_ddPeak    = input.float(60.0, "Both peaks min % of POC volume", minval = 20.0, maxval = 100.0, step = 5.0, group = GRP_DD)
+
+i_horizon   = input.int(60, "Stats horizon (sessions)", minval = 5, maxval = 500, group = GRP_STATS,
+     tooltip = "A level still untested after this many sessions is resolved as 'not tested'. This is the censoring rule for every percentage in the table.")
+i_atrLen    = input.int(14, "Daily ATR length", minval = 2, maxval = 100, group = GRP_STATS)
+i_statsPos  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = GRP_STATS)
+
+i_showLines = input.bool(true, "Draw naked POC lines", group = GRP_DISP)
+i_showZones = input.bool(true, "Draw POC zones", group = GRP_DISP)
+i_showVA    = input.bool(true, "Plot prior session VAH/VAL", group = GRP_DISP)
+i_showDD    = input.bool(true, "Plot prior session LVN (double dist.)", group = GRP_DISP)
+i_lineWidth = input.int(1, "Line width", minval = 1, maxval = 4, group = GRP_DISP)
+i_colWeak   = input.color(color.new(color.gray, 30), "Weak POC colour", group = GRP_DISP)
+i_colStrong = input.color(color.new(color.orange, 0), "Strong POC colour", group = GRP_DISP)
+i_zoneOpac  = input.int(88, "Zone fill transparency", minval = 50, maxval = 99, group = GRP_DISP)
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
+type SessionProfile
+    float poc       = na
+    float vah       = na
+    float val       = na
+    float pocShare  = 0.0
+    float totalVol  = 0.0
+    float zoneTop   = na
+    float zoneBot   = na
+    bool  dblDist   = false
+    float ddValley  = na
+
+// -----------------------------------------------------------------------------
+// Helper functions (top level -- Pine forbids nested function definitions)
+// -----------------------------------------------------------------------------
+
+// Bin index for a price. Anchored at 0 so indices stay stable within a session.
+f_binIdx(float price, float bsize) =>
+    int(math.floor(price / bsize))
+
+// Percentile of a float array (nearest-rank on a sorted copy). Non-destructive.
+f_pct(array<float> a, float p) =>
+    float res = na
+    int n = a.size()
+    if n > 0
+        c = a.copy()
+        c.sort(order.ascending)
+        idx = int(math.round(p * (n - 1)))
+        res := c.get(math.max(0, math.min(n - 1, idx)))
+    res
+
+// Safe number formatting for table cells.
+f_num(float v, string fmt) =>
+    na(v) ? "--" : str.tostring(v, fmt)
+
+// Build the completed session's profile from the bin map.
+// Pure function -- no var state, so it is safe to call from a conditional block.
+f_buildProfile(map<int, float> binMap, float bsize, float vaPct, string zoneMode,
+     float zTicks, float zAtrMult, float zExpPct, float atrD,
+     bool ddOn, float ddValleyPct, float ddPeakPct) =>
+
+    SessionProfile p = SessionProfile.new()
+    keys = binMap.keys()
+
+    if keys.size() > 0
+        keys.sort(order.ascending)
+        int minK = keys.get(0)
+        int maxK = keys.get(keys.size() - 1)
+        int m    = maxK - minK + 1
+
+        if m >= 1 and m <= MAX_DENSE_BINS
+            // Dense histogram: absent keys are genuine zero-volume bins and must
+            // be represented, otherwise value-area expansion and valley detection
+            // would step straight over the strongest low-volume nodes.
+            vols  = array.new<float>(m, 0.0)
+            float total = 0.0
+            for k in keys
+                v = nz(binMap.get(k))
+                vols.set(k - minK, v)
+                total += v
+            p.totalVol := total
+
+            // ---- POC -------------------------------------------------------
+            int   pocI = 0
+            float pocV = vols.get(0)
+            if m > 1
+                for i = 1 to m - 1
+                    vi = vols.get(i)
+                    if vi > pocV
+                        pocV := vi
+                        pocI := i
+            p.poc      := (minK + pocI + 0.5) * bsize
+            p.pocShare := total > 0.0 ? pocV / total : 0.0
+
+            // ---- Value area: expand from the POC, taking the richer side ----
+            float target  = total * vaPct / 100.0
+            float covered = pocV
+            int   hi = pocI
+            int   lo = pocI
+            for _iter = 0 to m
+                if covered >= target or (hi >= m - 1 and lo <= 0)
+                    break
+                float vUp = hi < m - 1 ? vols.get(hi + 1) : -1.0
+                float vDn = lo > 0     ? vols.get(lo - 1) : -1.0
+                if vUp >= vDn
+                    hi      += 1
+                    covered += vUp
+                else
+                    lo      -= 1
+                    covered += vDn
+            p.vah := (minK + hi + 1) * bsize
+            p.val := (minK + lo) * bsize
+
+            // ---- Zone ------------------------------------------------------
+            float half = 0.0
+            if zoneMode == "Fixed ticks"
+                half := zTicks * syminfo.mintick
+            else if zoneMode == "ATR fraction"
+                half := nz(atrD) * zAtrMult
+            else if zoneMode == "Bin width"
+                half := bsize / 2.0
+
+            if zoneMode == "Volume expansion"
+                // Contiguous shelf: stop at the first bin that fails the test.
+                float thr  = pocV * zExpPct / 100.0
+                int   hiE  = pocI
+                int   loE  = pocI
+                for _iu = 0 to m
+                    if hiE >= m - 1 or vols.get(hiE + 1) < thr
+                        break
+                    hiE += 1
+                for _id = 0 to m
+                    if loE <= 0 or vols.get(loE - 1) < thr
+                        break
+                    loE -= 1
+                p.zoneTop := (minK + hiE + 1) * bsize
+                p.zoneBot := (minK + loE) * bsize
+            else
+                p.zoneTop := p.poc + half
+                p.zoneBot := p.poc - half
+
+            // ---- Double distribution ---------------------------------------
+            // Prefix/suffix maxima give an O(n) test for "a deep valley with a
+            // real peak on BOTH sides" -- the cheap, robust subset of LVN
+            // detection, with no peak-finding or smoothing parameters.
+            if ddOn and m >= 3
+                pre = array.new<float>(m, 0.0)
+                suf = array.new<float>(m, 0.0)
+                float run = 0.0
+                for i = 0 to m - 1
+                    pre.set(i, run)
+                    run := math.max(run, vols.get(i))
+                run := 0.0
+                for i = m - 1 to 0
+                    suf.set(i, run)
+                    run := math.max(run, vols.get(i))
+
+                float valleyTh = pocV * ddValleyPct / 100.0
+                float peakTh   = pocV * ddPeakPct   / 100.0
+                int   bestI    = -1
+                float bestV    = na
+                for i = 1 to m - 2
+                    vi = vols.get(i)
+                    if vi <= valleyTh and pre.get(i) >= peakTh and suf.get(i) >= peakTh
+                        if bestI == -1 or vi < bestV
+                            bestI := i
+                            bestV := vi
+                if bestI >= 0
+                    p.dblDist  := true
+                    p.ddValley := (minK + bestI + 0.5) * bsize
+    p
+
+// -----------------------------------------------------------------------------
+// Global series (must be evaluated unconditionally, every bar)
+// -----------------------------------------------------------------------------
+atrDaily = request.security(syminfo.tickerid, "D", ta.atr(i_atrLen),
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+inSess    = not na(time(timeframe.period, i_sess, i_tz))
+sessStart = inSess and not inSess[1]
+sessEnd   = not inSess and inSess[1]
+
+// -----------------------------------------------------------------------------
+// Session accumulation state
+// -----------------------------------------------------------------------------
+var map<int, float> binMap  = map.new<int, float>()
+var bool   sessOpen    = false
+var float  sessBinSize = na
+var float  sessHigh    = na
+var float  sessLow     = na
+var float  sessVol     = 0.0
+var int    sessLastBar = 0
+var int    sessCount   = 0     // completed sessions (profiles built)
+var int    sessStartCnt = 0     // sessions OPENED -- the clock for level age
+var int    ddCount     = 0
+
+var array<float> rangeHist = array.new<float>()
+var array<float> volHist   = array.new<float>()
+
+// Prior-session levels, plotted as steplines (cheap, and non-repainting because
+// they only ever update on the bar after the session closes).
+var float lastPoc = na
+var float lastVah = na
+var float lastVal = na
+var float lastLvn = na
+var float lastZoneTop = na  // prior session POC zone, for the pullback setup
+var float lastZoneBot = na
+var float lastSessHi  = na  // prior session range, for the fallback target
+var float lastSessLo  = na
+var float lastVaW = na      // prior session value-area width
+var float lastClsPos = na   // where the prior session closed inside its value area (0..1)
+var float sessOpenPx = na   // opening price of the CURRENT session (playbook A)
+var array<float> pocHist  = array.new<float>()   // recent POCs, for migration
+var array<float> vaWHist  = array.new<float>()   // recent VA widths, for the width regime
+
+// -----------------------------------------------------------------------------
+// Naked POC stack (parallel arrays, insertion order = oldest first)
+// -----------------------------------------------------------------------------
+var array<float> npPrice   = array.new<float>()
+var array<float> npTop     = array.new<float>()
+var array<float> npBot     = array.new<float>()
+var array<int>   npSess    = array.new<int>()
+var array<float> npShare   = array.new<float>()
+var array<float> npDistAtk = array.new<float>()
+var array<bool>  npDone    = array.new<bool>()
+var array<line>  npLine    = array.new<line>()
+var array<box>   npBox     = array.new<box>()
+
+// Resolved records -- one entry per nPOC that was either tested or aged out.
+var array<bool>  resTested = array.new<bool>()
+var array<float> resAge    = array.new<float>()
+var array<float> resShare  = array.new<float>()
+var array<float> resDist   = array.new<float>()
+var int censored = 0
+
+// -----------------------------------------------------------------------------
+// 1. Session start -- reset the profile and fix the bin size for this session
+// -----------------------------------------------------------------------------
+if sessStart
+    binMap.clear()
+    sessOpen := true
+    // Age and test-eligibility are measured in sessions OPENED, not sessions
+    // completed: a level born at the close of session N must become testable at
+    // the OPEN of session N+1, which is before sessCount next increments.
+    sessStartCnt += 1
+    sessHigh   := high
+    sessLow    := low
+    sessVol    := 0.0
+    sessOpenPx := open
+
+    // Bin size from the rolling average session range so that a session lands on
+    // roughly i_bins buckets. Falls back to daily ATR before history exists.
+    float avgRange = rangeHist.size() > 0 ? rangeHist.avg() : nz(atrDaily, high - low)
+    float raw      = avgRange / i_bins
+    sessBinSize := math.max(math.round(raw / syminfo.mintick) * syminfo.mintick, syminfo.mintick)
+
+// -----------------------------------------------------------------------------
+// 2. In-session accumulation
+// -----------------------------------------------------------------------------
+if inSess and sessOpen and not na(sessBinSize) and sessBinSize > 0.0
+    sessHigh := math.max(nz(sessHigh, high), high)
+    sessLow  := math.min(nz(sessLow, low), low)
+    sessVol  += nz(volume)
+    sessLastBar := bar_index
+
+    float v = nz(volume)
+    if v > 0.0
+        int hiI  = f_binIdx(high, sessBinSize)
+        int loI  = f_binIdx(low,  sessBinSize)
+        int span = hiI - loI + 1
+        if i_dist == "HLC3 point" or span <= 1 or span > MAX_SPAN_BINS
+            int k = f_binIdx(hlc3, sessBinSize)
+            binMap.put(k, nz(binMap.get(k)) + v)
+        else
+            float per = v / span
+            for k = loI to hiI
+                binMap.put(k, nz(binMap.get(k)) + per)
+
+// -----------------------------------------------------------------------------
+// 3. Session end -- finalise the profile and push onto the naked stack
+// -----------------------------------------------------------------------------
+if sessEnd and sessOpen
+    sessOpen := false
+    prof = f_buildProfile(binMap, sessBinSize, i_vaPct, i_zoneMode,
+         i_zoneTicks, i_zoneAtr, i_zoneExp, atrDaily,
+         i_ddOn, i_ddValley, i_ddPeak)
+
+    if not na(prof.poc)
+        sessCount += 1
+
+        // Rolling history for the next session's bin sizing / relative volume.
+        rangeHist.push(nz(sessHigh, high) - nz(sessLow, low))
+        if rangeHist.size() > i_binLook
+            rangeHist.shift()
+        volHist.push(sessVol)
+        if volHist.size() > i_binLook
+            volHist.shift()
+
+        lastPoc := prof.poc
+        lastVah := prof.vah
+        lastVal := prof.val
+        lastLvn := prof.ddValley
+        lastZoneTop := prof.zoneTop
+        lastZoneBot := prof.zoneBot
+        lastSessHi  := sessHigh
+        lastSessLo  := sessLow
+        lastVaW := prof.vah - prof.val
+        // Where the session closed inside its own value area: ~0.5 is balance,
+        // near 0 or 1 is an imbalanced/directional close.
+        lastClsPos := lastVaW > 0.0 ? math.max(0.0, math.min(1.0, (close[1] - prof.val) / lastVaW)) : na
+
+        pocHist.push(prof.poc)
+        if pocHist.size() > 10
+            pocHist.shift()
+        vaWHist.push(lastVaW)
+        if vaWHist.size() > i_binLook
+            vaWHist.shift()
+        if prof.dblDist
+            ddCount += 1
+
+        // Distance at creation, in daily-ATR units, measured from the session's
+        // closing price (close[1] -- this bar is already outside the session).
+        float distAtk = not na(atrDaily) and atrDaily > 0.0 ? math.abs(prof.poc - close[1]) / atrDaily : na
+
+        npPrice.push(prof.poc)
+        npTop.push(prof.zoneTop)
+        npBot.push(prof.zoneBot)
+        npSess.push(sessStartCnt)
+        npShare.push(prof.pocShare)
+        npDistAtk.push(distAtk)
+        npDone.push(false)
+
+        // Colour carries POC strength: share of session volume held by the bin.
+        color lvlCol = color.from_gradient(prof.pocShare, 0.02, 0.10, i_colWeak, i_colStrong)
+
+        line ln = na
+        if i_showLines
+            ln := line.new(sessLastBar, prof.poc, sessLastBar + 1, prof.poc,
+                 xloc = xloc.bar_index, extend = extend.right,
+                 color = lvlCol, width = i_lineWidth,
+                 style = prof.dblDist ? line.style_dashed : line.style_solid)
+        npLine.push(ln)
+
+        box bx = na
+        if i_showZones and i_zoneMode != "Line only" and prof.zoneTop > prof.zoneBot
+            bx := box.new(sessLastBar, prof.zoneTop, sessLastBar + 1, prof.zoneBot,
+                 xloc = xloc.bar_index, extend = extend.right,
+                 border_color = color.new(lvlCol, 60), border_width = 1,
+                 bgcolor = color.new(lvlCol, i_zoneOpac))
+        npBox.push(bx)
+
+        // Evict the oldest once the cap is reached. An unresolved eviction is
+        // reported as censored so the reader knows the stats are truncated.
+        while npPrice.size() > i_maxStack
+            if not npDone.get(0)
+                censored += 1
+            l0 = npLine.get(0)
+            b0 = npBox.get(0)
+            if not na(l0)
+                line.delete(l0)
+            if not na(b0)
+                box.delete(b0)
+            npPrice.remove(0)
+            npTop.remove(0)
+            npBot.remove(0)
+            npSess.remove(0)
+            npShare.remove(0)
+            npDistAtk.remove(0)
+            npDone.remove(0)
+            npLine.remove(0)
+            npBox.remove(0)
+
+    // Age-out: resolve as "not tested" once past the horizon. The level stays on
+    // the stack and can still be drawn and tested -- it just cannot be counted
+    // twice. This is the censoring rule behind every % in the table.
+    if npPrice.size() > 0
+        for i = 0 to npPrice.size() - 1
+            if not npDone.get(i) and (sessStartCnt - npSess.get(i)) > i_horizon
+                npDone.set(i, true)
+                resTested.push(false)
+                resAge.push(na)
+                resShare.push(npShare.get(i))
+                resDist.push(npDistAtk.get(i))
+
+// -----------------------------------------------------------------------------
+// 4. Test detection -- iterate BACKWARDS, removal shifts every later index
+// -----------------------------------------------------------------------------
+bool testedThisBar = false
+float testedPrice  = na
+
+float tol     = i_testTol * syminfo.mintick
+bool  canTest = i_testRth ? inSess : true
+
+if canTest and npPrice.size() > 0
+    for i = npPrice.size() - 1 to 0
+        // A level is testable once a LATER session has opened, so the bars
+        // immediately following its own session close cannot test it.
+        bool eligible = not i_testNext or npSess.get(i) < sessStartCnt
+        if eligible
+            float p = npPrice.get(i)
+            if low - tol <= p and high + tol >= p
+                testedThisBar := true
+                testedPrice   := p
+
+                if not npDone.get(i)
+                    resTested.push(true)
+                    resAge.push(math.max(0, sessStartCnt - npSess.get(i)))
+                    resShare.push(npShare.get(i))
+                    resDist.push(npDistAtk.get(i))
+
+                l = npLine.get(i)
+                b = npBox.get(i)
+                if i_keepTest
+                    if not na(l)
+                        line.set_extend(l, extend.none)
+                        line.set_x2(l, bar_index)
+                        line.set_color(l, color.new(color.gray, 55))
+                        line.set_style(l, line.style_dotted)
+                    if not na(b)
+                        box.set_extend(b, extend.none)
+                        box.set_right(b, bar_index)
+                        box.set_bgcolor(b, color.new(color.gray, 92))
+                else
+                    if not na(l)
+                        line.delete(l)
+                    if not na(b)
+                        box.delete(b)
+
+                npPrice.remove(i)
+                npTop.remove(i)
+                npBot.remove(i)
+                npSess.remove(i)
+                npShare.remove(i)
+                npDistAtk.remove(i)
+                npDone.remove(i)
+                npLine.remove(i)
+                npBox.remove(i)
+
+// =============================================================================
+// STRATEGY LAYER
+// =============================================================================
+
+const string GRP_SETUP = "7 - Entry Setup"
+const string GRP_FILT  = "8 - Regime Filter"
+const string GRP_TGT   = "9 - Target Engine"
+const string GRP_RISK  = "10 - Stop & Sizing"
+const string GRP_EXEC  = "11 - Execution"
+
+i_playbook   = input.string("B - Trend pullback to POC", "Playbook",
+     options = ["B - Trend pullback to POC", "A - Return to value", "Both"], group = GRP_SETUP,
+     tooltip = "B enters a pullback into the prior POC zone that holds. A enters when the session opens outside prior value and rotates back into it. They are different systems -- run them separately before running Both.")
+i_aBalance   = input.bool(true, "A: require balance regime", group = GRP_SETUP,
+     tooltip = "Return-to-value is a balance-day trade. Off = take it in any regime.")
+i_bTrend     = input.bool(false, "B: require trend regime (wide VA)", group = GRP_SETUP,
+     tooltip = "Continuation is a trend-day trade. Off by default so the VA-width regime can be A/B tested rather than assumed.")
+
+i_filterMode = input.string("Profile regime", "Direction filter",
+     options = ["Profile regime", "EMA", "Both", "None"], group = GRP_FILT,
+     tooltip = "None is the CONTROL GROUP -- direction then comes from the setup's own approach side. Always measure against None before believing a filter helps.")
+i_migLook    = input.int(3, "POC migration lookback (sessions)", minval = 1, maxval = 10, group = GRP_FILT)
+i_migMinAtr  = input.float(0.15, "POC migration min move (x daily ATR)", minval = 0.0, step = 0.05, group = GRP_FILT,
+     tooltip = "POCs must have migrated at least this far to count as a trend.")
+i_trendVaMult= input.float(1.10, "Wide VA multiple (trend regime)", minval = 1.0, step = 0.05, group = GRP_FILT)
+i_balVaMult  = input.float(0.90, "Narrow VA multiple (balance regime)", maxval = 1.0, step = 0.05, group = GRP_FILT)
+i_emaFast    = input.int(21, "EMA fast", minval = 2, group = GRP_FILT)
+i_emaSlow    = input.int(55, "EMA slow", minval = 3, group = GRP_FILT)
+
+i_minTgtR    = input.float(1.0, "Min target distance (R)", minval = 0.1, step = 0.1, group = GRP_TGT,
+     tooltip = "An nPOC closer than this is skipped and the next one up is used. A target inside 1R is not a trade.")
+i_maxTgtAtr  = input.float(1.50, "Max target distance (x daily ATR)", minval = 0.1, step = 0.1, group = GRP_TGT,
+     tooltip = "PLACEHOLDER -- set this from the distance-at-creation table in naked_poc_levels.pine, do not fit it here.")
+i_tgtOffTick = input.float(2.0, "Target offset (ticks inside the level)", minval = 0.0, step = 1.0, group = GRP_TGT,
+     tooltip = "Places the limit slightly BEFORE the nPOC. Resting orders pile up on a magnet and TradingView fills you on a touch with no queue position; this pays for that optimism.")
+i_fallback   = input.string("Fixed R", "Fallback when no valid nPOC",
+     options = ["Fixed R", "Prior session H/L", "ATR extension", "Skip trade"], group = GRP_TGT,
+     tooltip = "Skip trade isolates the pure nPOC-target hypothesis. Naked POCs only exist where price has already traded, so a trend-following long at new highs will often have none above it.")
+i_fbR        = input.float(2.0, "Fallback fixed R multiple", minval = 0.2, step = 0.1, group = GRP_TGT)
+i_fbAtr      = input.float(0.50, "Fallback ATR extension", minval = 0.1, step = 0.1, group = GRP_TGT)
+i_scaleOut   = input.bool(false, "Scale out: 50% at nPOC 1, rest at nPOC 2", group = GRP_TGT,
+     tooltip = "Off by default so the base case stays clean and measurable.")
+i_beAfterTp1 = input.bool(true, "Move stop to breakeven after TP1", group = GRP_TGT)
+
+i_stopMode   = input.string("Beyond value area", "Stop placement",
+     options = ["Beyond value area", "Beyond POC zone", "ATR"], group = GRP_RISK)
+i_stopBufAtr = input.float(0.05, "Stop buffer (x daily ATR)", minval = 0.0, step = 0.01, group = GRP_RISK)
+i_stopAtr    = input.float(0.25, "ATR stop distance (x daily ATR)", minval = 0.05, step = 0.05, group = GRP_RISK)
+i_minRiskTk  = input.float(8.0, "Min risk (ticks)", minval = 1.0, step = 1.0, group = GRP_RISK,
+     tooltip = "A stop a few ticks away makes R meaningless and will be noise-stopped.")
+i_maxRiskAtr = input.float(0.40, "Max risk (x daily ATR)", minval = 0.05, step = 0.05, group = GRP_RISK,
+     tooltip = "PLACEHOLDER. Skips the trade when the structural stop is too far away.")
+i_sizeMode   = input.string("Fixed contracts", "Position sizing",
+     options = ["Fixed contracts", "Risk % of equity"], group = GRP_RISK)
+i_qty        = input.int(1, "Contracts", minval = 1, group = GRP_RISK)
+i_riskPct    = input.float(0.5, "Risk % of equity", minval = 0.05, step = 0.05, group = GRP_RISK)
+
+i_entrySess  = input.session("0935-1545", "Entry window", group = GRP_EXEC,
+     tooltip = "No entries in the opening or closing minutes.")
+i_flatSess   = input.session("0930-1555", "Position-holding window", group = GRP_EXEC,
+     tooltip = "Positions are flattened once price trades outside this window but still inside the session.")
+i_eodFlat    = input.bool(true, "Flatten at end of session", group = GRP_EXEC)
+i_maxTrades  = input.int(2, "Max trades per session", minval = 1, maxval = 10, group = GRP_EXEC)
+i_showDash   = input.bool(true, "Show strategy dashboard", group = GRP_EXEC)
+
+// -----------------------------------------------------------------------------
+// Target engine -- top-level functions, arrays passed in explicitly
+// -----------------------------------------------------------------------------
+
+// Nearest level strictly above px + minGap. na when the stack holds none.
+f_nearestAbove(array<float> arr, float px, float minGap) =>
+    float best = na
+    if arr.size() > 0
+        for i = 0 to arr.size() - 1
+            float p = arr.get(i)
+            if p >= px + minGap and (na(best) or p < best)
+                best := p
+    best
+
+// Nearest level strictly below px - minGap.
+f_nearestBelow(array<float> arr, float px, float minGap) =>
+    float best = na
+    if arr.size() > 0
+        for i = 0 to arr.size() - 1
+            float p = arr.get(i)
+            if p <= px - minGap and (na(best) or p > best)
+                best := p
+    best
+
+// -----------------------------------------------------------------------------
+// 5. Regime filter -- built from the profile itself, not bolted on
+// -----------------------------------------------------------------------------
+// ta.* must run unconditionally on every bar to keep its history consistent.
+emaFast = ta.ema(close, i_emaFast)
+emaSlow = ta.ema(close, i_emaSlow)
+
+float vaWAvg = vaWHist.size() > 0 ? vaWHist.avg() : na
+bool  wideVA   = not na(lastVaW) and not na(vaWAvg) and vaWAvg > 0.0 and lastVaW > vaWAvg * i_trendVaMult
+bool  narrowVA = not na(lastVaW) and not na(vaWAvg) and vaWAvg > 0.0 and lastVaW < vaWAvg * i_balVaMult
+
+// POC migration: where the last N session POCs have walked, in ATR units.
+int pocMig = 0
+if pocHist.size() >= i_migLook + 1 and not na(atrDaily) and atrDaily > 0.0
+    float pNow  = pocHist.get(pocHist.size() - 1)
+    float pThen = pocHist.get(pocHist.size() - 1 - i_migLook)
+    float dMig  = pNow - pThen
+    float migTh = atrDaily * i_migMinAtr
+    pocMig := dMig > migTh ? 1 : dMig < -migTh ? -1 : 0
+
+// Profile-native bias: POCs migrating one way AND the prior session closing on
+// that side of its own value area.
+int profBias = 0
+if pocMig == 1 and nz(lastClsPos, 0.5) >= 0.5
+    profBias := 1
+else if pocMig == -1 and nz(lastClsPos, 0.5) <= 0.5
+    profBias := -1
+
+int emaBias = emaFast > emaSlow ? 1 : emaFast < emaSlow ? -1 : 0
+
+int bias = switch i_filterMode
+    "Profile regime" => profBias
+    "EMA"            => emaBias
+    "Both"           => profBias == emaBias ? profBias : 0
+    => 0
+
+bool filterOff = i_filterMode == "None"
+
+// -----------------------------------------------------------------------------
+// 6. Setup state machines
+// -----------------------------------------------------------------------------
+var int  bLastSide = 0      // last side price was fully on, relative to the POC zone
+var bool bTouched  = false
+var int  bApproach = 0      // side price came FROM when it reached the zone
+var int  aOpenSide = 0      // where this session opened relative to prior value
+var bool aFired    = false
+var int  tradesToday = 0
+
+if sessStart
+    bLastSide   := 0
+    bTouched    := false
+    bApproach   := 0
+    aFired      := false
+    tradesToday := 0
+    aOpenSide   := not na(lastVah) and not na(lastVal) and not na(sessOpenPx) ?
+         (sessOpenPx > lastVah ? 1 : sessOpenPx < lastVal ? -1 : 0) : 0
+
+bool haveZone = not na(lastZoneTop) and not na(lastZoneBot)
+
+// -- Playbook B: pullback into the prior POC zone that holds -------------------
+int  bSide  = haveZone ? (low > lastZoneTop ? 1 : high < lastZoneBot ? -1 : 0) : 0
+bool inZone = haveZone and bSide == 0
+
+if inSess and bSide != 0
+    bLastSide := bSide
+if inSess and inZone and not bTouched and bLastSide != 0
+    bTouched  := true
+    bApproach := bLastSide
+
+// Reclaim: a close back out of the zone on the side price approached from.
+bool bRegimeOk = not i_bTrend or wideVA
+bool bLongSig  = bTouched and bApproach ==  1 and haveZone and bRegimeOk and close > lastZoneTop
+bool bShortSig = bTouched and bApproach == -1 and haveZone and bRegimeOk and close < lastZoneBot
+
+// -- Playbook A: opened outside value, rotates back in ------------------------
+bool aRegimeOk = not i_aBalance or narrowVA
+bool aLongSig  = not aFired and aOpenSide == -1 and aRegimeOk and not na(lastVal) and close > lastVal
+bool aShortSig = not aFired and aOpenSide ==  1 and aRegimeOk and not na(lastVah) and close < lastVah
+
+bool useB = i_playbook != "A - Return to value"
+bool useA = i_playbook != "B - Trend pullback to POC"
+
+// Candidate direction and which playbook produced it. B is checked first: it is
+// the primary system, and A only fires once per session anyway.
+int candDir  = 0
+int candPlay = 0
+if useB and (bLongSig or bShortSig)
+    candDir  := bLongSig ? 1 : -1
+    candPlay := 2
+else if useA and (aLongSig or aShortSig)
+    candDir  := aLongSig ? 1 : -1
+    candPlay := 1
+
+// The filter gates direction. With the filter off, direction comes from the
+// setup itself -- that is what makes "None" a usable control group.
+bool dirOk = filterOff or (candDir != 0 and candDir == bias)
+
+// -----------------------------------------------------------------------------
+// 7. Trade construction
+// -----------------------------------------------------------------------------
+bool inEntryWin = not na(time(timeframe.period, i_entrySess, i_tz))
+bool inFlatWin  = not na(time(timeframe.period, i_flatSess,  i_tz))
+
+var int   posDir    = 0
+var float sStop     = na
+var float sT1       = na
+var float sT2       = na
+var bool  sUsedN    = false
+var float sRiskCcy  = na
+var int   sPlay     = 0
+var bool  sBeMoved  = false
+var bool  sTp1Done  = false
+var float prevPos   = 0.0
+
+// Instrumentation queue: one record per closed trade that an entry will produce.
+var array<bool>  qUsedN = array.new<bool>()
+var array<float> qRisk  = array.new<float>()
+var int   prevClosed = 0
+var int   cntNpocN = 0
+var int   cntNpocW = 0
+var float sumNpocR = 0.0
+var int   cntFbN   = 0
+var int   cntFbW   = 0
+var float sumFbR   = 0.0
+var int   cntPlayA = 0
+var int   cntPlayB = 0
+var int   cntSkipTgt = 0
+var int   cntSkipRisk = 0
+
+float buf   = nz(atrDaily) * i_stopBufAtr
+float entPx = close   // planning price; the fill is the next bar's open
+
+// ---- stop -------------------------------------------------------------------
+float rawStop = switch i_stopMode
+    "Beyond value area" => candDir == 1 ? lastVal - buf : lastVah + buf
+    "Beyond POC zone"   => candDir == 1 ? lastZoneBot - buf : lastZoneTop + buf
+    => candDir == 1 ? entPx - i_stopAtr * nz(atrDaily) : entPx + i_stopAtr * nz(atrDaily)
+
+// The stop must actually be on the losing side of entry -- a value area that has
+// already been crossed can otherwise place it the wrong side.
+bool stopOk  = candDir != 0 and not na(rawStop) and (candDir == 1 ? rawStop < entPx : rawStop > entPx)
+float riskD  = stopOk ? math.abs(entPx - rawStop) : na
+bool riskOk  = stopOk and riskD >= i_minRiskTk * syminfo.mintick and
+     not na(atrDaily) and atrDaily > 0.0 and riskD <= i_maxRiskAtr * atrDaily
+
+// ---- target -----------------------------------------------------------------
+float minGap = nz(riskD) * i_minTgtR
+float rawT1  = candDir == 1 ? f_nearestAbove(npPrice, entPx, minGap) : f_nearestBelow(npPrice, entPx, minGap)
+float maxTgt = i_maxTgtAtr * nz(atrDaily)
+bool  t1Ok   = riskOk and not na(rawT1) and math.abs(rawT1 - entPx) <= maxTgt
+
+float off = i_tgtOffTick * syminfo.mintick
+float npT1 = na
+float npT2 = na
+if t1Ok
+    npT1 := candDir == 1 ? rawT1 - off : rawT1 + off
+    float rawT2 = candDir == 1 ? f_nearestAbove(npPrice, rawT1, off) : f_nearestBelow(npPrice, rawT1, off)
+    if not na(rawT2) and math.abs(rawT2 - entPx) <= maxTgt
+        npT2 := candDir == 1 ? rawT2 - off : rawT2 + off
+
+float fbTgt = switch i_fallback
+    "Fixed R"           => candDir == 1 ? entPx + i_fbR * nz(riskD) : entPx - i_fbR * nz(riskD)
+    "Prior session H/L" => candDir == 1 ? lastSessHi : lastSessLo
+    "ATR extension"     => candDir == 1 ? entPx + i_fbAtr * nz(atrDaily) : entPx - i_fbAtr * nz(atrDaily)
+    => na
+
+// A fallback still has to clear the minimum-R hurdle to be a trade at all.
+bool fbOk = not na(fbTgt) and riskOk and (candDir == 1 ? fbTgt >= entPx + minGap : fbTgt <= entPx - minGap)
+
+bool  usedNpoc = t1Ok
+float finalT1  = t1Ok ? npT1 : (fbOk ? fbTgt : na)
+bool  tgtOk    = not na(finalT1)
+
+// ---- sizing -----------------------------------------------------------------
+int qtyUse = i_qty
+if i_sizeMode == "Risk % of equity" and riskOk and syminfo.pointvalue > 0.0
+    qtyUse := math.max(1, int(math.floor((strategy.equity * i_riskPct / 100.0) / (riskD * syminfo.pointvalue))))
+
+// -----------------------------------------------------------------------------
+// 8. Orders
+// -----------------------------------------------------------------------------
+bool canEnter = inSess and inEntryWin and barstate.isconfirmed and
+     strategy.position_size == 0 and tradesToday < i_maxTrades and candDir != 0 and dirOk
+
+// Diagnostics: separate "no valid target" from "risk out of bounds" so the
+// dashboard can say WHY setups were discarded rather than just how many.
+// Counted on the RISING EDGE of a setup only: the B signal stays latched for as
+// long as price holds outside the zone, so counting every qualifying bar would
+// report bars rather than setups and inflate the tally by an order of magnitude.
+bool candNew = candDir != 0 and (candDir[1] == 0 or candDir[1] != candDir)
+if canEnter and candNew and not riskOk
+    cntSkipRisk += 1
+if canEnter and candNew and riskOk and not tgtOk
+    cntSkipTgt += 1
+
+if canEnter and riskOk and tgtOk
+    string eid = candDir == 1 ? "nPOC L" : "nPOC S"
+    if candDir == 1
+        strategy.entry(eid, strategy.long,  qty = qtyUse)
+    else
+        strategy.entry(eid, strategy.short, qty = qtyUse)
+
+    posDir   := candDir
+    sStop    := rawStop
+    sT1      := finalT1
+    sT2      := usedNpoc ? npT2 : na
+    sUsedN   := usedNpoc
+    sPlay    := candPlay
+    sBeMoved := false
+    sRiskCcy := riskD * syminfo.pointvalue * qtyUse
+    tradesToday += 1
+    if candPlay == 1
+        cntPlayA += 1
+        aFired := true          // A fires at most once per session
+    else
+        cntPlayB += 1
+
+    // Clear the B latch. Without this the touch stays armed, and the first bar
+    // after the trade closes re-enters off the same stale interaction instead
+    // of requiring a fresh pullback into the zone.
+    bTouched  := false
+    bApproach := 0
+    bLastSide := 0
+
+    // One queue record per closed trade this entry will produce.
+    bool willScale = i_scaleOut and not na(sT2)
+    qUsedN.push(sUsedN)
+    qRisk.push(willScale ? sRiskCcy / 2.0 : sRiskCcy)
+    if willScale
+        qUsedN.push(sUsedN)
+        qRisk.push(sRiskCcy / 2.0)
+
+// First target filled, detected as a reduction in position size.
+bool sizeCut = posDir != 0 and strategy.position_size != 0 and
+     math.abs(strategy.position_size) < math.abs(prevPos)
+if i_scaleOut and sizeCut and not sTp1Done
+    sTp1Done := true
+    if i_beAfterTp1
+        sStop    := strategy.position_avg_price
+        sBeMoved := true
+
+// Re-assert the bracket every bar in position: real stop/limit orders, never a
+// close-based comparison, so intrabar stop hits are modelled.
+if strategy.position_size != 0 and posDir != 0 and not na(sStop) and not na(sT1)
+    string eid = posDir == 1 ? "nPOC L" : "nPOC S"
+    // Once TP1 has filled, TP1 must NOT be re-issued: qty_percent is a share of
+    // the CURRENT position, so re-asserting it would keep halving the runner on
+    // every subsequent bar instead of carrying it to TP2.
+    if i_scaleOut and not na(sT2) and not sTp1Done
+        strategy.exit("TP1", eid, stop = sStop, limit = sT1, qty_percent = 50)
+        strategy.exit("TP2", eid, stop = sStop, limit = sT2)
+    else if i_scaleOut and not na(sT2)
+        strategy.exit("TP2", eid, stop = sStop, limit = sT2)
+    else
+        strategy.exit("X", eid, stop = sStop, limit = sT1)
+
+// End-of-session flat.
+if i_eodFlat and inSess and not inFlatWin and strategy.position_size != 0
+    strategy.close_all(comment = "EOD")
+
+// Position sync.
+if strategy.position_size == 0 and posDir != 0
+    posDir   := 0
+    sStop    := na
+    sT1      := na
+    sT2      := na
+    sUsedN   := false
+    sRiskCcy := na
+    sPlay    := 0
+    sBeMoved := false
+    sTp1Done := false
+
+// -----------------------------------------------------------------------------
+// 9. Instrumentation -- split every result by target source
+// -----------------------------------------------------------------------------
+// Without this split the backtest cannot distinguish nPOC edge from fallback
+// edge, which is the entire question this strategy exists to answer.
+if strategy.closedtrades > prevClosed
+    for k = prevClosed to strategy.closedtrades - 1
+        if qUsedN.size() > 0
+            bool  un   = qUsedN.shift()
+            float rk   = qRisk.shift()
+            float pnl  = strategy.closedtrades.profit(k)
+            float rMul = not na(rk) and rk > 0.0 ? pnl / rk : na
+            if un
+                cntNpocN += 1
+                if pnl > 0.0
+                    cntNpocW += 1
+                if not na(rMul)
+                    sumNpocR += rMul
+            else
+                cntFbN += 1
+                if pnl > 0.0
+                    cntFbW += 1
+                if not na(rMul)
+                    sumFbR += rMul
+    prevClosed := strategy.closedtrades
+
+// Self-heal any queue desync (EOD flat can close a scaled position with fewer
+// closed-trade records than the entry queued).
+if strategy.position_size == 0 and qUsedN.size() > 0
+    qUsedN.clear()
+    qRisk.clear()
+
+prevPos := strategy.position_size
+
+// -----------------------------------------------------------------------------
+// 10. Plots
+// -----------------------------------------------------------------------------
+plot(strategy.position_size != 0 ? sStop : na, "Active stop",
+     color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 ? sT1 : na, "Target 1",
+     color = color.new(color.lime, 0), style = plot.style_linebr, linewidth = 2)
+plot(strategy.position_size != 0 and i_scaleOut ? sT2 : na, "Target 2",
+     color = color.new(color.green, 40), style = plot.style_linebr, linewidth = 1)
+
+plotshape(canEnter and riskOk and tgtOk and candDir == 1 and usedNpoc,
+     "Long (nPOC target)", shape.triangleup, location.belowbar, color.new(color.lime, 0), size = size.small)
+plotshape(canEnter and riskOk and tgtOk and candDir == -1 and usedNpoc,
+     "Short (nPOC target)", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
+plotshape(canEnter and riskOk and tgtOk and candDir == 1 and not usedNpoc,
+     "Long (fallback)", shape.circle, location.belowbar, color.new(color.aqua, 30), size = size.tiny)
+plotshape(canEnter and riskOk and tgtOk and candDir == -1 and not usedNpoc,
+     "Short (fallback)", shape.circle, location.abovebar, color.new(color.fuchsia, 30), size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// 11. Dashboard
+// -----------------------------------------------------------------------------
+dashPos = switch i_statsPos
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    "Middle right" => position.middle_right
+    => position.top_right
+
+var table dTbl = table.new(dashPos, 4, 12,
+     bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
+
+if barstate.islast and i_showDash
+    color hb = color.new(color.gray, 55)
+    color sb = color.new(color.blue, 70)
+    color tc = color.white
+    string SZ2 = size.small
+
+    // No merged cells: this block re-runs on every realtime tick and re-merging
+    // an already-merged cell is undefined behaviour in Pine.
+    table.cell(dTbl, 0, 0, "nPOC STRATEGY",                         text_color = tc, bgcolor = hb, text_size = SZ2)
+    table.cell(dTbl, 1, 0, str.tostring(strategy.closedtrades) + " tr", text_color = tc, bgcolor = hb, text_size = SZ2)
+    table.cell(dTbl, 2, 0, "PF " + f_num(strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na, "#.##"),
+         text_color = tc, bgcolor = hb, text_size = SZ2)
+    table.cell(dTbl, 3, 0, i_filterMode,                            text_color = tc, bgcolor = hb, text_size = SZ2)
+
+    table.cell(dTbl, 0, 1, "TARGET SOURCE", text_color = tc, bgcolor = sb, text_size = SZ2)
+    for c = 1 to 3
+        table.cell(dTbl, c, 1, "", bgcolor = sb)
+
+    table.cell(dTbl, 0, 2, "",       text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 1, 2, "N",      text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 2, "win %",  text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 2, "avg R",  text_color = tc, text_size = SZ2)
+
+    table.cell(dTbl, 0, 3, "Naked POC", text_color = color.new(color.lime, 0), text_size = SZ2)
+    table.cell(dTbl, 1, 3, str.tostring(cntNpocN), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 3, f_num(cntNpocN > 0 ? 100.0 * cntNpocW / cntNpocN : na, "#.#"), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 3, f_num(cntNpocN > 0 ? sumNpocR / cntNpocN : na, "#.##"), text_color = tc, text_size = SZ2)
+
+    table.cell(dTbl, 0, 4, "Fallback", text_color = color.new(color.aqua, 0), text_size = SZ2)
+    table.cell(dTbl, 1, 4, str.tostring(cntFbN), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 4, f_num(cntFbN > 0 ? 100.0 * cntFbW / cntFbN : na, "#.#"), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 4, f_num(cntFbN > 0 ? sumFbR / cntFbN : na, "#.##"), text_color = tc, text_size = SZ2)
+
+    table.cell(dTbl, 0, 5, "PLAYBOOK / DISCARDS", text_color = tc, bgcolor = sb, text_size = SZ2)
+    for c = 1 to 3
+        table.cell(dTbl, c, 5, "", bgcolor = sb)
+
+    table.cell(dTbl, 0, 6, "A / B entries", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 1, 6, str.tostring(cntPlayA) + " / " + str.tostring(cntPlayB), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 6, "", text_size = SZ2)
+    table.cell(dTbl, 3, 6, "", text_size = SZ2)
+
+    table.cell(dTbl, 0, 7, "Skipped: no target", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 1, 7, str.tostring(cntSkipTgt), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 7, "risk out of range", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 7, str.tostring(cntSkipRisk), text_color = tc, text_size = SZ2)
+
+    table.cell(dTbl, 0, 8, "REGIME NOW", text_color = tc, bgcolor = sb, text_size = SZ2)
+    for c = 1 to 3
+        table.cell(dTbl, c, 8, "", bgcolor = sb)
+
+    table.cell(dTbl, 0, 9, "Bias / POC migration", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 1, 9, (bias == 1 ? "LONG" : bias == -1 ? "SHORT" : "flat") + " / " + str.tostring(pocMig),
+         text_color = bias == 1 ? color.new(color.lime, 0) : bias == -1 ? color.new(color.red, 0) : tc, text_size = SZ2)
+    table.cell(dTbl, 2, 9, "VA regime", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 9, wideVA ? "trend" : narrowVA ? "balance" : "neutral", text_color = tc, text_size = SZ2)
+
+    table.cell(dTbl, 0, 10, "Live nPOCs", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 1, 10, str.tostring(npPrice.size()), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 10, "Prior POC", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 10, f_num(lastPoc, format.mintick), text_color = tc, text_size = SZ2)
+
+    table.cell(dTbl, 0, 11, "Trades this session", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 1, 11, str.tostring(tradesToday) + "/" + str.tostring(i_maxTrades), text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 2, 11, "Max DD", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 11, f_num(strategy.max_drawdown, "#.#"), text_color = tc, text_size = SZ2)
