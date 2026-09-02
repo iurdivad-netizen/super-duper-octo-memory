@@ -72,7 +72,7 @@ useLevelsFromPivots = input.bool(true, title = 'Use the OB / OS levels from the 
 customOB = input.float(80.0, title = 'Custom overbought level', minval = 0.0, maxval = 100.0, display = display.all - display.status_line, group = gCross)
 customOS = input.float(20.0, title = 'Custom oversold level', minval = 0.0, maxval = 100.0, display = display.all - display.status_line, group = gCross)
 
-zoneBasis = input.string('K or D', title = 'Zone test applies to', options = ['K or D', 'K and D', 'K only', 'D only'], display = display.all - display.status_line, group = gCross, tooltip = 'Which stochastic lines must sit inside the extreme zone for the cross to count. The cross bar and the bar before it are both considered, so a cross that is completed just as the lines leave the zone still counts.')
+zoneBasis = input.string('Either line (K or D)', title = 'Which lines must be in the zone', options = ['Either line (K or D)', 'Both lines (K and D)', 'K only', 'D only'], display = display.all - display.status_line, group = gCross, tooltip = 'How much of the stochastic has to be inside the overbought / oversold zone for the cross to count.\nEither line: one of K or D is enough.\nBoth lines: K and D must both be in the zone, so the cross happens fully inside the extreme rather than on its way out of it. This is the strict setting and it drops roughly a third of the signals.\nK only / D only: test just that line.')
 
 zoneLookback = input.int(1, title = 'Zone lookback (bars)', minval = 1, maxval = 20, display = display.all - display.status_line, group = gCross, tooltip = 'How far back from the cross the stochastic is allowed to have been inside the zone.\n1 = the cross bar itself must be in the zone (default, strictest).\nHigher values also accept a cross that lands a bar or two after the stochastic left the zone. Because the stochastic RSI can jump from 100 to 0 in one bar, a long window lets a down-cross at a low still count as overbought, which is what produces signals pointing the wrong way.')
 
@@ -403,13 +403,13 @@ dHigh = ta.highest(dm, zoneLookback)
 bullInZone = switch zoneBasis
     'K only' => kLow <= xOS
     'D only' => dLow <= xOS
-    'K and D' => kLow <= xOS and dLow <= xOS
+    'Both lines (K and D)' => kLow <= xOS and dLow <= xOS
     => kLow <= xOS or dLow <= xOS
 
 bearInZone = switch zoneBasis
     'K only' => kHigh >= xOB
     'D only' => dHigh >= xOB
-    'K and D' => kHigh >= xOB and dHigh >= xOB
+    'Both lines (K and D)' => kHigh >= xOB and dHigh >= xOB
     => kHigh >= xOB or dHigh >= xOB
 
 extremeOnly = crossFilterMode == 'Extreme zones only'
