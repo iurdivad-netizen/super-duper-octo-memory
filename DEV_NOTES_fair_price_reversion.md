@@ -314,6 +314,63 @@ stays the reference run.
 
 ---
 
+## Part 3c — Attribution and backtest integrity
+
+### The attribution panel
+
+The strategy tester reports one blended equity curve. That cannot answer a
+single question in Part 4 — which is why every test there previously needed its
+own backtest run and manual bookkeeping.
+
+Each entry is now tagged with six attributes and every closed trade is counted
+into all six buckets, so **one run** reports trades, win rate and net P&L split by:
+
+| Split | Answers |
+|-------|---------|
+| Continuation / A / A+ | Is the edge in phase 1 or phase 2, and does slide 6's "stronger win rate" for A+ actually exist? |
+| Layer 1 / 2 / 3+ | Do the second and third layers earn the risk they add, or are they just leverage? |
+| Standard / scaled volatility | Does the 50/76 exception protocol work, or does it just lose more per trade? |
+| Normal / 8:30 event day | If the 8:30 anchor helps, the gain **must** concentrate here. Spread evenly means the detector is firing on noise. |
+| Balanced / trend-day entry | The regime bet, measured directly. |
+| Displacement < TP / ≥ TP | The R:R degradation from Part 3 item 1, in realised money rather than in theory. |
+
+Read the panel before reading the equity curve. If a bucket has fewer than about
+thirty trades its win rate is noise, and the deck's 62.4% claim is not
+distinguishable from 50% at that sample size.
+
+### The ambiguity counter — read this row first
+
+A bar whose range covers **both** the stop and the target has an outcome decided
+by TradingView's intrabar assumption, not by the data. With a 25-point stop and a
+38-point target — 63 points of span — on 1m NQ, that is not a rare event, and it
+is the single largest source of backtest optimism in a system shaped like this
+one. The panel now counts those trades and shows them as a percentage.
+
+If that number is a large fraction of the total, **nothing else on the panel
+means much** until you re-run with the bar magnifier enabled or on a finer
+timeframe. A strategy whose results rest on a coin-flip resolution of 30% of its
+trades has not been backtested, it has been simulated.
+
+### Two corrections made at the same time
+
+**Risk-percent sizing was incompatible with the evaluation guard.** Sizing off
+`strategy.equity` compounds: over a profitable multi-year backtest the account
+grows, position size grows with it, and the fixed $2,000 trailing drawdown
+becomes breachable in a single trade — so the guard's pass rate stops meaning
+anything. A real evaluation account does not compound; you are paid out and it
+resets. `i_sizeBase` now defaults to sizing off initial capital.
+
+**The layer counter desynchronised on partial exits.** `layersOpen` was tracked
+manually and only reset when the position went flat, so the moment one leg of a
+three-leg position hit its target, the freed slot could never be reused —
+`position_size` was still non-zero, nothing reset the counter, and the day was
+silently capped below `i_maxLayers`. Both `layersOpen` and `posDir` are now read
+from `strategy.opentrades` and `strategy.position_size` directly. They cannot
+drift, and it makes `i_maxLayers` a cap on *concurrent open risk*, which is the
+useful reading — `i_maxTrades` already caps total entries per day.
+
+---
+
 ## Part 4 — How to test it
 
 1. **1m NQ1! continuous, RTH only**, at least two years, `i_openBars = 5` so the
@@ -352,6 +409,10 @@ are optimistic for a 10-trade-a-day system; raise them and see what survives.
 - **One direction at a time.** All open legs share a direction; an opposite
   signal is ignored unless `i_allowRev` is on.
 - **The multi-account layer is out of scope**, as above.
+- **Sixty-odd inputs is a large overfitting surface.** Every one is a chance to
+  fit noise. The honest procedure is to freeze everything at the deck's values,
+  change exactly one thing, and require the improvement to show up in the
+  attribution bucket it was supposed to affect — not merely in net profit.
 - **The 8:30 features need extended-hours data.** On an RTH-only chart they fall
   back to the 9:30 anchor and say so on the dashboard, but they do not work.
 - **Event detection finds volatility, not a calendar.** See Part 3b.
