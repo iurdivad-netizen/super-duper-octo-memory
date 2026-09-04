@@ -1,0 +1,698 @@
+//@version=6
+// =============================================================================
+// Fair Price Reversion  --  "The Prop Firm Extraction Algorithm"
+// =============================================================================
+// Mechanical implementation of the deck's system, built for NQ / MNQ index
+// futures on an intraday chart (1m or 5m).
+//
+// THESIS (deck slide 3, "Fair Pricing Theory"): the 9:30 New York open is the
+// first fair-auction reference of the day. Opening flow -- stop runs, hedging,
+// liquidity imbalances -- displaces price away from that anchor. Those early
+// moves are rarely genuine repricings, so the edge is the snap-back TOWARD the
+// 9:30 print, not the move away from it.
+//
+// THE 90-MINUTE WINDOW (slide 4):
+//   9:30 - 9:35   Phase 1, "Unfair Continuation". Ride the opening candle's
+//                 own direction. In and out. Bail if it stalls.
+//   9:35 - 11:00  Phase 2, "Reversion". Trade EXCLUSIVELY back toward the
+//                 9:30 baseline, on A / A+ displacement setups.
+//   11:00         Hard stop. Flat, no exceptions.
+//
+// EXECUTION MATHEMATICS (slide 5): 25pt stop / 38pt target = 1:1.52, sized to
+// the standard $2,000 trailing drawdown / $3,000 profit target evaluation.
+// If the opening candle's range exceeds 25 points the whole day scales to
+// 50pt / 76pt, preserving the ratio.
+//
+// WHAT IS AND IS NOT MECHANISABLE
+// The deck is a discretionary playbook. Three of its rules have no objective
+// definition and are implemented here as explicit, documented proxies:
+//   * "A setup" -> entry candle body strictly larger than the previous body.
+//   * "A+ / break of structure" -> body CLOSE beyond the last confirmed pivot,
+//     wicks do not count (slide 6 is explicit about this).
+//   * "Bailout: stalls, breaks structure, massive opposing wicks" -> a
+//     three-condition test (bars-without-progress, opposing BOS, wick-to-body
+//     ratio), each separately tunable.
+// The unexpected-news re-anchor (slide 9) is a shock-then-consolidation proxy
+// and ships DISABLED, because enabling it moves the very baseline every other
+// rule is measured against. Turn it on only once you have read what it does.
+//
+// The multi-account layer of the deck (slide 2, slide 10 -- "distribute
+// variance across decentralised accounts") is portfolio construction, not a
+// signal. It cannot be backtested inside one strategy and is not modelled.
+// What IS modelled is the single-account evaluation constraint it exists to
+// survive: the trailing-drawdown / profit-target guard in section 6.
+//
+// CALIBRATION WARNING: 25/38/50/76 and the 90-minute clock come from the deck,
+// not from this repo's data. Re-measure them on NQ before trusting any curve.
+// =============================================================================
+
+strategy("Fair Price Reversion (Prop Firm Extraction)", "FPR", overlay = true,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 50000,
+     currency                = currency.USD,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.50,
+     slippage                = 2,
+     pyramiding              = 10,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false,
+     max_bars_back           = 5000,
+     max_lines_count         = 500,
+     max_labels_count        = 500)
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+const string GRP_SESS = "1 - Session & fair price anchor"
+const string GRP_CONT = "2 - Phase 1: unfair continuation"
+const string GRP_REV  = "3 - Phase 2: reversion"
+const string GRP_MATH = "4 - Execution mathematics (SL/TP)"
+const string GRP_MGMT = "5 - Bailout & trade management"
+const string GRP_EVAL = "6 - Evaluation guard"
+const string GRP_SIZE = "7 - Position sizing"
+const string GRP_NEWS = "8 - News re-anchor protocol"
+const string GRP_DISP = "9 - Display"
+
+const string ANCH_OPEN  = "9:30 open price"
+const string ANCH_MID   = "Opening candle midpoint"
+const string ANCH_CLOSE = "Opening candle close"
+
+const string SET_A     = "A setups (displacement only)"
+const string SET_APLUS = "A+ setups only (displacement + BOS)"
+const string SET_BOTH  = "Both A and A+"
+
+const string TP_FIXED = "Fixed points (segmented extraction)"
+const string TP_BASE  = "Fair price baseline (full reversion)"
+const string TP_NEAR  = "Nearer of fixed / baseline"
+
+const string BAIL_OFF = "Off"
+const string BAIL_BE  = "Move stop to breakeven"
+const string BAIL_MKT = "Close at market"
+
+const string SIZE_FIX  = "Fixed contracts"
+const string SIZE_RISK = "Risk % of equity"
+
+const string HALT_OFF  = "Off"
+const string HALT_DAY  = "Halt for the day"
+const string HALT_PERM = "Halt permanently"
+
+// -----------------------------------------------------------------------------
+// 1 - Session & fair price anchor
+// -----------------------------------------------------------------------------
+i_sess = input.session("0930-1600", "RTH session", group = GRP_SESS,
+     tooltip = "Only the open of this session matters. The strategy never trades past the hard stop below.")
+i_tz   = input.string("America/New_York", "Session timezone", group = GRP_SESS)
+
+i_openBars = input.int(1, "Opening candle = first N chart bars", minval = 1, maxval = 30, group = GRP_SESS,
+     tooltip = "The deck's 'opening candle'. On a 5m chart leave this at 1 (09:30-09:35). On a 1m chart set 5 to reproduce the same 5-minute candle, or leave it at 1 to trigger a minute after the open.")
+
+i_anchor = input.string(ANCH_OPEN, "Fair price =", options = [ANCH_OPEN, ANCH_MID, ANCH_CLOSE], group = GRP_SESS,
+     tooltip = "Slide 11 marks the 9:30 OPEN as the permanent baseline. The other two are alternatives worth measuring, not the deck's rule.")
+
+i_pointSize = input.float(1.0, "Price units per point", minval = 0.0001, step = 0.25, group = GRP_SESS,
+     tooltip = "1.0 for NQ/MNQ/ES: one index point is one price unit. Change only for instruments where a 'point' is not 1.00 of price.")
+
+i_hardStop = input.float(90.0, "Hard stop (minutes after the open)", minval = 5, maxval = 390, group = GRP_SESS,
+     tooltip = "Slide 4: total session time is capped at 90 minutes. Everything is flat at 11:00 and no new entry is allowed to fill at or after it.")
+
+// -----------------------------------------------------------------------------
+// 2 - Phase 1: unfair continuation
+// -----------------------------------------------------------------------------
+i_useCont      = input.bool(true, "Trade the continuation", group = GRP_CONT)
+i_contDeadline = input.float(5.0, "Continuation window (minutes)", minval = 1, maxval = 60, group = GRP_CONT,
+     tooltip = "The deck's 09:30-09:35. The trigger is the opening candle's COLOUR, which is only knowable at that candle's close, so the fill lands on the first tick after the window -- 09:35 on a 5m chart, 09:31 on a 1m chart with a 1-bar opening candle. Phase 2 starts on the first bar closing after this. If your opening candle is longer than this window there is no continuation trade at all, by design.")
+i_contMinBody  = input.float(0.0, "Minimum opening candle body (points)", minval = 0, group = GRP_CONT,
+     tooltip = "Skip the continuation when the opening candle is a doji. 0 disables the filter.")
+i_contClose    = input.bool(true, "Close the continuation at the end of phase 1", group = GRP_CONT,
+     tooltip = "Slide 4: 'in and out instantly'. Off = let the bracket or the hard stop decide.")
+
+// -----------------------------------------------------------------------------
+// 3 - Phase 2: reversion
+// -----------------------------------------------------------------------------
+i_useRev   = input.bool(true, "Trade the reversion", group = GRP_REV)
+i_setup    = input.string(SET_BOTH, "Setup grade required", options = [SET_A, SET_APLUS, SET_BOTH], group = GRP_REV,
+     tooltip = "A = displacement body larger than the previous body. A+ = that, plus a body CLOSE through the last pivot. 'Both' takes every A and simply tags the A+ ones.")
+i_minDisp  = input.float(25.0, "Minimum displacement from fair price (points)", minval = 0, group = GRP_REV,
+     tooltip = "Dead band around the baseline. Price must be at least this far away before there is anything to revert. IMPORTANT: with the 'nearer of fixed / baseline' target, the deck's 1:1.52 only survives when the displacement is at least as large as the take profit. At 25 points of displacement you risk 25 to make 25. Set this to 38 (or your TP) to guarantee the full ratio, at the cost of far fewer trades -- the dashboard's 'R:R here' row shows what you are actually being paid.")
+i_minBody  = input.float(0.0, "Minimum entry body (points)", minval = 0, group = GRP_REV,
+     tooltip = "Absolute floor on displacement size, on top of the larger-than-previous test. 0 disables.")
+i_pivLen   = input.int(2, "Structure pivot length", minval = 1, maxval = 20, group = GRP_REV,
+     tooltip = "Bars either side of a swing. A pivot is only confirmed this many bars after it prints -- structure is deliberately lagged so it cannot repaint.")
+i_resetStr = input.bool(true, "Reset structure at the session open", group = GRP_REV,
+     tooltip = "On = only intraday swings count as structure. Off = carry overnight swings in.")
+
+i_maxLayers   = input.int(3, "Maximum layered entries", minval = 1, maxval = 10, group = GRP_REV,
+     tooltip = "Slide 8: 'if price breaks structure in your favour, layer an additional entry'. Each layer carries its own independent bracket.")
+i_layerBos    = input.bool(true, "Layers require a break of structure (A+)", group = GRP_REV)
+i_layerMinPts = input.float(10.0, "Minimum points between layers", minval = 0, group = GRP_REV,
+     tooltip = "A layer must be this much further along toward the baseline than the previous entry. Stops the same displacement being traded twice.")
+i_maxTrades   = input.int(10, "Maximum entries per day", minval = 1, maxval = 50, group = GRP_REV,
+     tooltip = "Slide 8 runs 10+ per day ACROSS accounts. On one account this is the per-day cap.")
+i_allowRev    = input.bool(false, "Allow reversing an open position", group = GRP_REV,
+     tooltip = "Off (deck behaviour): an opposite signal is ignored while a position is open.")
+
+// -----------------------------------------------------------------------------
+// 4 - Execution mathematics
+// -----------------------------------------------------------------------------
+i_slBase   = input.float(25.0, "Stop loss (points)", minval = 0.25, group = GRP_MATH)
+i_tpBase   = input.float(38.0, "Take profit (points)", minval = 0.25, group = GRP_MATH,
+     tooltip = "25 / 38 is the deck's 1:1.52 hurdle, chosen against a $2,000 drawdown / $3,000 target evaluation.")
+i_volTrig  = input.float(25.0, "Volatility scaling trigger (opening candle range, points)", minval = 0, group = GRP_MATH,
+     tooltip = "Slide 5's exception protocol. If the opening candle's high-low exceeds this, the WHOLE day switches to the scaled parameters below.")
+i_slScale  = input.float(50.0, "Scaled stop loss (points)", minval = 0.25, group = GRP_MATH)
+i_tpScale  = input.float(76.0, "Scaled take profit (points)", minval = 0.25, group = GRP_MATH)
+i_tpMode   = input.string(TP_NEAR, "Reversion target", options = [TP_FIXED, TP_BASE, TP_NEAR], group = GRP_MATH,
+     tooltip = "Slide 10 is the whole argument: live capital holds all the way back to the baseline, an evaluation segments the same bias into fixed extraction chunks. 'Nearer of the two' is the deck's combination -- take the fixed chunk, unless the baseline arrives first. Continuation trades always use the fixed target; they move away from the baseline, not toward it.")
+
+// -----------------------------------------------------------------------------
+// 5 - Bailout & trade management
+// -----------------------------------------------------------------------------
+i_bailMode   = input.string(BAIL_BE, "Continuation bailout", options = [BAIL_OFF, BAIL_BE, BAIL_MKT], group = GRP_MGMT,
+     tooltip = "Slide 7: 'do not hold a stalling continuation trade'. Breakeven keeps the upside if it recovers; market close is the literal reading.")
+i_stallBars  = input.int(3, "Stall: bars without progress", minval = 1, maxval = 50, group = GRP_MGMT)
+i_stallPts   = input.float(5.0, "Stall: minimum progress required (points)", minval = 0, group = GRP_MGMT,
+     tooltip = "If the trade has not moved this far in your favour within the bar count above, it is stalling.")
+i_bailBos    = input.bool(true, "Bail on a break of structure against the position", group = GRP_MGMT)
+i_wickMult   = input.float(2.0, "Bail on opposing wick / body ratio", minval = 0, step = 0.5, group = GRP_MGMT,
+     tooltip = "0 disables. 2.0 = an opposing wick twice the size of the candle body.")
+i_wickMinPts = input.float(8.0, "Minimum opposing wick to count (points)", minval = 0, group = GRP_MGMT)
+i_revBosExit = input.bool(false, "Exit reversion legs on an opposing break of structure", group = GRP_MGMT,
+     tooltip = "Not in the deck -- the deck stops reversion trades at the baseline or at 11:00 only. Off by default.")
+
+// -----------------------------------------------------------------------------
+// 6 - Evaluation guard
+// -----------------------------------------------------------------------------
+i_haltMode  = input.string(HALT_DAY, "Evaluation guard", options = [HALT_OFF, HALT_DAY, HALT_PERM], group = GRP_EVAL,
+     tooltip = "'Halt for the day' re-arms the account every session: the drawdown high-water mark and the profit target reset at each open, so the backtest measures many independent evaluation days. 'Halt permanently' simulates ONE account run from the initial capital -- the curve stops dead at the first breach or at the target, which is what an actual evaluation does.")
+i_trailDD   = input.float(2000.0, "Trailing drawdown ($)", minval = 0, group = GRP_EVAL,
+     tooltip = "Slide 5's standard $2,000. Measured from the equity high-water mark.")
+i_ddUnreal  = input.bool(true, "Trailing drawdown counts unrealised profit", group = GRP_EVAL,
+     tooltip = "Slide 10: trailing drawdowns 'aggressively punish unrealised floating profits'. On = the high-water mark includes open P&L, which is how most firms actually compute it.")
+i_target    = input.float(3000.0, "Profit target ($)", minval = 0, group = GRP_EVAL)
+i_dailyLoss = input.float(0.0, "Daily loss limit ($, 0 = off)", minval = 0, group = GRP_EVAL)
+
+// -----------------------------------------------------------------------------
+// 7 - Position sizing
+// -----------------------------------------------------------------------------
+i_sizeMode = input.string(SIZE_FIX, "Sizing", options = [SIZE_FIX, SIZE_RISK], group = GRP_SIZE)
+i_qtyFixed = input.int(1, "Contracts per entry", minval = 1, group = GRP_SIZE)
+i_riskPct  = input.float(1.0, "Risk per entry (% of equity)", minval = 0.01, step = 0.1, group = GRP_SIZE)
+i_maxQty   = input.int(10, "Maximum contracts per entry", minval = 1, group = GRP_SIZE,
+     tooltip = "Hard cap on the risk-based size. Remember every layer carries the full stop, so N layers risk N times this.")
+
+// -----------------------------------------------------------------------------
+// 8 - News re-anchor protocol
+// -----------------------------------------------------------------------------
+i_useReanchor  = input.bool(false, "Enable the unexpected-news re-anchor", group = GRP_NEWS,
+     tooltip = "Slide 9. Scheduled 8:30 data is 'priced in' and needs no code -- the baseline stays put. This models the OTHER branch: an unscheduled shock voids the pre-news fair price, and a new consolidation zone becomes the baseline. Off by default because it moves the anchor every other rule is measured against.")
+i_shockMult    = input.float(4.0, "Shock: bar range / ATR", minval = 1, step = 0.5, group = GRP_NEWS)
+i_atrLen       = input.int(14, "ATR length", minval = 2, group = GRP_NEWS)
+i_consolBars   = input.int(5, "Consolidation: bars required", minval = 2, maxval = 60, group = GRP_NEWS)
+i_consolMaxPts = input.float(15.0, "Consolidation: maximum zone height (points)", minval = 0.25, group = GRP_NEWS)
+
+// -----------------------------------------------------------------------------
+// 9 - Display
+// -----------------------------------------------------------------------------
+i_showAnchor = input.bool(true,  "Fair price line & dead band", group = GRP_DISP)
+i_showPhases = input.bool(true,  "Shade the phases", group = GRP_DISP)
+i_showStruct = input.bool(false, "Plot confirmed structure", group = GRP_DISP)
+i_showLabels = input.bool(true,  "Label entries", group = GRP_DISP)
+i_showTable  = input.bool(true,  "Dashboard", group = GRP_DISP)
+
+// -----------------------------------------------------------------------------
+// Timeframe guard
+// -----------------------------------------------------------------------------
+float tfMin = timeframe.in_seconds(timeframe.period) / 60.0
+
+if barstate.isfirst
+    if not timeframe.isintraday
+        runtime.error("Fair Price Reversion is an intraday system. Use a 1m or 5m chart.")
+    if tfMin > i_contDeadline
+        runtime.error("Chart timeframe (" + str.tostring(tfMin) + "m) is longer than the continuation window (" + str.tostring(i_contDeadline) + "m), so phase 1 can never resolve. Use a lower timeframe or widen the window.")
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+f_pts(float points) =>
+    points * i_pointSize
+
+f_qty(float slPoints) =>
+    float risked = strategy.equity * i_riskPct / 100.0
+    float perCon = math.max(slPoints * i_pointSize * syminfo.pointvalue, 0.01)
+    float raw    = i_sizeMode == SIZE_RISK ? math.floor(risked / perCon) : i_qtyFixed
+    int(math.max(1.0, math.min(raw, i_maxQty)))
+
+// -----------------------------------------------------------------------------
+// Unconditional series (must run on every bar)
+// -----------------------------------------------------------------------------
+float atrVal = ta.atr(i_atrLen)
+float ph     = ta.pivothigh(high, i_pivLen, i_pivLen)
+float pl     = ta.pivotlow(low,  i_pivLen, i_pivLen)
+
+bool  inSess  = not na(time(timeframe.period, i_sess, i_tz))
+bool  newSess = inSess and not inSess[1]
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+var float  fairPrice   = na
+var int    sessStartMs = na
+var int    sessBars    = 0
+var float  openOp      = na
+var float  openHi      = na
+var float  openLo      = na
+var float  openCl      = na
+var bool   openDone    = false
+
+var float  swHigh      = na
+var float  swLow       = na
+
+var int    entrySeq    = 0
+var int    dayTrades   = 0
+var int    layersOpen  = 0
+var int    posDir      = 0
+var float  lastEntryPx = na
+var bool   contOpen    = false
+var string contId      = ""
+var int    contBar     = na
+var bool   contBailed  = false
+
+var bool   haltedDay   = false
+var bool   haltedPerm  = false
+var float  eqPeak      = na
+var float  dayStartEq  = na
+
+var bool   reanchorWait = false
+var int    consolCount  = 0
+var float  consolHi     = na
+var float  consolLo     = na
+var int    reanchors    = 0
+
+float eqNow = i_ddUnreal ? strategy.equity : strategy.initial_capital + strategy.netprofit
+
+// -----------------------------------------------------------------------------
+// Session open: reset everything the day owns
+// -----------------------------------------------------------------------------
+if newSess
+    sessStartMs  := time
+    sessBars     := 0
+    openOp       := open
+    openHi       := high
+    openLo       := low
+    openCl       := close
+    openDone     := false
+    fairPrice    := na
+    dayTrades    := 0
+    haltedDay    := false
+    dayStartEq   := eqNow
+    reanchorWait := false
+    consolCount  := 0
+    consolHi     := na
+    consolLo     := na
+    if i_haltMode != HALT_PERM
+        eqPeak := eqNow
+    if i_resetStr
+        swHigh := na
+        swLow  := na
+
+// -----------------------------------------------------------------------------
+// Opening candle -> anchor + volatility regime
+// -----------------------------------------------------------------------------
+// openDone is a var that survives the night, so `openDone[1]` on the session's
+// first bar reads YESTERDAY's value. openJustDone is a plain per-bar flag and
+// is the only safe way to fire the continuation exactly once.
+bool openJustDone = false
+
+if inSess
+    sessBars += 1
+    if sessBars <= i_openBars
+        openHi := math.max(nz(openHi, high), high)
+        openLo := math.min(nz(openLo, low),  low)
+        openCl := close
+        if sessBars == i_openBars
+            openDone     := true
+            openJustDone := true
+            fairPrice := switch i_anchor
+                ANCH_MID   => (openHi + openLo) / 2.0
+                ANCH_CLOSE => openCl
+                => openOp
+
+float openRangePts = na(openHi) or na(openLo) ? na : (openHi - openLo) / i_pointSize
+bool  volScaled    = not na(openRangePts) and openRangePts > i_volTrig
+float slPts        = volScaled ? i_slScale : i_slBase
+float tpPts        = volScaled ? i_tpScale : i_tpBase
+
+// -----------------------------------------------------------------------------
+// Structure
+// -----------------------------------------------------------------------------
+if not na(ph)
+    swHigh := ph
+if not na(pl)
+    swLow := pl
+
+// -----------------------------------------------------------------------------
+// News re-anchor protocol (slide 9, unexpected branch)
+// -----------------------------------------------------------------------------
+bool shockBar = false
+if i_useReanchor and inSess and openDone
+    shockBar := not na(atrVal) and (high - low) > i_shockMult * atrVal
+    if shockBar and not reanchorWait
+        reanchorWait := true
+        fairPrice    := na
+        consolCount  := 0
+        consolHi     := na
+        consolLo     := na
+        if strategy.position_size != 0
+            strategy.close_all(comment = "NEWS SHOCK")
+    else if reanchorWait
+        consolHi := math.max(nz(consolHi, high), high)
+        consolLo := math.min(nz(consolLo, low),  low)
+        consolCount += 1
+        if (consolHi - consolLo) > f_pts(i_consolMaxPts)
+            consolCount := 1
+            consolHi    := high
+            consolLo    := low
+        if consolCount >= i_consolBars
+            fairPrice    := (consolHi + consolLo) / 2.0
+            reanchorWait := false
+            reanchors    += 1
+
+bool haveAnchor = not na(fairPrice) and not reanchorWait
+
+// -----------------------------------------------------------------------------
+// Clock: minutes from the open, measured at the BAR CLOSE, because that is
+// when a signal is generated and therefore when the next-bar fill lands.
+// -----------------------------------------------------------------------------
+float elapsed = inSess and not na(sessStartMs) ? (time - sessStartMs) / 60000.0 : na
+float ce      = na(elapsed) ? -1.0 : elapsed + tfMin
+
+bool inCont     = inSess and openDone and ce >= 0 and ce <= i_contDeadline
+bool inRev      = inSess and openDone and ce >  i_contDeadline and ce < i_hardStop
+bool atHardStop = inSess and ce >= i_hardStop
+
+// -----------------------------------------------------------------------------
+// Candle anatomy (slide 6)
+// -----------------------------------------------------------------------------
+float body     = math.abs(close - open)
+float prevBody = math.abs(close[1] - open[1])
+bool  bull     = close > open
+bool  bear     = close < open
+float upWick   = high - math.max(close, open)
+float dnWick   = math.min(close, open) - low
+
+// Diagram 1 -- the A setup: the entry body must exceed the previous body.
+bool aSetup = body > prevBody and body >= f_pts(i_minBody)
+
+// Diagram 2 -- the A+ setup: a body CLOSE through the last confirmed pivot.
+bool bosDown = not na(swLow)  and close < swLow
+bool bosUp   = not na(swHigh) and close > swHigh
+
+// -----------------------------------------------------------------------------
+// Reversion bias: 100% committed toward the baseline, never away from it
+// -----------------------------------------------------------------------------
+float dispPts  = haveAnchor ? (close - fairPrice) / i_pointSize : na
+bool  wantShort = haveAnchor and dispPts >=  i_minDisp
+bool  wantLong  = haveAnchor and dispPts <= -i_minDisp
+
+bool gradeShort = switch i_setup
+    SET_APLUS => aSetup and bosDown
+    => aSetup
+bool gradeLong = switch i_setup
+    SET_APLUS => aSetup and bosUp
+    => aSetup
+
+bool revShortSig = i_useRev and inRev and wantShort and bear and gradeShort
+bool revLongSig  = i_useRev and inRev and wantLong  and bull and gradeLong
+
+// -----------------------------------------------------------------------------
+// Continuation signal (slide 7): the colour of the opening candle
+// -----------------------------------------------------------------------------
+int  contDir = na(openCl) or na(openOp) ? 0 : openCl > openOp ? 1 : openCl < openOp ? -1 : 0
+bool contSig = i_useCont and inCont and openJustDone and contDir != 0
+     and math.abs(openCl - openOp) >= f_pts(i_contMinBody)
+
+// -----------------------------------------------------------------------------
+// Position sync -- reset the day's leg bookkeeping whenever we are flat
+// -----------------------------------------------------------------------------
+if strategy.position_size == 0
+    layersOpen  := 0
+    posDir      := 0
+    contOpen    := false
+    contBailed  := false
+    contId      := ""
+    lastEntryPx := na
+
+// -----------------------------------------------------------------------------
+// Evaluation guard (slide 5 / slide 10)
+// -----------------------------------------------------------------------------
+eqPeak := na(eqPeak) ? eqNow : math.max(eqPeak, eqNow)
+float evalBase = i_haltMode == HALT_PERM ? strategy.initial_capital : nz(dayStartEq, strategy.initial_capital)
+float ddFloor  = eqPeak - i_trailDD
+float targetEq = evalBase + i_target
+float dayPnl   = na(dayStartEq) ? 0.0 : eqNow - dayStartEq
+
+bool ddBreach   = i_trailDD > 0 and eqNow <= ddFloor
+bool targetHit  = i_target  > 0 and eqNow >= targetEq
+bool dayLossHit = i_dailyLoss > 0 and dayPnl <= -i_dailyLoss
+
+if i_haltMode != HALT_OFF and not haltedPerm and not haltedDay
+    if ddBreach or targetHit or dayLossHit
+        if i_haltMode == HALT_PERM
+            haltedPerm := true
+        else
+            haltedDay := true
+        if strategy.position_size != 0
+            strategy.close_all(comment = ddBreach ? "DD BREACH" : targetHit ? "TARGET HIT" : "DAILY LOSS")
+
+// -----------------------------------------------------------------------------
+// Hard stop: 11:00, and anything left over outside the session
+// -----------------------------------------------------------------------------
+if strategy.position_size != 0 and (atHardStop or not inSess)
+    strategy.close_all(comment = "HARD STOP")
+
+// End of phase 1 -- the deck does not hold a continuation trade into the
+// reversion phase, because the two have opposite biases.
+if i_contClose and contOpen and strategy.position_size != 0 and ce > i_contDeadline
+    strategy.close(contId, comment = "PHASE END")
+
+// -----------------------------------------------------------------------------
+// Continuation bailout (slide 7)
+// -----------------------------------------------------------------------------
+if i_bailMode != BAIL_OFF and contOpen and not contBailed and strategy.position_size != 0 and not na(contBar)
+    float cpx      = strategy.position_avg_price
+    int   held     = bar_index - contBar
+    float progress = posDir == 1 ? (close - cpx) / i_pointSize : (cpx - close) / i_pointSize
+    bool  stalling = held >= i_stallBars and progress < i_stallPts
+    bool  bosAgainst = i_bailBos and (posDir == 1 ? bosDown : bosUp)
+    float wickAgainst = posDir == 1 ? upWick : dnWick
+    bool  wickBail = i_wickMult > 0 and wickAgainst >= f_pts(i_wickMinPts)
+         and wickAgainst > i_wickMult * math.max(body, syminfo.mintick)
+    if stalling or bosAgainst or wickBail
+        contBailed := true
+        if i_bailMode == BAIL_MKT
+            strategy.close(contId, comment = "BAILOUT")
+
+// -----------------------------------------------------------------------------
+// Optional: reversion legs exit on an opposing break of structure
+// -----------------------------------------------------------------------------
+if i_revBosExit and not contOpen and strategy.position_size != 0 and posDir != 0
+    if posDir == 1 ? bosDown : bosUp
+        strategy.close_all(comment = "STRUCTURE EXIT")
+
+// -----------------------------------------------------------------------------
+// Entry permission
+// -----------------------------------------------------------------------------
+bool canTrade = barstate.isconfirmed and haveAnchor and not haltedDay and not haltedPerm
+     and not reanchorWait and dayTrades < i_maxTrades and ce >= 0 and ce < i_hardStop
+
+bool tookLong  = false
+bool tookShort = false
+string tookTag = ""
+
+// -----------------------------------------------------------------------------
+// Phase 1 entry
+// -----------------------------------------------------------------------------
+if contSig and canTrade and strategy.position_size == 0
+    entrySeq += 1
+    string cid = "C" + str.tostring(entrySeq)
+    int    cqty = f_qty(slPts)
+    strategy.entry(cid, contDir == 1 ? strategy.long : strategy.short, qty = cqty, comment = "CONT")
+    // Provisional bracket off the signal close so the leg is protected from the
+    // fill. Section "bracket refresh" below re-prices it off the real fill.
+    float cSl = contDir == 1 ? close - f_pts(slPts) : close + f_pts(slPts)
+    float cTp = contDir == 1 ? close + f_pts(tpPts) : close - f_pts(tpPts)
+    strategy.exit(cid + "_X", from_entry = cid, stop = cSl, limit = cTp)
+    contId      := cid
+    contOpen    := true
+    contBar     := bar_index
+    contBailed  := false
+    posDir      := contDir
+    layersOpen  := 1
+    lastEntryPx := close
+    dayTrades   += 1
+    tookLong    := contDir == 1
+    tookShort   := contDir == -1
+    tookTag     := "CONT"
+    if i_showLabels
+        label.new(bar_index, contDir == 1 ? low : high, "CONT",
+             style = contDir == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
+    alert(str.format("FPR CONT {0} {1} @ {2} SL {3} TP {4}",
+         contDir == 1 ? "LONG" : "SHORT", syminfo.ticker,
+         str.tostring(close, format.mintick), str.tostring(cSl, format.mintick),
+         str.tostring(cTp, format.mintick)), alert.freq_once_per_bar_close)
+
+// -----------------------------------------------------------------------------
+// Phase 2 entries (including layering)
+// -----------------------------------------------------------------------------
+int  revDir  = revShortSig ? -1 : revLongSig ? 1 : 0
+bool bosThis = revDir == -1 ? bosDown : revDir == 1 ? bosUp : false
+
+if revDir != 0 and canTrade
+    bool flat     = strategy.position_size == 0
+    bool sameSide = strategy.position_size != 0 and posDir == revDir
+    bool oppSide  = strategy.position_size != 0 and posDir != revDir
+
+    bool progressed = na(lastEntryPx) ? true :
+         revDir == -1 ? (lastEntryPx - close) >= f_pts(i_layerMinPts)
+                      : (close - lastEntryPx) >= f_pts(i_layerMinPts)
+    bool canLayer = sameSide and layersOpen < i_maxLayers and progressed
+         and (not i_layerBos or bosThis)
+
+    // A reversal is handled by strategy.entry itself: an entry in the opposite
+    // direction closes the open legs and opens the new one in the same fill.
+    bool canFlip = oppSide and i_allowRev
+
+    if flat or canLayer or canFlip
+        entrySeq += 1
+        string rid  = "R" + str.tostring(entrySeq)
+        int    rqty = f_qty(slPts)
+        strategy.entry(rid, revDir == 1 ? strategy.long : strategy.short, qty = rqty,
+             comment = bosThis ? "A+" : "A")
+        float rSl    = revDir == 1 ? close - f_pts(slPts) : close + f_pts(slPts)
+        float rTpFix = revDir == 1 ? close + f_pts(tpPts) : close - f_pts(tpPts)
+        float rTp = switch i_tpMode
+            TP_BASE => fairPrice
+            TP_NEAR => revDir == 1 ? math.min(rTpFix, fairPrice) : math.max(rTpFix, fairPrice)
+            => rTpFix
+        if (revDir == 1 and rTp <= close) or (revDir == -1 and rTp >= close)
+            rTp := rTpFix
+        strategy.exit(rid + "_X", from_entry = rid, stop = rSl, limit = rTp)
+        if canFlip
+            contOpen := false
+            contId   := ""
+        posDir      := revDir
+        layersOpen  := canLayer ? layersOpen + 1 : 1
+        lastEntryPx := close
+        dayTrades   += 1
+        tookLong    := revDir == 1
+        tookShort   := revDir == -1
+        tookTag     := bosThis ? "A+" : "A"
+        if i_showLabels
+            label.new(bar_index, revDir == 1 ? low : high, tookTag + (layersOpen > 1 ? " L" + str.tostring(layersOpen) : ""),
+                 style = revDir == 1 ? label.style_label_up : label.style_label_down,
+                 color = bosThis ? color.new(color.teal, 15) : color.new(color.navy, 25),
+                 textcolor = color.white, size = size.tiny)
+        alert(str.format("FPR {0} {1} {2} @ {3} SL {4} TP {5} | fair {6}",
+             tookTag, revDir == 1 ? "LONG" : "SHORT", syminfo.ticker,
+             str.tostring(close, format.mintick), str.tostring(rSl, format.mintick),
+             str.tostring(rTp, format.mintick), str.tostring(fairPrice, format.mintick)),
+             alert.freq_once_per_bar_close)
+
+// -----------------------------------------------------------------------------
+// Bracket refresh
+//
+// The provisional brackets above are priced off the SIGNAL close, but the order
+// fills at the next bar's open. From the first bar after a fill this loop
+// re-prices every live bracket off the trade's ACTUAL entry price, so the
+// backtest measures a true 25pt stop rather than a 25pt-from-signal stop. It
+// also applies the breakeven bailout and the baseline cap on the target.
+// -----------------------------------------------------------------------------
+if strategy.opentrades > 0
+    for i = 0 to strategy.opentrades - 1
+        string eid = strategy.opentrades.entry_id(i)
+        float  epx = strategy.opentrades.entry_price(i)
+        float  esz = strategy.opentrades.size(i)
+        if not na(epx) and esz != 0
+            int   ed     = esz > 0 ? 1 : -1
+            bool  isCont = str.startswith(eid, "C")
+            float xSl    = ed == 1 ? epx - f_pts(slPts) : epx + f_pts(slPts)
+            float xTpFix = ed == 1 ? epx + f_pts(tpPts) : epx - f_pts(tpPts)
+            float xTp    = xTpFix
+            if not isCont and not na(fairPrice)
+                xTp := switch i_tpMode
+                    TP_BASE => fairPrice
+                    TP_NEAR => ed == 1 ? math.min(xTpFix, fairPrice) : math.max(xTpFix, fairPrice)
+                    => xTpFix
+                if (ed == 1 and xTp <= epx) or (ed == -1 and xTp >= epx)
+                    xTp := xTpFix
+            if isCont and contBailed
+                xSl := epx
+            strategy.exit(eid + "_X", from_entry = eid, stop = xSl, limit = xTp)
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+bool  showZone = i_showAnchor and inSess and haveAnchor and ce < i_hardStop
+float pFair    = showZone ? fairPrice : na
+float pUp      = showZone ? fairPrice + f_pts(i_minDisp) : na
+float pDn      = showZone ? fairPrice - f_pts(i_minDisp) : na
+
+plot(pFair, "Fair price (9:30)", color = color.new(#1E4C8A, 0), linewidth = 2, style = plot.style_linebr)
+pu = plot(pUp, "Dead band upper", color = color.new(#1E4C8A, 65), linewidth = 1, style = plot.style_linebr)
+pd = plot(pDn, "Dead band lower", color = color.new(#1E4C8A, 65), linewidth = 1, style = plot.style_linebr)
+fill(pu, pd, color = color.new(#1E4C8A, 92), title = "No-trade dead band")
+
+plot(i_showStruct and not na(swHigh) ? swHigh : na, "Swing high", color = color.new(color.red, 40), style = plot.style_linebr)
+plot(i_showStruct and not na(swLow)  ? swLow  : na, "Swing low",  color = color.new(color.green, 40), style = plot.style_linebr)
+
+bgcolor(i_showPhases and inCont ? color.new(color.orange, 90) : i_showPhases and inRev ? color.new(#1E4C8A, 94) : na, title = "Phase shading")
+
+plotshape(tookLong,  "Long entry",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.teal, 0), size = size.tiny)
+plotshape(tookShort, "Short entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
+plotshape(i_showLabels and shockBar, "News shock", style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// Dashboard
+// -----------------------------------------------------------------------------
+// The deck advertises a fixed 1:1.52. That only holds while the displacement
+// is at least as large as the take profit: under TP_NEAR / TP_BASE the target
+// is capped at the baseline, so a trade entered 25 points from fair price
+// risks 25 to make 25, not 38. This is the single most important number the
+// deck never states, so it gets its own dashboard row.
+float effTp = switch i_tpMode
+    TP_BASE => na(dispPts) ? na : math.abs(dispPts)
+    TP_NEAR => na(dispPts) ? tpPts : math.min(tpPts, math.abs(dispPts))
+    => tpPts
+float effRR = na(effTp) ? na : effTp / slPts
+
+var table dash = table.new(position.top_right, 2, 14, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(dash, 0, r, k, text_color = color.new(color.silver, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_color = vc, text_size = size.tiny, text_halign = text.align_right)
+
+if i_showTable and barstate.islast
+    string phase = haltedPerm ? "HALTED (run over)" : haltedDay ? "HALTED (day)" :
+         reanchorWait ? "AWAITING RE-ANCHOR" : not inSess ? "Outside session" :
+         not openDone ? "Opening candle" : inCont ? "1 - Continuation" :
+         inRev ? "2 - Reversion" : "Closed (past hard stop)"
+    color pc = haltedPerm or haltedDay ? color.red : inRev ? color.aqua : inCont ? color.orange : color.silver
+
+    table.cell(dash, 0, 0, "FAIR PRICE REVERSION", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dash, 1, 0, volScaled ? "SCALED" : "STANDARD", text_color = volScaled ? color.orange : color.silver, text_size = size.tiny, text_halign = text.align_right)
+
+    f_row(1,  "Phase", phase, pc)
+    f_row(2,  "Fair price", haveAnchor ? str.tostring(fairPrice, format.mintick) : "--", color.white)
+    f_row(3,  "Displacement", na(dispPts) ? "--" : str.tostring(dispPts, "#.#") + " pt", math.abs(nz(dispPts)) >= i_minDisp ? color.aqua : color.gray)
+    f_row(4,  "Opening range", na(openRangePts) ? "--" : str.tostring(openRangePts, "#.#") + " pt", color.white)
+    f_row(5,  "SL / TP", str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#") + " pt", color.white)
+    f_row(6,  "R:R nominal", str.tostring(tpPts / slPts, "#.00"), color.white)
+    f_row(7,  "R:R here", na(effRR) ? "--" : str.tostring(effRR, "#.00"), na(effRR) or effRR >= tpPts / slPts ? color.white : color.orange)
+    f_row(8,  "Entries today", str.tostring(dayTrades) + " / " + str.tostring(i_maxTrades), dayTrades >= i_maxTrades ? color.orange : color.white)
+    f_row(9,  "Layers open", str.tostring(layersOpen) + " / " + str.tostring(i_maxLayers), color.white)
+    f_row(10, "Day P&L", str.tostring(dayPnl, "#.00"), dayPnl >= 0 ? color.lime : color.red)
+    f_row(11, "To DD floor", i_trailDD > 0 ? str.tostring(eqNow - ddFloor, "#.00") : "off", eqNow - ddFloor < i_trailDD * 0.25 ? color.red : color.white)
+    f_row(12, "To target", i_target > 0 ? str.tostring(targetEq - eqNow, "#.00") : "off", color.white)
+    f_row(13, "Re-anchors", i_useReanchor ? str.tostring(reanchors) : "off", color.white)
