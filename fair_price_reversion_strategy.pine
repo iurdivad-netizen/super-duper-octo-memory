@@ -77,6 +77,18 @@ const string GRP_DISP = "9 - Display"
 const string ANCH_OPEN  = "9:30 open price"
 const string ANCH_MID   = "Opening candle midpoint"
 const string ANCH_CLOSE = "Opening candle close"
+const string ANCH_NEWS  = "8:30 news bar open"
+const string ANCH_ZONE  = "8:30 post-news consolidation midpoint"
+const string ANCH_AUTO  = "Auto: 8:30 on event days, else 9:30 open"
+
+const string FP_STATIC = "Static anchor (fixed level)"
+const string FP_VWAP   = "Anchored VWAP (moving level)"
+const string FP_BLEND  = "Midpoint of static anchor and VWAP"
+
+const string VA_RTH    = "9:30 RTH open"
+const string VA_NEWS   = "8:30 news bar"
+const string VA_GLOBEX = "Globex open (CME daily boundary)"
+const string VA_AUTO   = "Auto: 8:30 on event days, else 9:30"
 
 const string SET_A     = "A setups (displacement only)"
 const string SET_APLUS = "A+ setups only (displacement + BOS)"
@@ -107,8 +119,26 @@ i_tz   = input.string("America/New_York", "Session timezone", group = GRP_SESS)
 i_openBars = input.int(1, "Opening candle = first N chart bars", minval = 1, maxval = 30, group = GRP_SESS,
      tooltip = "The deck's 'opening candle'. On a 5m chart leave this at 1 (09:30-09:35). On a 1m chart set 5 to reproduce the same 5-minute candle, or leave it at 1 to trigger a minute after the open.")
 
-i_anchor = input.string(ANCH_OPEN, "Fair price =", options = [ANCH_OPEN, ANCH_MID, ANCH_CLOSE], group = GRP_SESS,
-     tooltip = "Slide 11 marks the 9:30 OPEN as the permanent baseline. The other two are alternatives worth measuring, not the deck's rule.")
+i_anchor = input.string(ANCH_OPEN, "Static anchor =", options = [ANCH_OPEN, ANCH_MID, ANCH_CLOSE, ANCH_NEWS, ANCH_ZONE, ANCH_AUTO], group = GRP_SESS,
+     tooltip = "Slide 11 marks the 9:30 OPEN as the permanent baseline; that is the deck. The 8:30 options are a DEPARTURE from it -- slide 9 explicitly says scheduled news is priced in and must NOT move the fair price. The argument for overriding the deck: NQ trades 23 hours, so 9:30 is the cash-equity open, not an auction open, and on data days the genuine repricing happened at 8:30. 'Auto' uses the 8:30 anchor only on days where an 8:30 event is actually detected. If the 8:30 data is unavailable (an RTH-only chart) this silently falls back to the 9:30 open and the dashboard says so.")
+
+i_fpMode = input.string(FP_STATIC, "Fair price mode", options = [FP_STATIC, FP_VWAP, FP_BLEND], group = GRP_SESS,
+     tooltip = "READ THIS BEFORE SWITCHING TO VWAP. A static anchor is a FIXED target: if price runs 60 points away, the target stays 60 points away. VWAP CHASES price -- it rises as price rises, so by the time you enter, your measured displacement and your reward have both been compressed, and the target keeps walking toward you while you hold. That systematically shrinks the R:R the deck's whole arithmetic depends on. The compensation is that VWAP also refuses to report a huge displacement on a trend day, which is where the static anchor gets you run over. It is a real trade-off, not a free upgrade. If what you want from VWAP is regime awareness, use the VWAP filter below and keep the static target.")
+
+i_vwapAnchor = input.string(VA_AUTO, "VWAP anchored at", options = [VA_RTH, VA_NEWS, VA_GLOBEX, VA_AUTO], group = GRP_SESS,
+     tooltip = "The anchor point is most of the answer. A VWAP anchored at 9:30 sits almost exactly on price at 9:35, so it reports near-zero displacement for the first part of the window and no reversion trade can fire. Anchoring at 8:30 carries an hour of post-news volume and is the version that matches the '8:30 is the day's fair price' thesis. Globex-anchored VWAP is dominated by overnight volume and sits far from post-news price on data days.")
+
+i_vwapSrc = input.source(hlc3, "VWAP source", group = GRP_SESS)
+
+i_vwapFilter = input.bool(false, "Require VWAP agreement", group = GRP_SESS,
+     tooltip = "Independent of the fair price mode. Only short when price is ALSO above VWAP, only long when it is ALSO below. This is the highest-value use of VWAP in this system: it keeps the static anchor's fixed target while refusing entries where the volume-weighted average has already followed price -- which is what a trend day looks like from the inside.")
+
+i_vwapSlopeMax = input.float(0.0, "Maximum opposing VWAP slope (points, 0 = off)", minval = 0, group = GRP_SESS,
+     tooltip = "Refuse to fade into a VWAP that is itself trending hard in the direction you are fading. Measured over the lookback below. This is the direct answer to 'reversion is a regime bet': a steeply rising VWAP means the day is repricing, not oscillating.")
+i_vwapSlopeLen = input.int(15, "VWAP slope lookback (bars)", minval = 1, maxval = 200, group = GRP_SESS)
+
+i_tpFreeze = input.bool(true, "Freeze the baseline target at entry", group = GRP_SESS,
+     tooltip = "Only matters when the fair price moves (VWAP or blend). On: each leg's baseline target is the fair price as it stood when that leg was entered, so the limit order does not walk. Off: the target tracks the live fair price, which for a rising VWAP under a short means your target rises to meet you. No effect with a static anchor.")
 
 i_pointSize = input.float(1.0, "Price units per point", minval = 0.0001, step = 0.25, group = GRP_SESS,
      tooltip = "1.0 for NQ/MNQ/ES: one index point is one price unit. Change only for instruments where a 'point' is not 1.00 of price.")
@@ -202,8 +232,18 @@ i_maxQty   = input.int(10, "Maximum contracts per entry", minval = 1, group = GR
      tooltip = "Hard cap on the risk-based size. Remember every layer carries the full stop, so N layers risk N times this.")
 
 // -----------------------------------------------------------------------------
-// 8 - News re-anchor protocol
+// 8 - News protocol: the 8:30 anchor and the shock re-anchor
 // -----------------------------------------------------------------------------
+i_newsSess     = input.session("0830-0930", "Pre-open / 8:30 news window", group = GRP_NEWS,
+     tooltip = "The first bar of this window is the 'news bar'. REQUIRES a chart with extended hours enabled -- on an RTH-only chart no such bar exists and every 8:30 feature silently falls back to the 9:30 anchor.")
+i_newsDetect   = input.bool(true, "Detect 8:30 events automatically", group = GRP_NEWS,
+     tooltip = "There is no economic calendar in Pine. This detects a VOLATILITY EVENT at 8:30, not a red folder listing: it will catch CPI, NFP, PPI and retail sales, it will also fire on an unrelated 8:30 spike, and it will miss a scheduled release the market shrugs off. Treat it as a proxy and check a handful of flagged days by eye before trusting it.")
+i_newsRangeMult = input.float(3.0, "Event: news bar range / ATR", minval = 0, step = 0.5, group = GRP_NEWS,
+     tooltip = "0 disables the range test.")
+i_newsVolMult  = input.float(4.0, "Event: news bar volume / average", minval = 0, step = 0.5, group = GRP_NEWS,
+     tooltip = "0 disables the volume test. Volume is the more reliable of the two on NQ -- a CPI print routinely does 20x the surrounding minute.")
+i_newsVolLen   = input.int(20, "Volume average length", minval = 2, maxval = 200, group = GRP_NEWS)
+
 i_useReanchor  = input.bool(false, "Enable the unexpected-news re-anchor", group = GRP_NEWS,
      tooltip = "Slide 9. Scheduled 8:30 data is 'priced in' and needs no code -- the baseline stays put. This models the OTHER branch: an unscheduled shock voids the pre-news fair price, and a new consolidation zone becomes the baseline. Off by default because it moves the anchor every other rule is measured against.")
 i_shockMult    = input.float(4.0, "Shock: bar range / ATR", minval = 1, step = 0.5, group = GRP_NEWS)
@@ -217,6 +257,7 @@ i_consolMaxPts = input.float(15.0, "Consolidation: maximum zone height (points)"
 i_showAnchor = input.bool(true,  "Fair price line & dead band", group = GRP_DISP)
 i_showPhases = input.bool(true,  "Shade the phases", group = GRP_DISP)
 i_showStruct = input.bool(false, "Plot confirmed structure", group = GRP_DISP)
+i_showVwap   = input.bool(true,  "Plot anchored VWAP", group = GRP_DISP)
 i_showLabels = input.bool(true,  "Label entries", group = GRP_DISP)
 i_showTable  = input.bool(true,  "Dashboard", group = GRP_DISP)
 
@@ -253,10 +294,16 @@ float pl     = ta.pivotlow(low,  i_pivLen, i_pivLen)
 bool  inSess  = not na(time(timeframe.period, i_sess, i_tz))
 bool  newSess = inSess and not inSess[1]
 
+bool  inNews      = not na(time(timeframe.period, i_newsSess, i_tz))
+bool  newsBar     = inNews and not inNews[1]
+bool  globexStart = timeframe.change("D")
+float volAvg      = ta.sma(volume, i_newsVolLen)
+int   dayId       = year(time, i_tz) * 1000 + dayofyear(time, i_tz)
+
 // -----------------------------------------------------------------------------
 // State
 // -----------------------------------------------------------------------------
-var float  fairPrice   = na
+var float  reanchorPx  = na
 var int    sessStartMs = na
 var int    sessBars    = 0
 var float  openOp      = na
@@ -289,6 +336,25 @@ var float  consolHi     = na
 var float  consolLo     = na
 var int    reanchors    = 0
 
+// 8:30 news-bar state. Reset at the news bar, NOT at the RTH open -- 8:30
+// precedes 9:30, so a reset at the session open would wipe it before use.
+var float  newsOpen    = na
+var bool   newsEvent   = false
+var int    newsDayId   = na
+var float  nzHi        = na
+var float  nzLo        = na
+var int    nzCount     = 0
+var float  newsZoneMid = na
+var bool   nzDone      = false
+
+// Anchored VWAP, accumulated by hand so the reset point is explicit.
+var float  cumPV = 0.0
+var float  cumV  = 0.0
+
+// Baseline snapshot per leg, so a moving fair price does not drag a live
+// target around after the trade is on.
+var map<string, float> legFair = map.new<string, float>()
+
 float eqNow = i_ddUnreal ? strategy.equity : strategy.initial_capital + strategy.netprofit
 
 // -----------------------------------------------------------------------------
@@ -302,7 +368,7 @@ if newSess
     openLo       := low
     openCl       := close
     openDone     := false
-    fairPrice    := na
+    reanchorPx   := na
     dayTrades    := 0
     haltedDay    := false
     dayStartEq   := eqNow
@@ -310,6 +376,7 @@ if newSess
     consolCount  := 0
     consolHi     := na
     consolLo     := na
+    legFair.clear()
     if i_haltMode != HALT_PERM
         eqPeak := eqNow
     if i_resetStr
@@ -333,10 +400,6 @@ if inSess
         if sessBars == i_openBars
             openDone     := true
             openJustDone := true
-            fairPrice := switch i_anchor
-                ANCH_MID   => (openHi + openLo) / 2.0
-                ANCH_CLOSE => openCl
-                => openOp
 
 float openRangePts = na(openHi) or na(openLo) ? na : (openHi - openLo) / i_pointSize
 bool  volScaled    = not na(openRangePts) and openRangePts > i_volTrig
@@ -352,6 +415,90 @@ if not na(pl)
     swLow := pl
 
 // -----------------------------------------------------------------------------
+// The 8:30 news bar
+//
+// The deck anchors on 9:30 and slide 9 insists scheduled news must NOT move
+// that anchor. The counter-argument is that NQ trades 23 hours a day, so 9:30
+// is when cash equities open, not when the futures auction opens -- and on a
+// CPI or NFP day the genuine repricing happened an hour earlier, at 8:30, with
+// the largest volume print of the session. By 9:30 the market has had an hour
+// to find the new equilibrium, which would make the 9:30 print on exactly the
+// biggest days the LEAST unfair price of the day, not the most.
+//
+// Both readings are testable. Neither is assumed: the deck's 9:30 anchor stays
+// the default and the 8:30 anchor is opt-in.
+// -----------------------------------------------------------------------------
+if newsBar
+    newsOpen    := open
+    newsDayId   := dayId
+    nzHi        := na
+    nzLo        := na
+    nzCount     := 0
+    newsZoneMid := na
+    nzDone      := false
+    bool rangeHit = i_newsRangeMult > 0 and not na(atrVal) and (high - low) > i_newsRangeMult * atrVal
+    bool volHit   = i_newsVolMult > 0 and not na(volAvg) and volAvg > 0 and volume > i_newsVolMult * volAvg
+    newsEvent   := i_newsDetect and (rangeHit or volHit)
+
+// Post-news consolidation: the first zone of i_consolBars bars no taller than
+// i_consolMaxPts. This is slide 9's own mechanic for finding a new fair price,
+// applied to the scheduled release rather than only to the unscheduled shock.
+if inNews and not newsBar and not nzDone and not na(newsDayId) and newsDayId == dayId
+    nzHi := math.max(nz(nzHi, high), high)
+    nzLo := math.min(nz(nzLo, low),  low)
+    nzCount += 1
+    if (nzHi - nzLo) > f_pts(i_consolMaxPts)
+        nzCount := 1
+        nzHi    := high
+        nzLo    := low
+    if nzCount >= i_consolBars
+        newsZoneMid := (nzHi + nzLo) / 2.0
+        nzDone      := true
+
+// Stale-day guard: on a holiday or a half day with no 8:30 bar, yesterday's
+// news state must not be read as today's.
+bool  newsFresh = not na(newsDayId) and newsDayId == dayId
+float newsPx    = newsFresh ? newsOpen    : na
+float newsZone  = newsFresh ? newsZoneMid : na
+bool  eventDay  = newsFresh and newsEvent
+
+// -----------------------------------------------------------------------------
+// Static anchor
+// -----------------------------------------------------------------------------
+float a930op  = openDone ? openOp : na
+float a930mid = openDone ? (openHi + openLo) / 2.0 : na
+float a930cl  = openDone ? openCl : na
+
+float anchorRaw = switch i_anchor
+    ANCH_MID   => a930mid
+    ANCH_CLOSE => a930cl
+    ANCH_NEWS  => newsPx
+    ANCH_ZONE  => newsZone
+    ANCH_AUTO  => eventDay ? newsPx : a930op
+    => a930op
+
+// A missing 8:30 anchor (RTH-only chart, no zone formed, holiday) falls back to
+// the deck's 9:30 open rather than disabling the day silently.
+bool  anchorFellBack = na(anchorRaw) and not na(a930op)
+float staticAnchor   = na(anchorRaw) ? a930op : anchorRaw
+
+// -----------------------------------------------------------------------------
+// Anchored VWAP
+// -----------------------------------------------------------------------------
+bool useNewsVwap = i_vwapAnchor == VA_NEWS or (i_vwapAnchor == VA_AUTO and eventDay)
+bool vwapReset   = i_vwapAnchor == VA_GLOBEX ? globexStart : useNewsVwap ? newsBar : newSess
+
+if vwapReset
+    cumPV := 0.0
+    cumV  := 0.0
+float vBar = nz(volume, 0.0)
+cumPV += i_vwapSrc * vBar
+cumV  += vBar
+float vwapNow = cumV > 0 ? cumPV / cumV : na
+
+float vwapSlope = na(vwapNow) or na(vwapNow[i_vwapSlopeLen]) ? na : (vwapNow - vwapNow[i_vwapSlopeLen]) / i_pointSize
+
+// -----------------------------------------------------------------------------
 // News re-anchor protocol (slide 9, unexpected branch)
 // -----------------------------------------------------------------------------
 bool shockBar = false
@@ -359,7 +506,7 @@ if i_useReanchor and inSess and openDone
     shockBar := not na(atrVal) and (high - low) > i_shockMult * atrVal
     if shockBar and not reanchorWait
         reanchorWait := true
-        fairPrice    := na
+        reanchorPx   := na
         consolCount  := 0
         consolHi     := na
         consolLo     := na
@@ -374,9 +521,24 @@ if i_useReanchor and inSess and openDone
             consolHi    := high
             consolLo    := low
         if consolCount >= i_consolBars
-            fairPrice    := (consolHi + consolLo) / 2.0
+            reanchorPx   := (consolHi + consolLo) / 2.0
             reanchorWait := false
             reanchors    += 1
+
+// -----------------------------------------------------------------------------
+// Fair price
+//
+// A shock re-anchor, once it resolves, overrides everything for the rest of the
+// day. Otherwise the fair price is the static anchor, the VWAP, or their
+// midpoint. Note what changes with VWAP: fairPrice stops being a level fixed at
+// 9:30 and becomes a series that moves every bar, which is why entry brackets
+// snapshot it (i_tpFreeze) instead of tracking it.
+// -----------------------------------------------------------------------------
+float fpDynamic = switch i_fpMode
+    FP_VWAP  => vwapNow
+    FP_BLEND => na(vwapNow) ? staticAnchor : na(staticAnchor) ? vwapNow : (staticAnchor + vwapNow) / 2.0
+    => staticAnchor
+float fairPrice = not na(reanchorPx) ? reanchorPx : fpDynamic
 
 bool haveAnchor = not na(fairPrice) and not reanchorWait
 
@@ -422,8 +584,18 @@ bool gradeLong = switch i_setup
     SET_APLUS => aSetup and bosUp
     => aSetup
 
-bool revShortSig = i_useRev and inRev and wantShort and bear and gradeShort
-bool revLongSig  = i_useRev and inRev and wantLong  and bull and gradeLong
+// VWAP used as a regime gate rather than as a target. Fading price back to a
+// static level is a bet that the day is balanced; price sitting the wrong side
+// of VWAP, or a VWAP trending hard into the fade, is what a repricing day looks
+// like from the inside. Both tests are off by default.
+bool vwapKnown  = not na(vwapNow)
+bool sideOkShort = not i_vwapFilter or (vwapKnown and close > vwapNow)
+bool sideOkLong  = not i_vwapFilter or (vwapKnown and close < vwapNow)
+bool slopeOkShort = i_vwapSlopeMax <= 0 or na(vwapSlope) or vwapSlope <=  i_vwapSlopeMax
+bool slopeOkLong  = i_vwapSlopeMax <= 0 or na(vwapSlope) or vwapSlope >= -i_vwapSlopeMax
+
+bool revShortSig = i_useRev and inRev and wantShort and bear and gradeShort and sideOkShort and slopeOkShort
+bool revLongSig  = i_useRev and inRev and wantLong  and bull and gradeLong  and sideOkLong  and slopeOkLong
 
 // -----------------------------------------------------------------------------
 // Continuation signal (slide 7): the colour of the opening candle
@@ -523,6 +695,7 @@ if contSig and canTrade and strategy.position_size == 0
     float cSl = contDir == 1 ? close - f_pts(slPts) : close + f_pts(slPts)
     float cTp = contDir == 1 ? close + f_pts(tpPts) : close - f_pts(tpPts)
     strategy.exit(cid + "_X", from_entry = cid, stop = cSl, limit = cTp)
+    legFair.put(cid, fairPrice)
     contId      := cid
     contOpen    := true
     contBar     := bar_index
@@ -579,6 +752,7 @@ if revDir != 0 and canTrade
         if (revDir == 1 and rTp <= close) or (revDir == -1 and rTp >= close)
             rTp := rTpFix
         strategy.exit(rid + "_X", from_entry = rid, stop = rSl, limit = rTp)
+        legFair.put(rid, fairPrice)
         if canFlip
             contOpen := false
             contId   := ""
@@ -620,10 +794,13 @@ if strategy.opentrades > 0
             float xSl    = ed == 1 ? epx - f_pts(slPts) : epx + f_pts(slPts)
             float xTpFix = ed == 1 ? epx + f_pts(tpPts) : epx - f_pts(tpPts)
             float xTp    = xTpFix
-            if not isCont and not na(fairPrice)
+            // The fixed component always comes from the ACTUAL fill; only the
+            // baseline component is frozen, and only when asked for.
+            float legFp  = i_tpFreeze and legFair.contains(eid) ? legFair.get(eid) : fairPrice
+            if not isCont and not na(legFp)
                 xTp := switch i_tpMode
-                    TP_BASE => fairPrice
-                    TP_NEAR => ed == 1 ? math.min(xTpFix, fairPrice) : math.max(xTpFix, fairPrice)
+                    TP_BASE => legFp
+                    TP_NEAR => ed == 1 ? math.min(xTpFix, legFp) : math.max(xTpFix, legFp)
                     => xTpFix
                 if (ed == 1 and xTp <= epx) or (ed == -1 and xTp >= epx)
                     xTp := xTpFix
@@ -643,6 +820,8 @@ plot(pFair, "Fair price (9:30)", color = color.new(#1E4C8A, 0), linewidth = 2, s
 pu = plot(pUp, "Dead band upper", color = color.new(#1E4C8A, 65), linewidth = 1, style = plot.style_linebr)
 pd = plot(pDn, "Dead band lower", color = color.new(#1E4C8A, 65), linewidth = 1, style = plot.style_linebr)
 fill(pu, pd, color = color.new(#1E4C8A, 92), title = "No-trade dead band")
+
+plot(i_showVwap and inSess and not na(vwapNow) ? vwapNow : na, "Anchored VWAP", color = color.new(#B8860B, 0), linewidth = 2, style = plot.style_linebr)
 
 plot(i_showStruct and not na(swHigh) ? swHigh : na, "Swing high", color = color.new(color.red, 40), style = plot.style_linebr)
 plot(i_showStruct and not na(swLow)  ? swLow  : na, "Swing low",  color = color.new(color.green, 40), style = plot.style_linebr)
@@ -667,7 +846,7 @@ float effTp = switch i_tpMode
     => tpPts
 float effRR = na(effTp) ? na : effTp / slPts
 
-var table dash = table.new(position.top_right, 2, 14, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
+var table dash = table.new(position.top_right, 2, 17, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
 
 f_row(int r, string k, string v, color vc) =>
     table.cell(dash, 0, r, k, text_color = color.new(color.silver, 0), text_size = size.tiny, text_halign = text.align_left)
@@ -680,19 +859,29 @@ if i_showTable and barstate.islast
          inRev ? "2 - Reversion" : "Closed (past hard stop)"
     color pc = haltedPerm or haltedDay ? color.red : inRev ? color.aqua : inCont ? color.orange : color.silver
 
+    string anchorLabel = anchorFellBack ? "9:30 open (8:30 n/a)" :
+         i_anchor == ANCH_AUTO ? (eventDay ? "8:30 news bar (auto)" : "9:30 open (auto, no event)") : i_anchor
+    string fpLabel = i_fpMode == FP_STATIC ? anchorLabel :
+         i_fpMode == FP_VWAP ? ("VWAP @ " + (i_vwapAnchor == VA_AUTO ? (eventDay ? "8:30" : "9:30") : i_vwapAnchor)) :
+         ("blend: " + anchorLabel + " + VWAP")
+    string slopeTxt = na(vwapSlope) ? "" : "  (" + (vwapSlope >= 0 ? "+" : "") + str.tostring(vwapSlope, "#.#") + ")"
+
     table.cell(dash, 0, 0, "FAIR PRICE REVERSION", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
     table.cell(dash, 1, 0, volScaled ? "SCALED" : "STANDARD", text_color = volScaled ? color.orange : color.silver, text_size = size.tiny, text_halign = text.align_right)
 
     f_row(1,  "Phase", phase, pc)
     f_row(2,  "Fair price", haveAnchor ? str.tostring(fairPrice, format.mintick) : "--", color.white)
-    f_row(3,  "Displacement", na(dispPts) ? "--" : str.tostring(dispPts, "#.#") + " pt", math.abs(nz(dispPts)) >= i_minDisp ? color.aqua : color.gray)
-    f_row(4,  "Opening range", na(openRangePts) ? "--" : str.tostring(openRangePts, "#.#") + " pt", color.white)
-    f_row(5,  "SL / TP", str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#") + " pt", color.white)
-    f_row(6,  "R:R nominal", str.tostring(tpPts / slPts, "#.00"), color.white)
-    f_row(7,  "R:R here", na(effRR) ? "--" : str.tostring(effRR, "#.00"), na(effRR) or effRR >= tpPts / slPts ? color.white : color.orange)
-    f_row(8,  "Entries today", str.tostring(dayTrades) + " / " + str.tostring(i_maxTrades), dayTrades >= i_maxTrades ? color.orange : color.white)
-    f_row(9,  "Layers open", str.tostring(layersOpen) + " / " + str.tostring(i_maxLayers), color.white)
-    f_row(10, "Day P&L", str.tostring(dayPnl, "#.00"), dayPnl >= 0 ? color.lime : color.red)
-    f_row(11, "To DD floor", i_trailDD > 0 ? str.tostring(eqNow - ddFloor, "#.00") : "off", eqNow - ddFloor < i_trailDD * 0.25 ? color.red : color.white)
-    f_row(12, "To target", i_target > 0 ? str.tostring(targetEq - eqNow, "#.00") : "off", color.white)
-    f_row(13, "Re-anchors", i_useReanchor ? str.tostring(reanchors) : "off", color.white)
+    f_row(3,  "Anchor", fpLabel, anchorFellBack ? color.orange : color.silver)
+    f_row(4,  "8:30 event", not newsFresh ? "no 8:30 bar" : eventDay ? "YES" : "no", not newsFresh ? color.orange : eventDay ? color.aqua : color.gray)
+    f_row(5,  "VWAP", na(vwapNow) ? "--" : str.tostring(vwapNow, format.mintick) + slopeTxt, color.white)
+    f_row(6,  "Displacement", na(dispPts) ? "--" : str.tostring(dispPts, "#.#") + " pt", math.abs(nz(dispPts)) >= i_minDisp ? color.aqua : color.gray)
+    f_row(7,  "Opening range", na(openRangePts) ? "--" : str.tostring(openRangePts, "#.#") + " pt", color.white)
+    f_row(8,  "SL / TP", str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#") + " pt", color.white)
+    f_row(9,  "R:R nominal", str.tostring(tpPts / slPts, "#.00"), color.white)
+    f_row(10, "R:R here", na(effRR) ? "--" : str.tostring(effRR, "#.00"), na(effRR) or effRR >= tpPts / slPts ? color.white : color.orange)
+    f_row(11, "Entries today", str.tostring(dayTrades) + " / " + str.tostring(i_maxTrades), dayTrades >= i_maxTrades ? color.orange : color.white)
+    f_row(12, "Layers open", str.tostring(layersOpen) + " / " + str.tostring(i_maxLayers), color.white)
+    f_row(13, "Day P&L", str.tostring(dayPnl, "#.00"), dayPnl >= 0 ? color.lime : color.red)
+    f_row(14, "To DD floor", i_trailDD > 0 ? str.tostring(eqNow - ddFloor, "#.00") : "off", eqNow - ddFloor < i_trailDD * 0.25 ? color.red : color.white)
+    f_row(15, "To target", i_target > 0 ? str.tostring(targetEq - eqNow, "#.00") : "off", color.white)
+    f_row(16, "Re-anchors", i_useReanchor ? str.tostring(reanchors) : "off", color.white)

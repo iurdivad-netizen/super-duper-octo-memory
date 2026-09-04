@@ -27,7 +27,7 @@ continuation trade") and a news protocol. Slides 1, 2 and 10 are the pitch.
 
 | Deck rule | Implementation |
 |-----------|----------------|
-| 9:30 fair price anchor | `fairPrice`, set from the first session bar's open. Configurable to the opening candle's midpoint or close for testing. |
+| 9:30 fair price anchor | `fairPrice`, from the first session bar's open. Also selectable: the opening candle's midpoint or close, the 8:30 news bar, the post-news consolidation midpoint, or an anchored VWAP. See Part 3b — the 8:30 and VWAP options depart from the deck and are off by default. |
 | "Opening candle" | First `i_openBars` chart bars of the session. On 5m leave at 1; on 1m set 5 to reproduce the same 09:30–09:35 candle. |
 | Volatility exception protocol | `openRangePts > i_volTrig` → the **whole day** switches to 50/76. Day-level, not trade-level, exactly as slide 5 describes. |
 | Phase 1 continuation | Fires once, on the bar where the opening candle completes, in that candle's direction. |
@@ -118,6 +118,119 @@ Measure it before sizing anything.
 
 ---
 
+## Part 3b — The anchor question: 8:30 and VWAP
+
+Two departures from the deck, both implemented as options, both defaulted OFF so
+the deck's own configuration remains the reference run.
+
+### The 8:30 anchor
+
+**The claim:** on red-folder days the 8:30 release, not the 9:30 open, sets the
+day's fair price.
+
+**This directly contradicts the deck.** Slide 9 is explicit: expected news is
+"already forecasted", it is "priced in", and the action is *do NOT change the
+Fair Price — target the original 9:30 baseline*. Anyone enabling the 8:30 anchor
+should know they are overruling the source document, not implementing it.
+
+**The case for overruling it is strong.** The deck justifies 9:30 as "the first
+major intraday reference point for a fair auction". For a contract that trades 23
+hours a day that is not quite true: 9:30 is when *cash equities* open, not when
+the futures auction opens. On a CPI or NFP day the genuine repricing — the
+largest volume print of the session by a wide margin — happens at 8:30. By 9:30
+the market has had a full hour to find the new equilibrium. Which would mean
+that on precisely the highest-volatility days, the 9:30 print is the *least*
+unfair price available, not the most, and the deck's premise is weakest exactly
+where its parameters get scaled up.
+
+There is also an internal-consistency argument. Slide 9's *unexpected* branch
+already says to discard the old anchor, wait for a new consolidation zone, and
+adopt that. The market does not know whether a shock was on the calendar. What
+determines whether an anchor is still valid is whether a new equilibrium formed,
+not whether the event was forecast. `ANCH_ZONE` applies that same mechanic to the
+scheduled release, and reuses the existing `i_consolBars` / `i_consolMaxPts`.
+
+**Implementation.** `ANCH_NEWS` (the 8:30 bar's open), `ANCH_ZONE` (midpoint of
+the first post-8:30 consolidation zone), and `ANCH_AUTO` (8:30 on detected event
+days, 9:30 otherwise). The phase clock is untouched — it still runs from the RTH
+open, so only the anchor changes and runs stay comparable.
+
+**Event detection is a proxy and will not be perfect.** There is no economic
+calendar in Pine, and `request.economic()` returns data series, not release
+times. The detector fires on the 8:30 bar's range relative to ATR, or its volume
+relative to a rolling average — volume being the more reliable on NQ, where a CPI
+minute routinely trades 20x its neighbours. It will catch CPI, NFP, PPI and
+retail sales. It will also fire on an unrelated 8:30 spike, and miss a scheduled
+release the market shrugs off. Check a handful of flagged days by eye.
+
+**It needs extended-hours data.** On an RTH-only chart no 8:30 bar exists. Rather
+than fail silently the anchor falls back to the 9:30 open, `anchorFellBack` goes
+true, and the dashboard's Anchor row turns orange and says "8:30 n/a".
+
+### VWAP as the fair price
+
+**As a replacement target, this is a downgrade, and the reason is mechanical.**
+
+A static anchor is a *fixed* level. If price runs 60 points above the 9:30 open,
+the displacement reads 60 and the target sits 60 points away. **VWAP chases
+price.** After thirty minutes of a rising market, VWAP has followed price up and
+sits perhaps 25 points below it — so the same move now reads as 25 points of
+displacement, and under `TP_NEAR` your target is capped 25 points away instead of
+38. Worse, VWAP keeps rising while you hold, so the target walks toward you and
+your realised reward shrinks further. This is the *same* R:R erosion documented
+in Part 3, item 1, with an extra term that compounds over the holding period.
+
+**The compensating argument is real, though.** That 60-point static reading on a
+trend day is not an opportunity, it is the trap — the static anchor reports its
+largest displacement precisely when reversion is least likely. VWAP refuses to
+report a big number in that situation, because it has followed the repricing.
+So VWAP trades away upside on balanced days to avoid catastrophic entries on
+trend days. That is a genuine trade-off, not a free upgrade, which is why it is
+an option to measure rather than a new default.
+
+**The anchor point is most of the answer.** A VWAP anchored at 9:30 sits almost
+exactly on price at 9:35 — it reports near-zero displacement for the first part
+of the window and no reversion trade can fire at all. Anchoring at 8:30 carries
+an hour of post-news volume and is the version that actually matches the "8:30
+is the day's fair price" thesis. Globex-anchored VWAP is dominated by overnight
+volume and sits far from post-news price on data days. `VA_AUTO` anchors at 8:30
+on detected event days and 9:30 otherwise.
+
+**The moving-target problem is handled explicitly.** `i_tpFreeze` (default on)
+snapshots the fair price per leg at entry, so a leg's baseline target is fixed
+even though the fair price keeps moving. The fixed-points component still comes
+from the actual fill. With a static anchor this changes nothing.
+
+### The recommendation
+
+**Use VWAP as a filter, not as a target.** `i_vwapFilter` requires price to be on
+the correct side of VWAP before a reversion entry — short only when price is
+above *both* the static anchor and VWAP. This keeps the fixed target the deck's
+arithmetic depends on, and spends VWAP on the thing it is genuinely good at:
+telling you whether the day is oscillating or repricing. `i_vwapSlopeMax` goes
+further and refuses to fade into a VWAP that is itself trending hard in the
+direction of the fade. Both are off by default.
+
+This is the direct answer to Part 3, item 3 ("reversion is a regime bet"). The
+static anchor gives you the target; VWAP tells you whether the bet is on.
+
+### What to measure
+
+1. Baseline: deck default (9:30 open, static, no filter).
+2. `ANCH_AUTO` alone. Split results by the `eventDay` flag — if the 8:30 anchor
+   helps, the improvement must be concentrated in flagged days. If it is spread
+   evenly, the detector is firing on noise and you are just anchoring differently.
+3. `i_vwapFilter` alone, static anchor. Expect fewer trades; the question is
+   whether win rate rises by more than trade count falls.
+4. `FP_VWAP` alone. Expect the displacement distribution to compress and average
+   R:R to drop. If net profit still improves, the trend-day protection is worth
+   more than the reward given up — that is the whole test, and the dashboard's
+   "R:R here" row is where you watch the cost.
+5. Only then combine. Four options tested together produce a result you cannot
+   attribute.
+
+---
+
 ## Part 4 — How to test it
 
 1. **1m NQ1! continuous, RTH only**, at least two years, `i_openBars = 5` so the
@@ -156,3 +269,9 @@ are optimistic for a 10-trade-a-day system; raise them and see what survives.
 - **One direction at a time.** All open legs share a direction; an opposite
   signal is ignored unless `i_allowRev` is on.
 - **The multi-account layer is out of scope**, as above.
+- **The 8:30 features need extended-hours data.** On an RTH-only chart they fall
+  back to the 9:30 anchor and say so on the dashboard, but they do not work.
+- **Event detection finds volatility, not a calendar.** See Part 3b.
+- **VWAP needs volume.** On a symbol with no volume series, `vwapNow` is `na`,
+  the VWAP filters pass everything, and `FP_VWAP` leaves the anchor undefined so
+  no trade fires. Check the dashboard's VWAP row before assuming a config ran.
