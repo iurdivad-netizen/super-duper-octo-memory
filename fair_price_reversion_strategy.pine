@@ -320,6 +320,13 @@ if barstate.isfirst
 f_pts(float points) =>
     points * i_pointSize
 
+f_alertMsg(string tag, int dir, float px, float sl, float tp, float fair) =>
+    "FPR " + tag + " " + (dir == 1 ? "LONG" : "SHORT") + " " + syminfo.ticker +
+         " @ "  + str.tostring(px,   format.mintick) +
+         " SL " + str.tostring(sl,   format.mintick) +
+         " TP " + str.tostring(tp,   format.mintick) +
+         " | fair " + str.tostring(fair, format.mintick)
+
 f_qty(float slPoints) =>
     float risked = strategy.equity * i_riskPct / 100.0
     float perCon = math.max(slPoints * i_pointSize * syminfo.pointvalue, 0.01)
@@ -340,7 +347,7 @@ bool  inNews      = not na(time(timeframe.period, i_newsSess, i_tz))
 bool  newsBar     = inNews and not inNews[1]
 bool  globexStart = timeframe.change("D")
 float volAvg      = ta.sma(volume, i_newsVolLen)
-int   dayId       = year(time, i_tz) * 1000 + dayofyear(time, i_tz)
+int   dayId       = year(time, i_tz) * 10000 + month(time, i_tz) * 100 + dayofmonth(time, i_tz)
 
 // -----------------------------------------------------------------------------
 // State
@@ -850,10 +857,7 @@ if contSig and canTrade and strategy.position_size == 0
         label.new(bar_index, contDir == 1 ? low : high, "CONT",
              style = contDir == 1 ? label.style_label_up : label.style_label_down,
              color = color.new(color.gray, 20), textcolor = color.white, size = size.tiny)
-    alert(str.format("FPR CONT {0} {1} @ {2} SL {3} TP {4}",
-         contDir == 1 ? "LONG" : "SHORT", syminfo.ticker,
-         str.tostring(close, format.mintick), str.tostring(cSl, format.mintick),
-         str.tostring(cTp, format.mintick)), alert.freq_once_per_bar_close)
+    alert(f_alertMsg("CONT", contDir, close, cSl, cTp, fairPrice), alert.freq_once_per_bar_close)
 
 // -----------------------------------------------------------------------------
 // Phase 2 entries (including layering)
@@ -907,11 +911,7 @@ if revDir != 0 and canTrade
                  style = revDir == 1 ? label.style_label_up : label.style_label_down,
                  color = bosThis ? color.new(color.teal, 15) : color.new(color.navy, 25),
                  textcolor = color.white, size = size.tiny)
-        alert(str.format("FPR {0} {1} {2} @ {3} SL {4} TP {5} | fair {6}",
-             tookTag, revDir == 1 ? "LONG" : "SHORT", syminfo.ticker,
-             str.tostring(close, format.mintick), str.tostring(rSl, format.mintick),
-             str.tostring(rTp, format.mintick), str.tostring(fairPrice, format.mintick)),
-             alert.freq_once_per_bar_close)
+        alert(f_alertMsg(tookTag, revDir, close, rSl, rTp, fairPrice), alert.freq_once_per_bar_close)
 
 // -----------------------------------------------------------------------------
 // Bracket refresh
