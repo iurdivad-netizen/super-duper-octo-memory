@@ -214,20 +214,103 @@ direction of the fade. Both are off by default.
 This is the direct answer to Part 3, item 3 ("reversion is a regime bet"). The
 static anchor gives you the target; VWAP tells you whether the bet is on.
 
+### The 8:30 detector's baseline
+
+The ATR check on the 8:30 candle was there from the start, but its baseline was
+wrong in a way that biased it toward false positives, so it has been rebuilt.
+
+**The bug in the obvious approach.** A rolling `ta.atr(14)` on the chart
+timeframe asks "is this bar unusual *for the last fourteen bars*". At 8:30 those
+fourteen bars are 8:16-8:30 — and the minutes immediately before a scheduled
+release are anomalously **quiet**, because everyone stands aside. The baseline
+shrinks exactly when you are about to measure against it, so the ratio inflates,
+and the test fires on ordinary mornings that merely followed a dead pre-market.
+
+**The fix: a same-bar-of-day baseline.** The question you actually want answered
+is "is this unusual *for an 8:30 window*". The detector now keeps a rolling
+history of the last `i_newsBaseDays` (default 20) 8:30 windows and compares
+today against their **median**. Median rather than mean so that one CPI print
+cannot drag the baseline up and hide the next one. Today's reading is pushed to
+the history *after* the test, so a release is never part of its own baseline.
+Until five days are banked it falls back to the ATR test and the dashboard says
+`[ATR (warmup)]` so you can see which test produced a flag.
+
+**Measured over a clock window, not one bar.** Detection now runs over a fixed
+`i_newsWinMin` (default 5 minutes) from 8:30, so a 1m and a 5m chart classify the
+same day the same way. A CPI reaction is not finished after sixty seconds.
+
+**Scaling is not linear.** Under the ATR fallback the range baseline is scaled by
+`sqrt(windowBars)`, because volatility scales with the square root of time.
+Volume is scaled linearly, because it does. Scaling both the same way would make
+one of the two tests wrong by construction.
+
+**One consequence worth knowing.** Because the verdict now arrives at 8:35 rather
+than 8:30, the `VA_AUTO` VWAP anchors at the window close instead of at 8:30 —
+you cannot anchor on a fact you do not have yet. That is arguably the better
+anchor anyway: it measures the post-release auction and leaves the spike bar out
+of the average. `VA_NEWS` still anchors at 8:30 exactly if you want the spike in.
+
+### The opening range / trend-day filter
+
+This is the most direct answer available to Part 3 item 3, and probably the
+single most valuable addition to the system. The static anchor reports its
+**largest** displacement on trend days — the days where reversion is least likely
+— so the deck's own signal is loudest precisely where it is most wrong. Something
+has to say "not today", and a day that breaks its opening range and holds outside
+it is the textbook definition of the day you must not fade.
+
+**Scope: reversion entries only.** The phase-1 continuation trades *with* the
+opening flow; a trend-day filter has no business blocking it. It also fires at
+9:35, before any sane opening range has formed.
+
+**The range.** First `i_orMin` minutes from the RTH open, default 15. The classic
+30-minute initial balance ends at 10:00 and costs a third of a 90-minute session
+before the filter can say anything. Measured on bar closes, on the same clock as
+the rest of the strategy, so 1m and 5m charts bracket the same minutes.
+
+**The rule: block counter-trend, not everything.** `OR_CT` is the default and the
+one to start with. After a confirmed upside break it blocks reversion **shorts**
+but still allows longs — a long back up toward the anchor from below runs *with*
+the day, not against it. The filter is naturally directional, which is why it
+costs far fewer trades than a blanket day-kill. `OR_ALL` kills the day outright;
+`OR_WIDTH` skips the break logic entirely and applies only the width cap.
+
+**A break needs `i_orHoldBars` consecutive closes outside** (default 2). One close
+outside is a probe; consecutive closes are what separate a break from a wick
+through the edge.
+
+**The classification clears by default.** If price closes back inside the range,
+`orDir` resets — unless `i_orSticky` is on. This is deliberate: a failed breakout
+is the *best* reversion setup on the board, and a sticky flag would throw away
+the highest-quality trade of the day in the name of avoiding trend days.
+
+**`i_orMaxPts` is a separate, blunter test** and ships disabled. Measure your
+instrument's opening-range distribution before picking a number; an arbitrary cap
+here is curve fitting with extra steps.
+
+**Everything is off by default**, including this. The deck's own configuration
+stays the reference run.
+
 ### What to measure
 
 1. Baseline: deck default (9:30 open, static, no filter).
 2. `ANCH_AUTO` alone. Split results by the `eventDay` flag — if the 8:30 anchor
    helps, the improvement must be concentrated in flagged days. If it is spread
    evenly, the detector is firing on noise and you are just anchoring differently.
-3. `i_vwapFilter` alone, static anchor. Expect fewer trades; the question is
-   whether win rate rises by more than trade count falls.
-4. `FP_VWAP` alone. Expect the displacement distribution to compress and average
+3. **`i_orUse` alone**, mode `OR_CT`. This is the one I would test first of the
+   four — it targets the failure mode the deck is most exposed to, and it is the
+   cheapest in trades given the counter-trend-only rule. Then vary `i_orMin`
+   (15 vs 30) and `i_orHoldBars` (1 vs 2 vs 3) one at a time.
+4. `i_vwapFilter` alone, static anchor. Expect fewer trades; the question is
+   whether win rate rises by more than trade count falls. Note this overlaps
+   with the OR filter — both are trend-day detectors — so gains will not add up.
+5. `FP_VWAP` alone. Expect the displacement distribution to compress and average
    R:R to drop. If net profit still improves, the trend-day protection is worth
    more than the reward given up — that is the whole test, and the dashboard's
    "R:R here" row is where you watch the cost.
-5. Only then combine. Four options tested together produce a result you cannot
-   attribute.
+6. Only then combine, and expect less than the sum: items 3, 4 and 5 are three
+   different instruments pointed at the same problem. Five options tested
+   together produce a result you cannot attribute to any of them.
 
 ---
 
