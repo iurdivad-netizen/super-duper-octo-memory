@@ -82,6 +82,9 @@ const string ANCH_NEWS  = "8:30 news bar open"
 const string ANCH_ZONE  = "8:30 post-news consolidation midpoint"
 const string ANCH_AUTO  = "Auto: 8:30 on event days, else 9:30 open"
 
+const string PS_AUTO = "Auto-detect from the symbol"
+const string PS_MAN  = "Manual"
+
 const string FP_STATIC = "Static anchor (fixed level)"
 const string FP_VWAP   = "Anchored VWAP (moving level)"
 const string FP_BLEND  = "Midpoint of static anchor and VWAP"
@@ -151,8 +154,10 @@ i_vwapSlopeLen = input.int(15, "VWAP slope lookback (bars)", minval = 1, maxval 
 i_tpFreeze = input.bool(true, "Freeze the baseline target at entry", group = GRP_SESS,
      tooltip = "Only matters when the fair price moves (VWAP or blend). On: each leg's baseline target is the fair price as it stood when that leg was entered, so the limit order does not walk. Off: the target tracks the live fair price, which for a rising VWAP under a short means your target rises to meet you. No effect with a static anchor.")
 
-i_pointSize = input.float(1.0, "Price units per point", minval = 0.0001, step = 0.25, group = GRP_SESS,
-     tooltip = "1.0 for NQ/MNQ/ES: one index point is one price unit. Change only for instruments where a 'point' is not 1.00 of price.")
+i_psMode = input.string(PS_AUTO, "Point / pip size", options = [PS_AUTO, PS_MAN], group = GRP_SESS,
+     tooltip = "THIS IS NOT THE TICK SIZE, and setting it to the tick size would be a silent disaster. NQ's minimum tick is 0.25, but a 'point' -- the unit the deck's 25 and 38 are quoted in -- is 1.0, or four ticks. Set this to 0.25 and every stop becomes four times tighter than intended while the script runs happily. Auto-detect resolves the CONVENTION: 1.0 for index futures, stocks and crypto, 0.0001 for FX pairs, 0.01 for JPY pairs, 0.0001 for anything pip-quoted. The dashboard always shows what it resolved to and why.")
+i_ptSizeMan = input.float(1.0, "Manual point size (price units per point)", minval = 0.0000001, step = 0.25, group = GRP_SESS,
+     tooltip = "Used only when the mode above is Manual. 1.0 for NQ / MNQ / ES / YM: one index point is one price unit.")
 
 i_hardStop = input.float(90.0, "Hard stop (minutes after the open)", minval = 5, maxval = 390, group = GRP_SESS,
      tooltip = "Slide 4: total session time is capped at 90 minutes. Everything is flat at 11:00 and no new entry is allowed to fill at or after it.")
@@ -311,6 +316,33 @@ i_showAttr   = input.bool(true,  "Attribution panel", group = GRP_DISP,
      tooltip = "Splits closed-trade results by phase, setup grade, layer, volatility regime, 8:30 event day, day state and displacement size. P&L is str.tostring of strategy.closedtrades.profit(), which matches the per-trade P&L column in the strategy tester's List of Trades.")
 
 // -----------------------------------------------------------------------------
+// Point / pip size
+//
+// syminfo.mintick answers "what is the smallest price increment" and Pine gives
+// it away for free. That is NOT the question here. The question is what one unit
+// of the deck's 25 and 38 means on this instrument, and that is a market
+// CONVENTION, not a fact any built-in reports:
+//
+//   NQ / ES / YM / RTY   1 point  = 1.0 price   (4 ticks of 0.25)
+//   Stocks, crypto       1 point  = 1.0 price
+//   EURUSD, GBPUSD       1 pip    = 0.0001      (10 ticks on a 5-decimal feed)
+//   USDJPY and JPY pairs 1 pip    = 0.01
+//   6E and FX futures    pip-quoted, caught by the mintick test
+//
+// The FX branch keys off the quote currency rather than off mintick * 10,
+// because a 4-decimal feed would make that arithmetic silently wrong.
+// -----------------------------------------------------------------------------
+float autoPtSize = syminfo.type == "forex" ? (syminfo.currency == "JPY" ? 0.01 : 0.0001) :
+     syminfo.type == "stock" ? 1.0 :
+     syminfo.mintick <= 0.0001 ? 0.0001 : 1.0
+float ptSize = i_psMode == PS_AUTO ? autoPtSize : i_ptSizeMan
+
+// Portability sanity check, shown on the dashboard. The deck's 25 / 38 are NQ
+// numbers; expressing them against the daily range is what exposes the fact
+// that they do not travel.
+float dailyAtr = request.security(syminfo.tickerid, "D", ta.atr(14)[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+// -----------------------------------------------------------------------------
 // Timeframe guard
 // -----------------------------------------------------------------------------
 float tfMin = timeframe.in_seconds(timeframe.period) / 60.0
@@ -318,6 +350,8 @@ float tfMin = timeframe.in_seconds(timeframe.period) / 60.0
 if barstate.isfirst
     if not timeframe.isintraday
         runtime.error("Fair Price Reversion is an intraday system. Use a 1m or 5m chart.")
+    if ptSize < syminfo.mintick
+        runtime.error("Point size (" + str.tostring(ptSize) + ") is smaller than this symbol's minimum tick (" + str.tostring(syminfo.mintick) + "). A point cannot be smaller than a tick. Switch the point size to Manual and set it to the unit your stop and target are actually quoted in.")
     if tfMin > i_contDeadline
         runtime.error("Chart timeframe (" + str.tostring(tfMin) + "m) is longer than the continuation window (" + str.tostring(i_contDeadline) + "m), so phase 1 can never resolve. Use a lower timeframe or widen the window.")
 
@@ -325,7 +359,7 @@ if barstate.isfirst
 // Helpers
 // -----------------------------------------------------------------------------
 f_pts(float points) =>
-    points * i_pointSize
+    points * ptSize
 
 f_alertMsg(string tag, int dir, float px, float sl, float tp, float fair) =>
     "FPR " + tag + " " + (dir == 1 ? "LONG" : "SHORT") + " " + syminfo.ticker +
@@ -337,7 +371,7 @@ f_alertMsg(string tag, int dir, float px, float sl, float tp, float fair) =>
 f_qty(float slPoints) =>
     float baseEq = i_sizeBase == SB_EQ ? strategy.equity : strategy.initial_capital
     float risked = baseEq * i_riskPct / 100.0
-    float perCon = math.max(slPoints * i_pointSize * syminfo.pointvalue, 0.01)
+    float perCon = math.max(slPoints * ptSize * syminfo.pointvalue, 0.01)
     float raw    = i_sizeMode == SIZE_RISK ? math.floor(risked / perCon) : i_qtyFixed
     int(math.max(1.0, math.min(raw, i_maxQty)))
 
@@ -517,7 +551,7 @@ if inSess
             openDone     := true
             openJustDone := true
 
-float openRangePts = na(openHi) or na(openLo) ? na : (openHi - openLo) / i_pointSize
+float openRangePts = na(openHi) or na(openLo) ? na : (openHi - openLo) / ptSize
 bool  volScaled    = not na(openRangePts) and openRangePts > i_volTrig
 float slPts        = volScaled ? i_slScale : i_slBase
 float tpPts        = volScaled ? i_tpScale : i_tpBase
@@ -571,14 +605,14 @@ if not nwDone and not na(nwStartMs) and not na(nwHi) and (time - nwStartMs) / 60
     nwDone     := true
     nwJustDone := true
     float winBars = math.max(1.0, i_newsWinMin / tfMin)
-    float wRange  = (nwHi - nwLo) / i_pointSize
+    float wRange  = (nwHi - nwLo) / ptSize
     // Baseline from previous days only -- today is pushed after the test, so a
     // release can never sit in its own baseline.
     float histR = nrHist.size() >= 5 ? nrHist.median() : na
     float histV = nvHist.size() >= 5 ? nvHist.median() : na
     bool  useHist = i_newsBaseline == NB_HIST and not na(histR)
     // Range scales with the square root of time, volume scales linearly.
-    float atrR  = na(atrVal) ? na : (atrVal / i_pointSize) * math.sqrt(winBars)
+    float atrR  = na(atrVal) ? na : (atrVal / ptSize) * math.sqrt(winBars)
     float volR  = na(volAvg) ? na : volAvg * winBars
     float rBase = useHist ? histR : atrR
     float vBase = useHist and not na(histV) ? histV : volR
@@ -653,7 +687,7 @@ cumPV += i_vwapSrc * vBar
 cumV  += vBar
 float vwapNow = cumV > 0 ? cumPV / cumV : na
 
-float vwapSlope = na(vwapNow) or na(vwapNow[i_vwapSlopeLen]) ? na : (vwapNow - vwapNow[i_vwapSlopeLen]) / i_pointSize
+float vwapSlope = na(vwapNow) or na(vwapNow[i_vwapSlopeLen]) ? na : (vwapNow - vwapNow[i_vwapSlopeLen]) / ptSize
 
 // -----------------------------------------------------------------------------
 // News re-anchor protocol (slide 9, unexpected branch)
@@ -724,7 +758,7 @@ if inSess and ce >= 0 and not orDone
     if ce >= i_orMin
         orDone := true
 
-float orWidth = na(orHi) or na(orLo) ? na : (orHi - orLo) / i_pointSize
+float orWidth = na(orHi) or na(orLo) ? na : (orHi - orLo) / ptSize
 
 if orDone and not na(orHi) and inSess
     int side = close > orHi ? 1 : close < orLo ? -1 : 0
@@ -764,7 +798,7 @@ bool bosUp   = not na(swHigh) and close > swHigh
 // -----------------------------------------------------------------------------
 // Reversion bias: 100% committed toward the baseline, never away from it
 // -----------------------------------------------------------------------------
-float dispPts  = haveAnchor ? (close - fairPrice) / i_pointSize : na
+float dispPts  = haveAnchor ? (close - fairPrice) / ptSize : na
 bool  wantShort = haveAnchor and dispPts >=  i_minDisp
 bool  wantLong  = haveAnchor and dispPts <= -i_minDisp
 
@@ -854,7 +888,7 @@ if i_contClose and contOpen and strategy.position_size != 0 and ce > i_contDeadl
 if i_bailMode != BAIL_OFF and contOpen and not contBailed and strategy.position_size != 0 and not na(contBar)
     float cpx      = strategy.position_avg_price
     int   held     = bar_index - contBar
-    float progress = posDir == 1 ? (close - cpx) / i_pointSize : (cpx - close) / i_pointSize
+    float progress = posDir == 1 ? (close - cpx) / ptSize : (cpx - close) / ptSize
     bool  stalling = held >= i_stallBars and progress < i_stallPts
     bool  bosAgainst = i_bailBos and (posDir == 1 ? bosDown : bosUp)
     float wickAgainst = posDir == 1 ? upWick : dnWick
@@ -1076,7 +1110,7 @@ float effTp = switch i_tpMode
     => tpPts
 float effRR = na(effTp) ? na : effTp / slPts
 
-var table dash = table.new(position.top_right, 2, 19, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
+var table dash = table.new(position.top_right, 2, 21, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
 
 f_row(int r, string k, string v, color vc) =>
     table.cell(dash, 0, r, k, text_color = color.new(color.silver, 0), text_size = size.tiny, text_halign = text.align_left)
@@ -1095,6 +1129,13 @@ if i_showTable and barstate.islast
          i_fpMode == FP_VWAP ? ("VWAP @ " + (i_vwapAnchor == VA_AUTO ? (eventDay ? "8:30" : "9:30") : i_vwapAnchor)) :
          ("blend: " + anchorLabel + " + VWAP")
     string slopeTxt = na(vwapSlope) ? "" : "  (" + (vwapSlope >= 0 ? "+" : "") + str.tostring(vwapSlope, "#.#") + ")"
+    string ptWhy = i_psMode == PS_MAN ? "manual" :
+         syminfo.type == "forex" ? (syminfo.currency == "JPY" ? "auto, JPY pip" : "auto, FX pip") :
+         syminfo.type == "stock" ? "auto, stock" :
+         syminfo.mintick <= 0.0001 ? "auto, pip-quoted" : "auto, 1 pt = 1.0"
+    string tickTxt = syminfo.mintick > 0 ?
+         "  (" + str.tostring(slPts * ptSize / syminfo.mintick, "#") + " / " + str.tostring(tpPts * ptSize / syminfo.mintick, "#") + " ticks)" : ""
+    float slVsAtr = na(dailyAtr) or dailyAtr <= 0 ? na : slPts * ptSize / dailyAtr
     string dayStateTxt = not i_orUse ? "filter off" : orWide ? "WIDE RANGE - skipped" :
          orDir == 1 ? "TRENDING UP - no shorts" : orDir == -1 ? "TRENDING DOWN - no longs" :
          orDone ? "balanced" : "range forming"
@@ -1112,15 +1153,17 @@ if i_showTable and barstate.islast
     f_row(7,  "Opening candle", na(openRangePts) ? "--" : str.tostring(openRangePts, "#.#") + " pt", color.white)
     f_row(8,  "Opening range", not i_orUse ? "off" : na(orWidth) ? "--" : str.tostring(orWidth, "#.#") + " pt" + (orDone ? "" : " (forming)"), orWide ? color.orange : color.white)
     f_row(9,  "Day state", dayStateTxt, dayStateCol)
-    f_row(10, "SL / TP", str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#") + " pt", color.white)
-    f_row(11, "R:R nominal", str.tostring(tpPts / slPts, "#.00"), color.white)
-    f_row(12, "R:R here", na(effRR) ? "--" : str.tostring(effRR, "#.00"), na(effRR) or effRR >= tpPts / slPts ? color.white : color.orange)
-    f_row(13, "Entries today", str.tostring(dayTrades) + " / " + str.tostring(i_maxTrades), dayTrades >= i_maxTrades ? color.orange : color.white)
-    f_row(14, "Layers open", str.tostring(layersOpen) + " / " + str.tostring(i_maxLayers), color.white)
-    f_row(15, "Day P&L", str.tostring(dayPnl, "#.00"), dayPnl >= 0 ? color.lime : color.red)
-    f_row(16, "To DD floor", i_trailDD > 0 ? str.tostring(eqNow - ddFloor, "#.00") : "off", eqNow - ddFloor < i_trailDD * 0.25 ? color.red : color.white)
-    f_row(17, "To target", i_target > 0 ? str.tostring(targetEq - eqNow, "#.00") : "off", color.white)
-    f_row(18, "Re-anchors", i_useReanchor ? str.tostring(reanchors) : "off", color.white)
+    f_row(10, "SL / TP", str.tostring(slPts, "#.#") + " / " + str.tostring(tpPts, "#.#") + " pt" + tickTxt, color.white)
+    f_row(11, "Point size", str.tostring(ptSize) + "  (" + ptWhy + ", tick " + str.tostring(syminfo.mintick) + ")", i_psMode == PS_MAN ? color.white : color.aqua)
+    f_row(12, "SL / daily ATR", na(slVsAtr) ? "--" : str.tostring(slVsAtr, "#.##"), na(slVsAtr) ? color.gray : slVsAtr > 0.35 or slVsAtr < 0.02 ? color.orange : color.white)
+    f_row(13, "R:R nominal", str.tostring(tpPts / slPts, "#.00"), color.white)
+    f_row(14, "R:R here", na(effRR) ? "--" : str.tostring(effRR, "#.00"), na(effRR) or effRR >= tpPts / slPts ? color.white : color.orange)
+    f_row(15, "Entries today", str.tostring(dayTrades) + " / " + str.tostring(i_maxTrades), dayTrades >= i_maxTrades ? color.orange : color.white)
+    f_row(16, "Layers open", str.tostring(layersOpen) + " / " + str.tostring(i_maxLayers), color.white)
+    f_row(17, "Day P&L", str.tostring(dayPnl, "#.00"), dayPnl >= 0 ? color.lime : color.red)
+    f_row(18, "To DD floor", i_trailDD > 0 ? str.tostring(eqNow - ddFloor, "#.00") : "off", eqNow - ddFloor < i_trailDD * 0.25 ? color.red : color.white)
+    f_row(19, "To target", i_target > 0 ? str.tostring(targetEq - eqNow, "#.00") : "off", color.white)
+    f_row(20, "Re-anchors", i_useReanchor ? str.tostring(reanchors) : "off", color.white)
 
 // -----------------------------------------------------------------------------
 // Attribution panel
