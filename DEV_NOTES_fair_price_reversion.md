@@ -524,6 +524,63 @@ mistake that trade-off for an edge.
 
 ---
 
+## Part 3g — The ATR candle as an entry
+
+### What it is
+
+The deck's A setup measures displacement against **the candle before it**. An ATR
+candle measures displacement against **recent volatility**. Same idea, different
+yardstick, and worth testing as an alternative trigger.
+
+`atrCandle` is true when the bar exceeds `i_atrMult` x `ta.atr(i_atrSetLen)`.
+Marked on the chart with a gold diamond whenever `i_showAtrBar` is on, regardless
+of whether the setup mode is using them — so you can eyeball where they land
+before committing to trading them.
+
+Three new setup modes sit alongside the deck's:
+
+| Mode | Question it asks |
+|------|------------------|
+| `SET_ATR` | Is the ATR candle a good entry *on its own*? |
+| `SET_ANY` | Does adding ATR candles to A setups help? |
+| `SET_AND` | Does requiring both filter out bad A setups? |
+
+The attribution panel gains an **ATR only** row: entries that did not pass the A
+test and therefore qualified on the ATR candle alone. That population is the
+answer to the question — not the totals.
+
+### Three things to know before reading the result
+
+**The two tests overlap heavily, and the difference is specific.** Any large
+candle following a small one passes both. The candles `SET_ANY` *adds* are the
+ones that are large in absolute terms but **not** larger than the bar before
+them — which is what a second push in an already-fast move looks like. So the
+union is not "A setups plus more of the same"; it is "A setups plus continuation
+of momentum". Judge it on that basis.
+
+**ATR(14) on a 1m chart is a fourteen-MINUTE volatility estimate.** It is
+inflated by the opening spike and decays through the session, so the threshold is
+**strictest right after the open, when displacement is largest** — arguably
+backwards for a strategy whose whole premise is fading the opening displacement.
+`i_atrSetLen` exists so you can test a longer, steadier baseline against 14.
+If the ATR trigger looks better at length 50 than at 14, that is what it is
+telling you.
+
+**Range or body is a real choice, not a detail.** ATR is a range measure, so
+range-to-ATR is like-for-like. A *body* exceeding a full ATR is a far rarer
+candle, and it is the measure consistent with how the deck defines the A setup.
+`AM_RANGE` is the default because it matches "candle bigger than the 14 ATR"
+literally; `AM_BODY` at the same multiplier is a much more selective filter.
+
+### The attribution repack
+
+Phase went from three values to four (CONT / A / A+ / ATR-only), so the packed
+bucket code changed base: `phase + layer*4 + vol*12 + event*24 + trend*48 +
+disp*96`, fifteen buckets. The encode/decode was verified collision-free across
+all 192 combinations.
+
+---
+
 ## Part 4 — How to test it
 
 1. **1m NQ1! continuous, RTH only**, at least two years, `i_openBars = 5` so the

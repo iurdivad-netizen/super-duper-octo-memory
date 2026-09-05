@@ -97,6 +97,12 @@ const string VA_AUTO   = "Auto: 8:30 on event days, else 9:30"
 const string SET_A     = "A setups (displacement only)"
 const string SET_APLUS = "A+ setups only (displacement + BOS)"
 const string SET_BOTH  = "Both A and A+"
+const string SET_ATR   = "ATR candles only"
+const string SET_ANY   = "A or ATR candle (union)"
+const string SET_AND   = "A and ATR candle (intersection)"
+
+const string AM_RANGE = "Range (high - low)"
+const string AM_BODY  = "Body (close - open)"
 
 const string TP_FIXED = "Fixed points (segmented extraction)"
 const string TP_BASE  = "Fair price baseline (full reversion)"
@@ -177,8 +183,15 @@ i_contClose    = input.bool(true, "Close the continuation at the end of phase 1"
 // 3 - Phase 2: reversion
 // -----------------------------------------------------------------------------
 i_useRev   = input.bool(true, "Trade the reversion", group = GRP_REV)
-i_setup    = input.string(SET_BOTH, "Setup grade required", options = [SET_A, SET_APLUS, SET_BOTH], group = GRP_REV,
-     tooltip = "A = displacement body larger than the previous body. A+ = that, plus a body CLOSE through the last pivot. 'Both' takes every A and simply tags the A+ ones.")
+i_setup    = input.string(SET_BOTH, "Setup grade required", options = [SET_A, SET_APLUS, SET_BOTH, SET_ATR, SET_ANY, SET_AND], group = GRP_REV,
+     tooltip = "A = displacement body larger than the previous body. A+ = that, plus a body CLOSE through the last pivot. 'Both' takes every A and tags the A+ ones. The three ATR options test a different definition of displacement: a candle large relative to recent VOLATILITY rather than large relative to the candle before it. 'Union' adds ATR candles the A test misses, 'intersection' keeps only candles that pass both. The attribution panel reports ATR-only entries as their own row, so you can see directly whether they are worth taking.")
+
+i_atrSetLen = input.int(14, "ATR candle: ATR length", minval = 2, maxval = 200, group = GRP_REV,
+     tooltip = "14 as asked. Be aware what 14 means on your chart: on 1m it is a fourteen-MINUTE volatility estimate, which is inflated by the opening spike and then decays. That makes the test strictest right after the open, when displacement is largest -- arguably backwards for this strategy. A longer length gives a steadier threshold; test both.")
+i_atrMult   = input.float(1.0, "ATR candle: size / ATR", minval = 0.1, step = 0.1, group = GRP_REV,
+     tooltip = "1.0 means literally 'bigger than the 14 ATR'.")
+i_atrMeas   = input.string(AM_RANGE, "ATR candle: measure", options = [AM_RANGE, AM_BODY], group = GRP_REV,
+     tooltip = "Range is the like-for-like comparison, since ATR is itself a range measure. Body is the stricter test and is consistent with how the deck defines its A setup -- a body exceeding a full ATR is a much rarer candle than a range that does.")
 i_minDisp  = input.float(25.0, "Minimum displacement from fair price (points)", minval = 0, group = GRP_REV,
      tooltip = "Dead band around the baseline. Price must be at least this far away before there is anything to revert. IMPORTANT: with the 'nearer of fixed / baseline' target, the deck's 1:1.52 only survives when the displacement is at least as large as the take profit. At 25 points of displacement you risk 25 to make 25. Set this to 38 (or your TP) to guarantee the full ratio, at the cost of far fewer trades -- the dashboard's 'R:R here' row shows what you are actually being paid.")
 i_minBody  = input.float(0.0, "Minimum entry body (points)", minval = 0, group = GRP_REV,
@@ -314,6 +327,8 @@ i_showPhases = input.bool(true,  "Shade the phases", group = GRP_DISP)
 i_showStruct = input.bool(false, "Plot confirmed structure", group = GRP_DISP)
 i_showVwap   = input.bool(true,  "Plot anchored VWAP", group = GRP_DISP)
 i_showOr     = input.bool(true,  "Plot opening range", group = GRP_DISP)
+i_showAtrBar = input.bool(true,  "Mark ATR candles", group = GRP_DISP,
+     tooltip = "Marks every candle exceeding the ATR threshold, whether or not the setup mode is using them as a trigger. Use it to eyeball whether they land where you would want to enter before you commit to trading them.")
 i_showLabels = input.bool(true,  "Label entries", group = GRP_DISP)
 i_showTable  = input.bool(true,  "Dashboard", group = GRP_DISP)
 i_showAttr   = input.bool(true,  "Attribution panel", group = GRP_DISP,
@@ -382,7 +397,8 @@ f_qty(float slPoints) =>
 // -----------------------------------------------------------------------------
 // Unconditional series (must run on every bar)
 // -----------------------------------------------------------------------------
-float atrVal = ta.atr(i_atrLen)
+float atrVal    = ta.atr(i_atrLen)
+float atrSetVal = ta.atr(i_atrSetLen)
 float ph     = ta.pivothigh(high, i_pivLen, i_pivLen)
 float pl     = ta.pivotlow(low,  i_pivLen, i_pivLen)
 
@@ -477,12 +493,12 @@ var map<string, float> legFair = map.new<string, float>()
 // and counted into every bucket it belongs to, so one backtest answers all of
 // them instead of six.
 //
-// Bucket layout: 0-2 phase, 3-5 layer, 6-7 volatility regime, 8-9 event day,
-// 10-11 day state, 12-13 displacement vs take profit.
+// Bucket layout: 0-3 phase, 4-6 layer, 7-8 volatility regime, 9-10 event day,
+// 11-12 day state, 13-14 displacement vs take profit.
 // -----------------------------------------------------------------------------
-var array<int>   bTr  = array.new<int>(14, 0)
-var array<int>   bWin = array.new<int>(14, 0)
-var array<float> bPnl = array.new<float>(14, 0.0)
+var array<int>   bTr  = array.new<int>(15, 0)
+var array<int>   bWin = array.new<int>(15, 0)
+var array<float> bPnl = array.new<float>(15, 0.0)
 var int   totTr   = 0
 var int   totWin  = 0
 var float totPnl  = 0.0
@@ -498,8 +514,9 @@ f_acc(int idx, float pnl) =>
         bWin.set(idx, bWin.get(idx) + 1)
 
 // phase 0=CONT 1=A 2=A+, layer 0-based capped at 2, then four binary flags.
+// phase 0=CONT 1=A 2=A+ 3=ATR-only, layer 0-based capped at 2, then four flags.
 f_code(int phase, int layer, bool volSc, bool evt, bool trend, bool dispBig) =>
-    phase + math.min(layer, 2) * 3 + (volSc ? 9 : 0) + (evt ? 18 : 0) + (trend ? 36 : 0) + (dispBig ? 72 : 0)
+    phase + math.min(layer, 2) * 4 + (volSc ? 12 : 0) + (evt ? 24 : 0) + (trend ? 48 : 0) + (dispBig ? 96 : 0)
 
 f_pct(int part, int whole) =>
     whole <= 0 ? "--" : str.tostring(100.0 * part / whole, "#.#") + "%"
@@ -825,11 +842,25 @@ float dispPts  = haveAnchor ? (close - fairPrice) / ptSize : na
 bool  wantShort = haveAnchor and dispPts >=  i_minDisp
 bool  wantLong  = haveAnchor and dispPts <= -i_minDisp
 
+// An "ATR candle" is displacement measured against recent VOLATILITY rather than
+// against the previous candle. It is the same idea as the A setup with a
+// different yardstick, so expect overlap: the candles the union adds are the
+// ones that are large in absolute terms but NOT larger than the bar before
+// them, which is what a second push in an already-fast move looks like.
+bool atrCandle = not na(atrSetVal) and atrSetVal > 0
+     and (i_atrMeas == AM_BODY ? body : high - low) > i_atrMult * atrSetVal
+
 bool gradeShort = switch i_setup
     SET_APLUS => aSetup and bosDown
+    SET_ATR   => atrCandle
+    SET_ANY   => aSetup or atrCandle
+    SET_AND   => aSetup and atrCandle
     => aSetup
 bool gradeLong = switch i_setup
     SET_APLUS => aSetup and bosUp
+    SET_ATR   => atrCandle
+    SET_ANY   => aSetup or atrCandle
+    SET_AND   => aSetup and atrCandle
     => aSetup
 
 // VWAP used as a regime gate rather than as a target. Fading price back to a
@@ -996,7 +1027,7 @@ if revDir != 0 and canTrade
         string rid  = "R" + str.tostring(entrySeq)
         int    rqty = f_qty(slPts)
         strategy.entry(rid, revDir == 1 ? strategy.long : strategy.short, qty = rqty,
-             comment = bosThis ? "A+" : "A")
+             comment = not aSetup ? "ATR" : bosThis ? "A+" : "A")
         float rSl    = revDir == 1 ? close - f_pts(slPts) : close + f_pts(slPts)
         float rTpFix = revDir == 1 ? close + f_pts(tpPts) : close - f_pts(tpPts)
         float rTp = switch tpModeEff
@@ -1007,8 +1038,10 @@ if revDir != 0 and canTrade
             rTp := rTpFix
         strategy.exit(rid + "_X", from_entry = rid, stop = rSl, limit = rTp)
         legFair.put(rid, fairPrice)
-        legCode.put(rid, f_code(bosThis ? 2 : 1, layersOpen, volScaled, eventDay, orDir != 0,
-             not na(dispPts) and math.abs(dispPts) >= tpPts))
+        // An entry that did not pass the A test qualified on the ATR candle
+        // alone. That is exactly the population worth judging separately.
+        legCode.put(rid, f_code(not aSetup ? 3 : bosThis ? 2 : 1, layersOpen, volScaled, eventDay,
+             orDir != 0, not na(dispPts) and math.abs(dispPts) >= tpPts))
         if canFlip
             contOpen := false
             contId   := ""
@@ -1016,7 +1049,7 @@ if revDir != 0 and canTrade
         dayTrades   += 1
         tookLong    := revDir == 1
         tookShort   := revDir == -1
-        tookTag     := bosThis ? "A+" : "A"
+        tookTag     := not aSetup ? "ATR" : bosThis ? "A+" : "A"
         if i_showLabels
             label.new(bar_index, revDir == 1 ? low : high, tookTag + (layersOpen >= 1 ? " L" + str.tostring(layersOpen + 1) : ""),
                  style = revDir == 1 ? label.style_label_up : label.style_label_down,
@@ -1074,12 +1107,12 @@ if strategy.closedtrades > lastClosed
         float  kpl = strategy.closedtrades.profit(k)
         if legCode.contains(kid)
             int code = legCode.get(kid)
-            f_acc(code % 3, kpl)
-            f_acc(3  + int(code / 3)  % 3, kpl)
-            f_acc(6  + int(code / 9)  % 2, kpl)
-            f_acc(8  + int(code / 18) % 2, kpl)
-            f_acc(10 + int(code / 36) % 2, kpl)
-            f_acc(12 + int(code / 72) % 2, kpl)
+            f_acc(code % 4, kpl)
+            f_acc(4  + int(code / 4)  % 3, kpl)
+            f_acc(7  + int(code / 12) % 2, kpl)
+            f_acc(9  + int(code / 24) % 2, kpl)
+            f_acc(11 + int(code / 48) % 2, kpl)
+            f_acc(13 + int(code / 96) % 2, kpl)
             totTr  += 1
             totPnl += kpl
             if kpl > 0
@@ -1117,6 +1150,9 @@ bgcolor(i_showPhases and inCont ? color.new(color.orange, 90) : i_showPhases and
 
 plotshape(tookLong,  "Long entry",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.teal, 0), size = size.tiny)
 plotshape(tookShort, "Short entry", style = shape.triangledown, location = location.abovebar, color = color.new(color.maroon, 0), size = size.tiny)
+plotshape(i_showAtrBar and atrCandle and bull, "ATR candle up",   style = shape.diamond, location = location.belowbar, color = color.new(#B8860B, 20), size = size.tiny)
+plotshape(i_showAtrBar and atrCandle and bear, "ATR candle down", style = shape.diamond, location = location.abovebar, color = color.new(#B8860B, 20), size = size.tiny)
+
 plotshape(i_showLabels and shockBar, "News shock", style = shape.xcross, location = location.abovebar, color = color.new(color.orange, 0), size = size.tiny)
 
 // -----------------------------------------------------------------------------
@@ -1197,7 +1233,7 @@ if i_showTable and barstate.islast
 // fraction of the total, no other row on this panel means very much until you
 // re-run with the bar magnifier on or on a finer timeframe.
 // -----------------------------------------------------------------------------
-var table attr = table.new(position.bottom_right, 4, 17, bgcolor = color.new(color.black, 15),
+var table attr = table.new(position.bottom_right, 4, 18, bgcolor = color.new(color.black, 15),
      border_width = 1, border_color = color.new(color.gray, 60))
 
 f_attrRow(int r, string lbl, int idx, color lc) =>
@@ -1222,19 +1258,20 @@ if i_showAttr and barstate.islast
     f_attrRow(2,  "Continuation",   0,  color.silver)
     f_attrRow(3,  "A setups",       1,  color.silver)
     f_attrRow(4,  "A+ setups",      2,  color.aqua)
-    f_attrRow(5,  "Layer 1",        3,  color.silver)
-    f_attrRow(6,  "Layer 2",        4,  color.silver)
-    f_attrRow(7,  "Layer 3+",       5,  color.silver)
-    f_attrRow(8,  "Vol standard",   6,  color.silver)
-    f_attrRow(9,  "Vol scaled",     7,  color.orange)
-    f_attrRow(10, "Normal day",     8,  color.silver)
-    f_attrRow(11, "8:30 event day", 9,  color.aqua)
-    f_attrRow(12, "Balanced day",   10, color.silver)
-    f_attrRow(13, "Trend-day entry",11, color.orange)
-    f_attrRow(14, "Disp < TP",      12, color.orange)
-    f_attrRow(15, "Disp >= TP",     13, color.silver)
+    f_attrRow(5,  "ATR only",       3,  color.new(#B8860B, 0))
+    f_attrRow(6,  "Layer 1",        4,  color.silver)
+    f_attrRow(7,  "Layer 2",        5,  color.silver)
+    f_attrRow(8,  "Layer 3+",       6,  color.silver)
+    f_attrRow(9,  "Vol standard",   7,  color.silver)
+    f_attrRow(10, "Vol scaled",     8,  color.orange)
+    f_attrRow(11, "Normal day",     9,  color.silver)
+    f_attrRow(12, "8:30 event day", 10, color.aqua)
+    f_attrRow(13, "Balanced day",   11, color.silver)
+    f_attrRow(14, "Trend-day entry",12, color.orange)
+    f_attrRow(15, "Disp < TP",      13, color.orange)
+    f_attrRow(16, "Disp >= TP",     14, color.silver)
 
-    table.cell(attr, 0, 16, "Ambiguous", text_color = color.orange, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(attr, 1, 16, str.tostring(ambigTr), text_color = color.orange, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(attr, 2, 16, f_pct(ambigTr, totTr), text_color = color.orange, text_size = size.tiny, text_halign = text.align_right)
-    table.cell(attr, 3, 16, "of n", text_color = color.gray, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(attr, 0, 17, "Ambiguous", text_color = color.orange, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(attr, 1, 17, str.tostring(ambigTr), text_color = color.orange, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(attr, 2, 17, f_pct(ambigTr, totTr), text_color = color.orange, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(attr, 3, 17, "of n", text_color = color.gray, text_size = size.tiny, text_halign = text.align_right)
