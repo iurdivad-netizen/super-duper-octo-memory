@@ -371,6 +371,60 @@ useful reading — `i_maxTrades` already caps total entries per day.
 
 ---
 
+## Part 3d — Point size, and why auto-detecting it does not make this portable
+
+### It is not the tick size
+
+`i_psMode` auto-resolves the point/pip size from the symbol. The thing worth
+being precise about is what it resolves, because the obvious answer is wrong.
+
+`syminfo.mintick` is the smallest price increment — **0.25 on NQ**. A *point*,
+the unit the deck's 25 and 38 are quoted in, is **1.0 on NQ**, four ticks.
+Setting the point size to the tick size makes every stop four times tighter than
+intended, and nothing errors: the script runs, the backtest produces a curve, and
+the curve is of a different strategy than the one you meant to test. That is why
+the input carries the warning and the dashboard always shows the resolved value
+alongside the symbol's actual tick.
+
+The mapping is a market convention, not a fact any built-in reports:
+
+| Instrument | Point / pip | Detected by |
+|---|---|---|
+| NQ, ES, YM, RTY, stocks, crypto | 1.0 | default branch |
+| EURUSD, GBPUSD, and most FX | 0.0001 | `syminfo.type == "forex"` |
+| USDJPY and JPY pairs | 0.01 | quote currency is JPY |
+| 6E and other FX futures | 0.0001 | `mintick <= 0.0001` |
+
+The FX branch keys off the **quote currency**, not off `mintick * 10`. That
+arithmetic happens to work on a 5-decimal feed and is silently wrong on a
+4-decimal one. A `runtime.error` fires if the resolved point size ends up smaller
+than the symbol's tick, which is incoherent by definition.
+
+### The trap this does not fix
+
+Auto-detecting the point size makes the *arithmetic* correct on any instrument.
+It does **not** make the strategy portable, and it would be easy to assume
+otherwise.
+
+25 and 38 are NQ numbers. NQ's daily range runs a few hundred points; ES runs
+roughly a quarter of that. A 25-point stop is a routine intraday wiggle on NQ and
+close to half a session's range on ES — on ES the strategy would sit in its dead
+band most days and take almost nothing, and what it did take would be sized
+completely differently in risk terms.
+
+So the dashboard now carries **SL / daily ATR**, and it turns orange outside a
+sane band. On NQ, 25 points against a ~300-point daily ATR reads about 0.08. Run
+the same settings on ES and it reads roughly 0.4. That single number tells you
+immediately that the parameters did not travel, which no amount of correct point
+arithmetic would have revealed.
+
+If you want the strategy to actually run on other instruments, the fix is
+ATR-relative stops and targets — `SL = k x ATR` with `k` calibrated so it
+reproduces ~25 points on NQ — not a different point size. That is a change to the
+risk model rather than to a unit conversion, and it is not built.
+
+---
+
 ## Part 4 — How to test it
 
 1. **1m NQ1! continuous, RTH only**, at least two years, `i_openBars = 5` so the
