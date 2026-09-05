@@ -130,8 +130,8 @@ i_sess = input.session("0930-1600", "RTH session", group = GRP_SESS,
      tooltip = "Only the open of this session matters. The strategy never trades past the hard stop below.")
 i_tz   = input.string("America/New_York", "Session timezone", group = GRP_SESS)
 
-i_openBars = input.int(1, "Opening candle = first N chart bars", minval = 1, maxval = 30, group = GRP_SESS,
-     tooltip = "The deck's 'opening candle'. On a 5m chart leave this at 1 (09:30-09:35). On a 1m chart set 5 to reproduce the same 5-minute candle, or leave it at 1 to trigger a minute after the open.")
+i_openMin = input.float(5.0, "Opening candle length (minutes)", minval = 0.5, maxval = 60, group = GRP_SESS,
+     tooltip = "The deck's opening candle is 09:30-09:35, so this is 5 minutes on ANY chart timeframe. It used to be a bar count, which made it one minute on a 1m chart -- and since the 09:30 minute on NQ routinely ranges more than 25 points, the volatility exception fired every single day and every trade ran on the scaled 50/76 parameters. Measuring in minutes removes that trap.")
 
 i_anchor = input.string(ANCH_OPEN, "Static anchor =", options = [ANCH_OPEN, ANCH_MID, ANCH_CLOSE, ANCH_NEWS, ANCH_ZONE, ANCH_AUTO], group = GRP_SESS,
      tooltip = "Slide 11 marks the 9:30 OPEN as the permanent baseline; that is the deck. The 8:30 options are a DEPARTURE from it -- slide 9 explicitly says scheduled news is priced in and must NOT move the fair price. The argument for overriding the deck: NQ trades 23 hours, so 9:30 is the cash-equity open, not an auction open, and on data days the genuine repricing happened at 8:30. 'Auto' uses the 8:30 anchor only on days where an 8:30 event is actually detected. If the 8:30 data is unavailable (an RTH-only chart) this silently falls back to the 9:30 open and the dashboard says so.")
@@ -185,6 +185,8 @@ i_minBody  = input.float(0.0, "Minimum entry body (points)", minval = 0, group =
      tooltip = "Absolute floor on displacement size, on top of the larger-than-previous test. 0 disables.")
 i_pivLen   = input.int(2, "Structure pivot length", minval = 1, maxval = 20, group = GRP_REV,
      tooltip = "Bars either side of a swing. A pivot is only confirmed this many bars after it prints -- structure is deliberately lagged so it cannot repaint.")
+i_bosOnce  = input.bool(true, "Count each break of structure only once", group = GRP_REV,
+     tooltip = "On: a swing can only be broken once, and the A+ grade goes to the bar that breaks it. Off (the old behaviour): any close beyond the last pivot grades A+, which in a trending move is every single bar -- the attribution panel will show 100% A+ and 0% A, meaning the filter is doing nothing at all. Turn it off only to reproduce that comparison.")
 i_resetStr = input.bool(true, "Reset structure at the session open", group = GRP_REV,
      tooltip = "On = only intraday swings count as structure. Off = carry overnight swings in.")
 
@@ -396,15 +398,16 @@ int   dayId       = year(time, i_tz) * 10000 + month(time, i_tz) * 100 + dayofmo
 // -----------------------------------------------------------------------------
 var float  reanchorPx  = na
 var int    sessStartMs = na
-var int    sessBars    = 0
 var float  openOp      = na
 var float  openHi      = na
 var float  openLo      = na
 var float  openCl      = na
 var bool   openDone    = false
 
-var float  swHigh      = na
-var float  swLow       = na
+var float  swHigh       = na
+var float  swLow        = na
+var bool   swHighBroken = false
+var bool   swLowBroken  = false
 
 var int    entrySeq    = 0
 var int    dayTrades   = 0
@@ -506,7 +509,6 @@ float eqNow = i_ddUnreal ? strategy.equity : strategy.initial_capital + strategy
 // -----------------------------------------------------------------------------
 if newSess
     sessStartMs  := time
-    sessBars     := 0
     openOp       := open
     openHi       := high
     openLo       := low
@@ -530,8 +532,17 @@ if newSess
     if i_haltMode != HALT_PERM
         eqPeak := eqNow
     if i_resetStr
-        swHigh := na
-        swLow  := na
+        swHigh       := na
+        swLow        := na
+        swHighBroken := false
+        swLowBroken  := false
+
+// -----------------------------------------------------------------------------
+// Clock: minutes from the open, measured at the BAR CLOSE, because that is
+// when a signal is generated and therefore when the next-bar fill lands.
+// -----------------------------------------------------------------------------
+float elapsed = inSess and not na(sessStartMs) ? (time - sessStartMs) / 60000.0 : na
+float ce      = na(elapsed) ? -1.0 : elapsed + tfMin
 
 // -----------------------------------------------------------------------------
 // Opening candle -> anchor + volatility regime
@@ -541,15 +552,14 @@ if newSess
 // is the only safe way to fire the continuation exactly once.
 bool openJustDone = false
 
-if inSess
-    sessBars += 1
-    if sessBars <= i_openBars
+if inSess and ce >= 0 and not openDone
+    if na(openHi) or ce <= i_openMin
         openHi := math.max(nz(openHi, high), high)
         openLo := math.min(nz(openLo, low),  low)
         openCl := close
-        if sessBars == i_openBars
-            openDone     := true
-            openJustDone := true
+    if ce >= i_openMin
+        openDone     := true
+        openJustDone := true
 
 float openRangePts = na(openHi) or na(openLo) ? na : (openHi - openLo) / ptSize
 bool  volScaled    = not na(openRangePts) and openRangePts > i_volTrig
@@ -560,9 +570,11 @@ float tpPts        = volScaled ? i_tpScale : i_tpBase
 // Structure
 // -----------------------------------------------------------------------------
 if not na(ph)
-    swHigh := ph
+    swHigh       := ph
+    swHighBroken := false
 if not na(pl)
-    swLow := pl
+    swLow       := pl
+    swLowBroken := false
 
 // -----------------------------------------------------------------------------
 // The 8:30 news bar
@@ -733,13 +745,6 @@ float fairPrice = not na(reanchorPx) ? reanchorPx : fpDynamic
 
 bool haveAnchor = not na(fairPrice) and not reanchorWait
 
-// -----------------------------------------------------------------------------
-// Clock: minutes from the open, measured at the BAR CLOSE, because that is
-// when a signal is generated and therefore when the next-bar fill lands.
-// -----------------------------------------------------------------------------
-float elapsed = inSess and not na(sessStartMs) ? (time - sessStartMs) / 60000.0 : na
-float ce      = na(elapsed) ? -1.0 : elapsed + tfMin
-
 bool inCont     = inSess and openDone and ce >= 0 and ce <= i_contDeadline
 bool inRev      = inSess and openDone and ce >  i_contDeadline and ce < i_hardStop
 bool atHardStop = inSess and ce >= i_hardStop
@@ -792,8 +797,20 @@ float dnWick   = math.min(close, open) - low
 bool aSetup = body > prevBody and body >= f_pts(i_minBody)
 
 // Diagram 2 -- the A+ setup: a body CLOSE through the last confirmed pivot.
-bool bosDown = not na(swLow)  and close < swLow
-bool bosUp   = not na(swHigh) and close > swHigh
+// A break of structure is an EVENT -- the first close through a swing -- not a
+// state that stays true for as long as price is beyond it. Treated as a state,
+// every bar of a downtrend closes below the last confirmed pivot low, so every
+// A setup also grades A+ and slide 6's "stronger win rate" filter selects
+// nothing. The raw state is kept separately because the bailout and the
+// structure exit are genuinely asking "is structure broken", not "did it break".
+bool bosDownRaw = not na(swLow)  and close < swLow
+bool bosUpRaw   = not na(swHigh) and close > swHigh
+bool bosDown    = bosDownRaw and (not i_bosOnce or not swLowBroken)
+bool bosUp      = bosUpRaw   and (not i_bosOnce or not swHighBroken)
+if bosDownRaw
+    swLowBroken := true
+if bosUpRaw
+    swHighBroken := true
 
 // -----------------------------------------------------------------------------
 // Reversion bias: 100% committed toward the baseline, never away from it
@@ -890,7 +907,7 @@ if i_bailMode != BAIL_OFF and contOpen and not contBailed and strategy.position_
     int   held     = bar_index - contBar
     float progress = posDir == 1 ? (close - cpx) / ptSize : (cpx - close) / ptSize
     bool  stalling = held >= i_stallBars and progress < i_stallPts
-    bool  bosAgainst = i_bailBos and (posDir == 1 ? bosDown : bosUp)
+    bool  bosAgainst = i_bailBos and (posDir == 1 ? bosDownRaw : bosUpRaw)
     float wickAgainst = posDir == 1 ? upWick : dnWick
     bool  wickBail = i_wickMult > 0 and wickAgainst >= f_pts(i_wickMinPts)
          and wickAgainst > i_wickMult * math.max(body, syminfo.mintick)
@@ -903,7 +920,7 @@ if i_bailMode != BAIL_OFF and contOpen and not contBailed and strategy.position_
 // Optional: reversion legs exit on an opposing break of structure
 // -----------------------------------------------------------------------------
 if i_revBosExit and not contOpen and strategy.position_size != 0 and posDir != 0
-    if posDir == 1 ? bosDown : bosUp
+    if posDir == 1 ? bosDownRaw : bosUpRaw
         strategy.close_all(comment = "STRUCTURE EXIT")
 
 // -----------------------------------------------------------------------------
