@@ -425,6 +425,64 @@ risk model rather than to a unit conversion, and it is not built.
 
 ---
 
+## Part 3e — What the first live attribution run exposed
+
+A 1m MNQ run returned: 32 trades, 0 continuation, 0 A setups, 32 A+, 0 standard
+volatility, 32 scaled. Three of those five numbers were symptoms.
+
+### The opening candle was measured in bars, not minutes
+
+`i_openBars` counted **chart bars**. On a 1m chart the deck's opening candle
+became the 09:30 *minute* — and the 09:30 minute on NQ routinely ranges more
+than 25 points, so slide 5's volatility exception fired **every single day**.
+Every trade ran on the scaled 50/76 parameters, permanently, which is why targets
+sat ~76 points from entry and punched straight through the fair price baseline.
+
+This is the third place in the script where a bar count had to become a clock
+window, after the 8:30 detection window and the opening range. It is now
+`i_openMin`, default 5 minutes, and it means 09:30-09:35 on any timeframe.
+
+The visible symptom was the target overshoot. The cause was a unit.
+
+### "Break of structure" was a state, not an event
+
+`bosDown` was `close < swLow` — true for **every bar** of a downtrend, because
+the last confirmed pivot low keeps being taken out. So every A setup also graded
+A+, the attribution showed 32 A+ and 0 A, and slide 6's "stronger win rate"
+filter was selecting nothing at all. Setting `SET_APLUS` would have filtered
+almost nothing while appearing to work.
+
+A break of structure is the **first** close through a swing. `i_bosOnce`
+(default on) marks a swing broken once it is taken out and does not re-grade
+subsequent bars until a new pivot forms. The raw state is kept separately for
+the bailout and the structure exit, which genuinely ask "is structure broken"
+rather than "did it just break".
+
+Turn `i_bosOnce` off to reproduce the old behaviour and see the difference in the
+A vs A+ rows — that comparison is now the point.
+
+### Zero continuation trades — check before assuming
+
+Nothing in the entry path explains this, so the first thing to check is whether
+"Trade the continuation" is simply unticked. If it is ticked and the bucket is
+still zero across a multi-day run, that is a real defect worth chasing rather
+than a setting.
+
+### The target question this started from
+
+Exits printing 40+ points *below* the baseline on a short is not a bug. It is
+`TP_FIXED` — "fixed points (segmented extraction)" — doing exactly what slide 10
+describes: take a fixed chunk and ignore where fair value is. Combined with the
+permanently-scaled 76-point target above, the overshoot was large enough to look
+like an error.
+
+If you want the target to stop at the baseline, that is `TP_NEAR`, "nearer of
+fixed / baseline", which is the shipped default. The two modes answer different
+questions and slide 10 is the argument between them; the attribution panel is
+now how you settle it.
+
+---
+
 ## Part 4 — How to test it
 
 1. **1m NQ1! continuous, RTH only**, at least two years, `i_openBars = 5` so the
