@@ -238,6 +238,8 @@ i_volTrig  = input.float(25.0, "Volatility scaling trigger (opening candle range
      tooltip = "Slide 5's exception protocol. If the opening candle's high-low exceeds this, the WHOLE day switches to the scaled parameters below.")
 i_slScale  = input.float(50.0, "Scaled stop loss (points)", minval = 0.25, group = GRP_MATH)
 i_tpScale  = input.float(76.0, "Scaled take profit (points)", minval = 0.25, group = GRP_MATH)
+i_fixedBr  = input.bool(false, "Fixed bracket (no adaptation)", group = GRP_MATH,
+     tooltip = "Every trade gets exactly the base stop and base target above, entry +/- those points, and nothing moves them. It overrides THREE separate mechanisms that otherwise adapt the bracket: (1) the volatility exception, which switches the whole day to the scaled 50/76; (2) the reversion target mode, which under 'nearer of fixed / baseline' caps the target at the fair price and so shortens it; (3) the continuation bailout, which pulls the stop to breakeven when a trade stalls. It does NOT override the 11:00 hard stop or the end of phase 1 -- those are session rules, not bracket rules, and a trade can still be closed by them before either level is reached. Beyond convenience this is the honest CONTROL RUN: a plain unmanaged 25/38 is the baseline that all three adaptations have to beat before you keep any of them.")
 i_tpMode   = input.string(TP_NEAR, "Reversion target", options = [TP_FIXED, TP_BASE, TP_NEAR], group = GRP_MATH,
      tooltip = "Slide 10 is the whole argument: live capital holds all the way back to the baseline, an evaluation segments the same bias into fixed extraction chunks. 'Nearer of the two' is the deck's combination -- take the fixed chunk, unless the baseline arrives first. Continuation trades always use the fixed target; they move away from the baseline, not toward it.")
 
@@ -562,9 +564,13 @@ if inSess and ce >= 0 and not openDone
         openJustDone := true
 
 float openRangePts = na(openHi) or na(openLo) ? na : (openHi - openLo) / ptSize
-bool  volScaled    = not na(openRangePts) and openRangePts > i_volTrig
+bool  volScaled    = not i_fixedBr and not na(openRangePts) and openRangePts > i_volTrig
 float slPts        = volScaled ? i_slScale : i_slBase
 float tpPts        = volScaled ? i_tpScale : i_tpBase
+
+// The effective target mode. A fixed bracket forces plain points everywhere the
+// mode is read, so the baseline can never shorten a target.
+string tpModeEff = i_fixedBr ? TP_FIXED : i_tpMode
 
 // -----------------------------------------------------------------------------
 // Structure
@@ -902,7 +908,7 @@ if i_contClose and contOpen and strategy.position_size != 0 and ce > i_contDeadl
 // -----------------------------------------------------------------------------
 // Continuation bailout (slide 7)
 // -----------------------------------------------------------------------------
-if i_bailMode != BAIL_OFF and contOpen and not contBailed and strategy.position_size != 0 and not na(contBar)
+if not i_fixedBr and i_bailMode != BAIL_OFF and contOpen and not contBailed and strategy.position_size != 0 and not na(contBar)
     float cpx      = strategy.position_avg_price
     int   held     = bar_index - contBar
     float progress = posDir == 1 ? (close - cpx) / ptSize : (cpx - close) / ptSize
@@ -993,7 +999,7 @@ if revDir != 0 and canTrade
              comment = bosThis ? "A+" : "A")
         float rSl    = revDir == 1 ? close - f_pts(slPts) : close + f_pts(slPts)
         float rTpFix = revDir == 1 ? close + f_pts(tpPts) : close - f_pts(tpPts)
-        float rTp = switch i_tpMode
+        float rTp = switch tpModeEff
             TP_BASE => fairPrice
             TP_NEAR => revDir == 1 ? math.min(rTpFix, fairPrice) : math.max(rTpFix, fairPrice)
             => rTpFix
@@ -1042,7 +1048,7 @@ if strategy.opentrades > 0
             // baseline component is frozen, and only when asked for.
             float legFp  = i_tpFreeze and legFair.contains(eid) ? legFair.get(eid) : fairPrice
             if not isCont and not na(legFp)
-                xTp := switch i_tpMode
+                xTp := switch tpModeEff
                     TP_BASE => legFp
                     TP_NEAR => ed == 1 ? math.min(xTpFix, legFp) : math.max(xTpFix, legFp)
                     => xTpFix
@@ -1121,7 +1127,7 @@ plotshape(i_showLabels and shockBar, "News shock", style = shape.xcross, locatio
 // is capped at the baseline, so a trade entered 25 points from fair price
 // risks 25 to make 25, not 38. This is the single most important number the
 // deck never states, so it gets its own dashboard row.
-float effTp = switch i_tpMode
+float effTp = switch tpModeEff
     TP_BASE => na(dispPts) ? na : math.abs(dispPts)
     TP_NEAR => na(dispPts) ? tpPts : math.min(tpPts, math.abs(dispPts))
     => tpPts
@@ -1159,7 +1165,7 @@ if i_showTable and barstate.islast
     color dayStateCol = not i_orUse ? color.gray : orWide or orDir != 0 ? color.orange : orDone ? color.lime : color.silver
 
     table.cell(dash, 0, 0, "FAIR PRICE REVERSION", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
-    table.cell(dash, 1, 0, volScaled ? "SCALED" : "STANDARD", text_color = volScaled ? color.orange : color.silver, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(dash, 1, 0, i_fixedBr ? "FIXED" : volScaled ? "SCALED" : "STANDARD", text_color = i_fixedBr ? color.aqua : volScaled ? color.orange : color.silver, text_size = size.tiny, text_halign = text.align_right)
 
     f_row(1,  "Phase", phase, pc)
     f_row(2,  "Fair price", haveAnchor ? str.tostring(fairPrice, format.mintick) : "--", color.white)
