@@ -293,6 +293,8 @@ stays the reference run.
 
 ### What to measure
 
+0. **Control: `i_fixedBr` on.** Plain 25/38, no scaling, no baseline cap, no
+   bailout. Every adaptation below has to beat this number.
 1. Baseline: deck default (9:30 open, static, no filter).
 2. `ANCH_AUTO` alone. Split results by the `eventDay` flag — if the 8:30 anchor
    helps, the improvement must be concentrated in flagged days. If it is spread
@@ -480,6 +482,45 @@ If you want the target to stop at the baseline, that is `TP_NEAR`, "nearer of
 fixed / baseline", which is the shipped default. The two modes answer different
 questions and slide 10 is the argument between them; the attribution panel is
 now how you settle it.
+
+---
+
+## Part 3f — The fixed bracket, and why it is the control run
+
+There was always a fixed stop and target — 25 and 38 points. What there was not
+was a way to stop the script *adapting* them, and three separate mechanisms did:
+
+1. **The volatility exception** switches the whole day to 50/76 when the opening
+   candle is wide. Before the opening-candle fix in Part 3e this fired every
+   single day, so nobody was ever running 25/38.
+2. **The reversion target mode.** Under the default `TP_NEAR` the target is
+   capped at the fair price, so a trade entered 30 points from the baseline gets
+   a 30-point target, not 38.
+3. **The continuation bailout** pulls the stop to breakeven when a trade stalls.
+
+Each is defensible on its own and each is in the deck. Together they mean the
+bracket you configured is rarely the bracket you traded, and that a backtest of
+"25/38" was not a backtest of 25/38.
+
+`i_fixedBr` turns off all three at once. Entry ± the base points, nothing moves
+them. It deliberately does **not** override the 11:00 hard stop or the end of
+phase 1 — those are session rules, not bracket rules, and a trade can still be
+closed by them before either level is reached. The dashboard header shows FIXED
+when it is active, next to where it otherwise shows STANDARD or SCALED.
+
+### Why this matters more than convenience
+
+A plain, unmanaged 25/38 is the **control**. Volatility scaling, baseline
+capping and the bailout are three separate claims about improving on it, and
+until you have run the control you cannot say whether any of them does. Run the
+fixed bracket first, record the attribution panel, then re-enable them one at a
+time and require each to beat the control in the bucket it was supposed to
+affect.
+
+That ordering matters because two of the three make the target *shorter*.
+Shorter targets raise win rate and lower average win, which flatters every
+summary statistic except net profit. Without the control run it is easy to
+mistake that trade-off for an edge.
 
 ---
 
