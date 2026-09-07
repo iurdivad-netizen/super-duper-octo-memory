@@ -62,7 +62,8 @@
 // =============================================================================
 
 //@version=6
-indicator("Candle Forecast v2", shorttitle="CF2", overlay=true, max_bars_back=500)
+indicator("Candle Forecast v2", shorttitle="CF2", overlay=true, max_bars_back=500,
+     max_boxes_count=10, max_lines_count=10)
 
 // -----------------------------------------------------------------------------
 // constants — mirrored exactly in backtest_candle_forecast_v2.py
@@ -206,10 +207,14 @@ f_accAdd(array<float> a, int ph, int k, float v) =>
     array.set(a, ph * NACC + k, array.get(a, ph * NACC + k) + v)
 
 f_pct(float x) =>
-    str.tostring(x * 100.0, "#.##") + "%"
+    na(x) ? "—" : str.tostring(x * 100.0, "#.##") + "%"
 
 f_pp(float x) =>
-    (x >= 0 ? "+" : "") + str.tostring(x * 100.0, "#.##") + " pp"
+    na(x) ? "—" : (x >= 0 ? "+" : "") + str.tostring(x * 100.0, "#.##") + " pp"
+
+// Pine's format strings accept no leading "+", so the sign is prepended here.
+f_signed(float x, string fmt) =>
+    na(x) ? "—" : (x >= 0 ? "+" : "") + str.tostring(x, fmt)
 
 // Wilson score interval half-width, so a small sample cannot masquerade as a result.
 f_wilsonLo(float p, int n) =>
@@ -437,14 +442,24 @@ float ghNonBody = na(dispRange) or na(ghBody) ? na : math.max(dispRange - math.a
 float ghHigh = na(ghNonBody) ? na : math.max(ghOpen, ghClose) + ghNonBody * nz(pendUw, 0.5)
 float ghLow  = na(ghNonBody) ? na : math.min(ghOpen, ghClose) - ghNonBody * (1.0 - nz(pendUw, 0.5))
 
-bool showGhost = i_showGhost and pendOk and barstate.islast
-plotcandle(showGhost ? ghOpen : na, showGhost ? ghHigh : na, showGhost ? ghLow : na, showGhost ? ghClose : na,
-     title="Projected next candle", offset=1,
-     color=dispP > 0.5 ? color.new(color.teal, 55) : color.new(color.maroon, 55),
-     wickcolor=color.new(color.gray, 40), bordercolor=color.new(color.gray, 20))
+// plotcandle() and plotbar() take no `offset` -- only plot/plotshape/plotchar/
+// plotarrow do -- and a projected candle drawn on the last bar would sit on top
+// of the real one.  Drawing objects can be placed forward in time, so the ghost
+// is a box (body) plus a line (wick), centred one to three bars to the right.
+var box  ghBody_b = na
+var line ghWick_l = na
 
-plot(i_showBand and pendOk ? close + dispHi / 2.0 : na, "Band high", color=color.new(color.gray, 50), style=plot.style_stepline)
-plot(i_showBand and pendOk ? close - dispHi / 2.0 : na, "Band low",  color=color.new(color.gray, 50), style=plot.style_stepline)
+if barstate.islast and i_showGhost and pendOk and not na(ghHigh) and not na(ghLow)
+    box.delete(ghBody_b)
+    line.delete(ghWick_l)
+    color gc = dispP > 0.5 ? color.teal : color.maroon
+    ghWick_l := line.new(bar_index + 2, ghLow, bar_index + 2, ghHigh,
+         xloc=xloc.bar_index, color=color.new(gc, 25), width=1)
+    ghBody_b := box.new(bar_index + 1, math.max(ghOpen, ghClose), bar_index + 3, math.min(ghOpen, ghClose),
+         xloc=xloc.bar_index, border_color=color.new(gc, 10), bgcolor=color.new(gc, 60))
+
+plot(i_showBand and pendOk ? close + dispHi / 2.0 : na, "Range band upper", color=color.new(color.gray, 50), style=plot.style_stepline)
+plot(i_showBand and pendOk ? close - dispHi / 2.0 : na, "Range band lower", color=color.new(color.gray, 50), style=plot.style_stepline)
 
 color shadeCol = not i_shade ? na :
      phaseNow == 0 ? color.new(color.blue,  95) :
@@ -517,9 +532,9 @@ if i_panel and barstate.islast
             f_cell(col, 8,  str.tostring(int(n)), dim)
             f_cell(col, 9,  f_pct(acc), hdr)
             f_cell(col, 10, f_pp(acc - bacc), zc)
-            f_cell(col, 11, str.tostring(z, "+#.##"), zc)
-            f_cell(col, 12, str.tostring(lls, "+#.#####"), dim)
-            f_cell(col, 13, str.tostring(bss, "+#.#####"), dim)
+            f_cell(col, 11, f_signed(z, "#.##"), zc)
+            f_cell(col, 12, f_signed(lls, "#.#####"), dim)
+            f_cell(col, 13, f_signed(bss, "#.#####"), dim)
             f_cell(col, 14, f_pp(ssk), ssk > 0.02 ? color.new(color.teal, 0) : dim)
             f_cell(col, 15, f_pp(esk), dim)
             f_cell(col, 16, na(cov) ? "—" : f_pct(cov), dim)
