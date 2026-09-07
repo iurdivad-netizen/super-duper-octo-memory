@@ -1,2 +1,3 @@
 __pycache__/
 *.pyc
+data/xauusd_1h_clean.csv

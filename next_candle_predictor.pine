@@ -41,15 +41,29 @@
 // Run backtest_next_candle_predictor.py to reproduce those numbers, or just
 // watch the SCORECARD rows fill in on your own symbol.
 //
-// TRAIN / HOLDOUT SPLIT
-// Optionally learn on the first 75% of the chart and score the last 25%
-// separately, with learning frozen at the boundary. That answers a question
-// walk-forward cannot: does what the model learned in the past still hold
-// later? The panel then shows both columns side by side and the gap between
-// them is the decay. Use it to sanity-check any parameter you tuned by
-// watching the panel — tune on TRAIN, then look at HOLDOUT exactly once.
-// The range EWMA keeps running through the holdout because it is state, not a
-// fitted parameter; freezing it would only forecast stale volatility.
+// TRAIN / VALIDATION / TEST SPLIT
+// Optionally learn on the first 75% of the chart, compare parameter settings on
+// the next 20%, and look at the last 5% exactly once. Learning freezes at the
+// end of TRAIN, so VALID and TEST are both clean reads of the same fitted model.
+// The panel shows all three columns; the verdict reads the most untouched one.
+// The range EWMA keeps running throughout, because it is state rather than a
+// fitted parameter and freezing it would only forecast stale volatility.
+//
+// DEAD-BAR FILTER — read this before using the script on a new symbol.
+// Some feeds emit synthetic bars while the market is shut (gold and FX over the
+// weekend) carrying a near-zero range and a stale price. They are not
+// observations, and left in they fabricate enormous fake colour persistence.
+// Measured on XAUUSD 1h from one such feed: weekend bars had a median range of
+// 0.27 against 14.12 on weekdays, and the colour model showed a +4.5pp "edge" at
+// z=4.7 — which collapsed to -1.1pp once those bars were dropped. The filter
+// compares each bar against a rolling MEDIAN range (a mean or an EWMA would be
+// dragged down by the dead bars themselves) and excludes failures from counting,
+// scoring, the EWMA and any pattern containing one. The panel reports the share
+// it skipped; anything above a few percent means look at your data.
+//
+// Works on any symbol and timeframe — nothing here is instrument-specific. Set
+// Size basis to True range on anything that gaps overnight (single stocks, ETFs,
+// futures across sessions) so the forecast covers the gap rather than ignoring it.
 //
 // Repainting: nothing repaints. The displayed forecast is locked at the close
 // of the previous bar and is never revised while the bar it describes is
@@ -137,6 +151,22 @@ i_regTf   = input.timeframe("240", "Regime timeframe", group = G_COL)
 i_regFast = input.int(20, "Regime EMA fast", minval = 1, group = G_COL)
 i_regSlow = input.int(50, "Regime EMA slow", minval = 1, group = G_COL)
 
+i_sizeBas = input.string("High-low range", "Size basis",
+     options = ["High-low range", "True range"], group = G_SZE,
+     tooltip = "High-low is the visible candle size. True range includes the gap " +
+               "from the previous close, which is what matters on instruments that " +
+               "gap overnight (single stocks, ETFs, index futures across sessions).")
+i_deadOn  = input.bool(true, "Skip dead bars", group = G_SZE,
+     tooltip = "Some feeds emit synthetic bars while the market is shut — gold and " +
+               "FX over the weekend, for instance — with a near-zero range and a " +
+               "stale price. Left in, they manufacture enormous fake colour " +
+               "persistence. Measured on XAUUSD 1h: a +4.5pp 'edge' at z=4.7 " +
+               "collapses to -1.1pp once these bars are dropped.")
+i_deadPct = input.float(5.0, "  dead if range < % of median", minval = 0.5,
+     maxval = 50.0, step = 0.5, group = G_SZE)
+i_deadLen = input.int(200, "  median lookback (bars)", minval = 20, maxval = 2000,
+     group = G_SZE)
+
 i_lam     = input.float(0.94, "Range EWMA lambda", minval = 0.50, maxval = 0.999,
      step = 0.005, group = G_SZE,
      tooltip = "Decay of the range EWMA. 0.94 is the RiskMetrics convention; " +
@@ -167,22 +197,27 @@ i_prjUp   = input.color(color.new(color.teal, 55), "Projected up", group = G_PRJ
 i_prjDn   = input.color(color.new(color.red, 55), "Projected down", group = G_PRJ)
 i_drawBand = input.bool(true, "Draw range band", group = G_PRJ)
 
-i_splitOn  = input.bool(false, "Enable train / holdout split", group = G_SPL,
-     tooltip = "Learn on the first part of the chart, score the rest separately. " +
-               "Off = pure walk-forward over every bar.")
+i_splitOn  = input.bool(false, "Enable train / valid / test split", group = G_SPL,
+     tooltip = "Learn on TRAIN, compare parameter settings on VALID, and look at " +
+               "TEST exactly once. Off = pure walk-forward over every bar.")
 i_splitBy  = input.string("Percent of chart", "Split by",
      options = ["Percent of chart", "Date"], group = G_SPL,
-     tooltip = "Percent moves forward as new bars arrive, so the boundary drifts. " +
-               "Date is fixed, which is what you want for a repeated read.")
-i_trainPct = input.float(75.0, "Train share of chart (%)", minval = 10.0,
-     maxval = 95.0, step = 5.0, group = G_SPL)
-i_splitTs  = input.time(timestamp("01 Jan 2025 00:00 +0000"), "Split date",
+     tooltip = "Percent moves forward as new bars arrive, so the boundaries drift. " +
+               "Dates are fixed, which is what you want for a repeated read.")
+i_trainPct = input.float(75.0, "Train share (%)", minval = 10.0, maxval = 90.0,
+     step = 5.0, group = G_SPL)
+i_validPct = input.float(20.0, "Validation share (%)", minval = 0.0, maxval = 50.0,
+     step = 5.0, group = G_SPL,
+     tooltip = "Whatever is left after train + validation becomes the test window.")
+i_splitTs  = input.time(timestamp("01 Jan 2025 00:00 +0000"), "Train ends",
      group = G_SPL)
-i_freeze   = input.bool(true, "Freeze learning in the holdout", group = G_SPL,
-     tooltip = "On: counts stop updating at the split, so the holdout tests whether " +
-               "past structure still holds. Off: keep learning, and the holdout is " +
-               "just walk-forward restricted to recent bars.")
-i_tint     = input.bool(true, "Tint the holdout region", group = G_SPL)
+i_splitTs2 = input.time(timestamp("01 Jul 2025 00:00 +0000"), "Validation ends",
+     group = G_SPL)
+i_freeze   = input.bool(true, "Freeze learning at the end of TRAIN", group = G_SPL,
+     tooltip = "On: counts stop updating at the first boundary, so VALID and TEST " +
+               "are both clean reads of the train-fitted model. Off: keep learning, " +
+               "and the later windows are just walk-forward on recent bars.")
+i_tint     = input.bool(true, "Tint the validation and test regions", group = G_SPL)
 
 i_burnIn  = input.int(500, "Burn-in bars before scoring", minval = 0, maxval = 20000,
      group = G_QLT,
@@ -215,9 +250,16 @@ i_alertSk = input.bool(true, "Only alert while the Brier skill score is positive
 // -----------------------------------------------------------------------------
 // BAR FACTS
 // -----------------------------------------------------------------------------
-rngBar  = high - low
+trueRng = ta.tr(true)
+rngBar  = i_sizeBas == "True range" ? trueRng : high - low
 bodyAbs = math.abs(close - open)
 atrVal  = ta.atr(14)
+
+// Dead-bar detection. The reference is a rolling MEDIAN, not a mean or an EWMA:
+// on a feed where a third of the bars are synthetic, only a median survives them.
+medRng = ta.median(rngBar, i_deadLen)
+isDead = i_deadOn and not na(medRng) and medRng > 0.0 and
+     rngBar < i_deadPct / 100.0 * medRng
 
 isDoji   = i_dojiPct > 0.0 and rngBar > 0.0 and (bodyAbs / rngBar) * 100.0 <= i_dojiPct
 byCC     = close > nz(close[1], open)
@@ -248,6 +290,13 @@ f_patId(array<int> bf, int k, int off) =>
     idv
 
 // Wilson score interval — honest small-sample bounds on a proportion.
+// How many of the k bars starting `off` back are dead.
+f_anyDead(array<int> d, int k, int off) =>
+    int t = 0
+    for j = 0 to k - 1
+        t := t + array.get(d, off + j)
+    t
+
 f_wilson(float p, float n, float z) =>
     float lo = na
     float hi = na
@@ -302,7 +351,9 @@ var float gGrn = 0.0
 var float wNow = 1.0                       // current observation weight (decay)
 
 var array<int> LVLB = array.new<int>(MAXN + 1, 0)   // level -> array offset
-var array<int> bits = array.new<int>(MAXN + 2, 0)   // colour bit buffer
+var array<int> bits  = array.new<int>(MAXN + 2, 0)  // colour bit buffer
+var array<int> dbits = array.new<int>(MAXN + 2, 0)  // dead-bar bit buffer
+var float deadCount  = 0.0
 var array<float> pLad = array.new<float>(MAXN + 1, na)
 
 // Size model.
@@ -333,10 +384,10 @@ var float pendEw    = na
 var int   pendState = na
 var float pendN     = na
 
-// Scorecard, kept twice: slot 0 is the training phase (or every bar when the
-// split is off), slot 1 is the holdout.
-var array<float> scA = array.new<float>(SC_STRIDE * 2, 0.0)
-var array<float> szA = array.new<float>(SZ_STRIDE * 2, 0.0)
+// Scorecard, kept three times: slot 0 is TRAIN (or every bar when the split is
+// off), slot 1 is VALID, slot 2 is TEST.
+var array<float> scA = array.new<float>(SC_STRIDE * 3, 0.0)
+var array<float> szA = array.new<float>(SZ_STRIDE * 3, 0.0)
 
 // Read one phase's scorecard back out. Kept as functions so the train and the
 // holdout columns are computed by identical code.
@@ -382,15 +433,36 @@ array.set(bits, 7, isGrn[7] ? 1 : 0)
 array.set(bits, 8, isGrn[8] ? 1 : 0)
 array.set(bits, 9, isGrn[9] ? 1 : 0)
 
+array.set(dbits, 0, isDead ? 1 : 0)
+array.set(dbits, 1, isDead[1] ? 1 : 0)
+array.set(dbits, 2, isDead[2] ? 1 : 0)
+array.set(dbits, 3, isDead[3] ? 1 : 0)
+array.set(dbits, 4, isDead[4] ? 1 : 0)
+array.set(dbits, 5, isDead[5] ? 1 : 0)
+array.set(dbits, 6, isDead[6] ? 1 : 0)
+array.set(dbits, 7, isDead[7] ? 1 : 0)
+array.set(dbits, 8, isDead[8] ? 1 : 0)
+array.set(dbits, 9, isDead[9] ? 1 : 0)
+
+// A pattern is usable only when every bar in it is live.
+patAlive = f_anyDead(dbits, i_nPrev, 0) == 0     // pattern ending at this bar
+updAlive = not isDead and f_anyDead(dbits, i_nPrev, 1) == 0   // outcome + pattern
+
 warm = bar_index >= MAXN + 3
 
-// -- train / holdout phase ----------------------------------------------------
-// The EWMA is deliberately NOT frozen below: it is state that must track current
+// -- train / validation / test phase ------------------------------------------
+// Learning stops at the END OF TRAIN, so VALID and TEST are both clean reads of
+// the same train-fitted model. Compare parameter settings on VALID; look at TEST
+// once, at the end, and change nothing after you have.
+// The EWMA is deliberately NOT frozen: it is state that must track current
 // volatility, not a parameter fitted to the training window.
-splitBar = math.floor(last_bar_index * i_trainPct / 100.0)
-inHold   = i_splitOn and (i_splitBy == "Date" ? time > i_splitTs : bar_index > splitBar)
-learnOK  = not inHold or not i_freeze
-phase    = inHold ? 1 : 0
+trainBar = math.floor(last_bar_index * i_trainPct / 100.0)
+validBar = math.floor(last_bar_index * (i_trainPct + i_validPct) / 100.0)
+byDate   = i_splitBy == "Date"
+pastTr   = i_splitOn and (byDate ? time > i_splitTs  : bar_index > trainBar)
+pastVa   = i_splitOn and (byDate ? time > i_splitTs2 : bar_index > validBar)
+phase    = pastVa ? 2 : pastTr ? 1 : 0
+learnOK  = not pastTr or not i_freeze
 
 
 // -----------------------------------------------------------------------------
@@ -398,7 +470,7 @@ phase    = inHold ? 1 : 0
 // -----------------------------------------------------------------------------
 // Runs only on confirmed bars: array state must never be mutated by an
 // unconfirmed tick, because arrays do not roll back the way `var` scalars do.
-if barstate.isconfirmed and not na(pendP)
+if barstate.isconfirmed and not na(pendP) and not isDead
     y     = array.get(bits, 0)
     score = bar_index > i_burnIn
 
@@ -454,7 +526,7 @@ if barstate.isconfirmed and not na(pendP)
 // The key to the whole script: the pattern is read at offset 1 (the bars BEFORE
 // this one) and the outcome is this bar. A forecast is therefore always built
 // from counts that cannot contain the bar it is forecasting.
-if barstate.isconfirmed and warm and learnOK
+if barstate.isconfirmed and warm and learnOK and updAlive
     yNow   = array.get(bits, 0)
     ctxUpd = nz(ctx[1], 0)                 // regime as it stood at the pattern
     gTot  += wNow
@@ -477,9 +549,12 @@ if barstate.isconfirmed and warm and learnOK
 // -----------------------------------------------------------------------------
 // 4. ADVANCE THE RANGE EWMA
 // -----------------------------------------------------------------------------
+// A dead bar must not drag the volatility baseline down with it.
 prevEw = ew
-if barstate.isconfirmed
+if barstate.isconfirmed and not isDead
     ew := na(prevEw) ? rngBar : i_lam * prevEw + (1.0 - i_lam) * rngBar
+if barstate.isconfirmed and isDead
+    deadCount += 1.0
 
 
 // -----------------------------------------------------------------------------
@@ -537,39 +612,48 @@ predHigh  = na(nonBodyN) ? na :
 predLow   = na(nonBodyN) ? na :
      (predUp ? anchor - nonBodyN * (1.0 - upShrG) : predClose - nonBodyN * (1.0 - upShrR))
 
-if barstate.isconfirmed and warm
-    pendP     := pGnext
-    pendBase  := baseP
-    pendRng   := rngNext
-    pendNaive := rngNaive
-    pendLo    := loNext
-    pendHi    := hiNext
-    pendBody  := bodyNext
-    pendHigh  := predHigh
-    pendLow   := predLow
-    pendEw    := ew
-    pendState := sState
-    pendN     := nAtN
+// Commit, or explicitly invalidate. Without the else branch a forecast made
+// before a dead run would survive it and be scored against the wrong bar.
+if barstate.isconfirmed
+    if warm and patAlive and not isDead
+        pendP     := pGnext
+        pendBase  := baseP
+        pendRng   := rngNext
+        pendNaive := rngNaive
+        pendLo    := loNext
+        pendHi    := hiNext
+        pendBody  := bodyNext
+        pendHigh  := predHigh
+        pendLow   := predLow
+        pendEw    := ew
+        pendState := sState
+        pendN     := nAtN
+    else
+        pendP     := na
+        pendRng   := na
+        pendState := na
 
 
 // -----------------------------------------------------------------------------
 // SCORECARD DERIVATIONS
 // -----------------------------------------------------------------------------
 [trN, trAcc, trMaj, trZ, trBss] = f_colStats(0)
-[hoN, hoAcc, hoMaj, hoZ, hoBss] = f_colStats(1)
+[vaN, vaAcc, vaMaj, vaZ, vaBss] = f_colStats(1)
+[teN, teAcc, teMaj, teZ, teBss] = f_colStats(2)
 [trSzN, trSk, trCov] = f_szStats(0)
-[hoSzN, hoSk, hoCov] = f_szStats(1)
+[vaSzN, vaSk, vaCov] = f_szStats(1)
+[teSzN, teSk, teCov] = f_szStats(2)
 
-// The verdict always reads the untouched data: the holdout when a split is on,
-// otherwise the single walk-forward column.
-useHold = i_splitOn and hoN > 0.0
-scN     = useHold ? hoN   : trN
-scAcc   = useHold ? hoAcc : trAcc
-scMaj   = useHold ? hoMaj : trMaj
-scZ     = useHold ? hoZ   : trZ
-bss     = useHold ? hoBss : trBss
-szSkill = useHold ? hoSk  : trSk
-szCov   = useHold ? hoCov : trCov
+// The verdict reads the most untouched column that actually has data: TEST if
+// the split is on and it has filled, else VALID, else the walk-forward column.
+vPhase  = not i_splitOn ? 0 : teN > 0.0 ? 2 : vaN > 0.0 ? 1 : 0
+scN     = vPhase == 2 ? teN   : vPhase == 1 ? vaN   : trN
+scAcc   = vPhase == 2 ? teAcc : vPhase == 1 ? vaAcc : trAcc
+scMaj   = vPhase == 2 ? teMaj : vPhase == 1 ? vaMaj : trMaj
+scZ     = vPhase == 2 ? teZ   : vPhase == 1 ? vaZ   : trZ
+bss     = vPhase == 2 ? teBss : vPhase == 1 ? vaBss : trBss
+szSkill = vPhase == 2 ? teSk  : vPhase == 1 ? vaSk  : trSk
+szCov   = vPhase == 2 ? teCov : vPhase == 1 ? vaCov : trCov
 
 // The displayed forecast is the one locked at the previous close — it describes
 // the bar that is forming right now and does not move while it forms.
@@ -622,40 +706,45 @@ if barstate.islast
 // -----------------------------------------------------------------------------
 // PANEL
 // -----------------------------------------------------------------------------
-var table pnl = table.new(f_pos(i_pnlPos), 3, 27,
+var table pnl = table.new(f_pos(i_pnlPos), 4, 28,
      bgcolor = color.new(color.black, 15), border_width = 1,
      border_color = color.new(color.gray, 60), frame_width = 1,
      frame_color = color.new(color.gray, 40))
 
 // Single-value rows put the value in the rightmost column so it lines up with
 // the HOLDOUT column of the comparative rows below it.
-f_row(int r, string k, string v, color vc) =>
-    table.cell(pnl, 0, r, k, text_color = color.new(color.silver, 0),
-         text_size = f_txt(i_pnlSize), text_halign = text.align_left)
-    table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
-    table.cell(pnl, 2, r, v, text_color = vc,
-         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+f_cell(int c, int r, string v, color vc) =>
+    table.cell(pnl, c, r, v, text_color = vc, text_size = f_txt(i_pnlSize),
+         text_halign = c == 0 ? text.align_left : text.align_right)
     true
 
-// Comparative row: train value in column 1, holdout value in column 2.
-f_row2(int r, string k, string v1, color c1, string v2, color c2) =>
-    table.cell(pnl, 0, r, k, text_color = color.new(color.silver, 0),
-         text_size = f_txt(i_pnlSize), text_halign = text.align_left)
-    table.cell(pnl, 1, r, v1, text_color = c1,
-         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
-    table.cell(pnl, 2, r, v2, text_color = c2,
-         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+// Single-value rows put the value in the rightmost column so it lines up with
+// the TEST column of the comparative rows below it.
+f_row(int r, string k, string v, color vc) =>
+    f_cell(0, r, k, color.new(color.silver, 0))
+    f_cell(1, r, "", color.silver)
+    f_cell(2, r, "", color.silver)
+    f_cell(3, r, v, vc)
+    true
+
+// Comparative row: TRAIN, VALID, TEST across columns 1..3.
+f_row3(int r, string k, string v1, color c1, string v2, color c2,
+     string v3, color c3) =>
+    f_cell(0, r, k, color.new(color.silver, 0))
+    f_cell(1, r, v1, c1)
+    f_cell(2, r, v2, c2)
+    f_cell(3, r, v3, c3)
     true
 
 f_hdr(int r, string s) =>
-    table.cell(pnl, 0, r, s, text_color = color.new(color.aqua, 0),
-         text_size = f_txt(i_pnlSize), text_halign = text.align_left)
-    table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
-    table.cell(pnl, 2, r, "", text_size = f_txt(i_pnlSize))
+    f_cell(0, r, s, color.new(color.aqua, 0))
+    f_cell(1, r, "", color.silver)
+    f_cell(2, r, "", color.silver)
+    f_cell(3, r, "", color.silver)
     true
 
 if barstate.islast and i_showPnl
-    table.clear(pnl, 0, 0, 2, 26)
+    table.clear(pnl, 0, 0, 3, 27)
     int r = 0
 
     f_hdr(r, "COLOUR — bar now forming")
@@ -715,78 +804,99 @@ if barstate.islast and i_showPnl
          str.tostring(sState, "#"), color.silver)
     r += 1
 
+    // Data quality. A high dead-bar share means the feed is emitting synthetic
+    // bars while the market is shut; without the filter those bars fabricate a
+    // large fake colour edge.
+    if i_deadOn
+        deadShare = bar_index > 0 ? deadCount / bar_index : 0.0
+        f_row(r, "Dead bars skipped",
+             str.tostring(deadCount, "#") + "  (" +
+             str.tostring(deadShare * 100.0, "#.#") + "%)",
+             deadShare > 0.05 ? color.orange : color.silver)
+        r += 1
+
     f_hdr(r, "SCORECARD — out-of-sample")
     r += 1
 
-    // Column header. With the split off there is only one column of numbers and
-    // it sits on the right, where the HOLDOUT column would be.
-    f_row2(r, "", i_splitOn ? "TRAIN" : "", color.new(color.aqua, 30),
-         i_splitOn ? "HOLDOUT" : "WALK-FWD", color.new(color.aqua, 0))
+    // Column header. With the split off there is one column of numbers and it
+    // sits on the right, where TEST would be.
+    f_row3(r, "", i_splitOn ? "TRAIN" : "", color.new(color.aqua, 40),
+         i_splitOn ? "VALID" : "", color.new(color.aqua, 20),
+         i_splitOn ? "TEST" : "WALK-FWD", color.new(color.aqua, 0))
     r += 1
 
     if i_splitOn
         splitTxt = switch
-            i_splitBy == "Date" =>
-                 str.format_time(i_splitTs, "yyyy-MM-dd", syminfo.timezone)
-            => "bar " + str.tostring(splitBar, "#") + "/" +
-                 str.tostring(last_bar_index, "#")
-        f_row(r, "Split at / holdout", splitTxt + "  " +
-             (i_freeze ? "(frozen)" : "(still learning)"),
-             color.new(color.aqua, 30))
+            byDate => str.format_time(i_splitTs, "yyyy-MM-dd", syminfo.timezone) +
+                 " / " + str.format_time(i_splitTs2, "yyyy-MM-dd", syminfo.timezone)
+            => str.tostring(i_trainPct, "#") + "/" +
+                 str.tostring(i_validPct, "#") + "/" +
+                 str.tostring(100.0 - i_trainPct - i_validPct, "#") + "%"
+        f_row(r, "Split  " + (i_freeze ? "(frozen at train)" : "(still learning)"),
+             splitTxt, color.new(color.aqua, 30))
         r += 1
 
-    // -- comparative rows -----------------------------------------------------
-    f_row2(r, "Scored bars",
+    f_row3(r, "Scored bars",
          i_splitOn ? str.tostring(trN, "#") : "", color.silver,
-         str.tostring(i_splitOn ? hoN : trN, "#"),
-         (i_splitOn ? hoN : trN) < 200 ? color.orange : color.silver)
+         i_splitOn ? str.tostring(vaN, "#") : "", color.silver,
+         str.tostring(i_splitOn ? teN : trN, "#"),
+         scN < 200 ? color.orange : color.silver)
     r += 1
-    f_row2(r, "Colour accuracy",
+    f_row3(r, "Colour accuracy",
          i_splitOn ? f_pctStr(trAcc) : "", color.silver,
-         f_pctStr(i_splitOn ? hoAcc : trAcc), color.white)
+         i_splitOn ? f_pctStr(vaAcc) : "", color.silver,
+         f_pctStr(i_splitOn ? teAcc : trAcc), color.white)
     r += 1
-    f_row2(r, "  always-majority",
+    f_row3(r, "  always-majority",
          i_splitOn ? f_pctStr(trMaj) : "", color.silver,
-         f_pctStr(i_splitOn ? hoMaj : trMaj), color.silver)
+         i_splitOn ? f_pctStr(vaMaj) : "", color.silver,
+         f_pctStr(i_splitOn ? teMaj : trMaj), color.silver)
     r += 1
 
     trEdge = na(trAcc) or na(trMaj) ? na : trAcc - trMaj
-    hoEdge = na(hoAcc) or na(hoMaj) ? na : hoAcc - hoMaj
-    shEdge = i_splitOn ? hoEdge : trEdge
-    shZ    = i_splitOn ? hoZ : trZ
-    f_row2(r, "  edge (z)",
-         not i_splitOn ? "" : na(trEdge) ? "n/a" :
-              f_sgnStr(trEdge * 100.0, "#.##") + " (" + f_sgnStr(trZ, "#.#") + ")",
+    vaEdge = na(vaAcc) or na(vaMaj) ? na : vaAcc - vaMaj
+    teEdge = na(teAcc) or na(teMaj) ? na : teAcc - teMaj
+    shEdge = na(scAcc) or na(scMaj) ? na : scAcc - scMaj
+    f_row3(r, "  edge (z)",
+         not i_splitOn or na(trEdge) ? "" :
+              f_sgnStr(trEdge * 100.0, "#.#") + " (" + f_sgnStr(trZ, "#.#") + ")",
          na(trEdge) ? color.gray : (trEdge > 0 ? color.lime : color.red),
+         not i_splitOn or na(vaEdge) ? "" :
+              f_sgnStr(vaEdge * 100.0, "#.#") + " (" + f_sgnStr(vaZ, "#.#") + ")",
+         na(vaEdge) ? color.gray : (vaEdge > 0 ? color.lime : color.red),
          na(shEdge) ? "n/a" :
-              f_sgnStr(shEdge * 100.0, "#.##") + " pp (z " + f_sgnStr(shZ, "#.#") + ")",
+              f_sgnStr(shEdge * 100.0, "#.##") + " pp (z " + f_sgnStr(scZ, "#.#") + ")",
          na(shEdge) ? color.gray : (shEdge > 0 ? color.lime : color.red))
     r += 1
 
-    f_row2(r, "Brier skill score",
-         not i_splitOn ? "" : na(trBss) ? "n/a" : f_sgnStr(trBss, "#.####"),
+    f_row3(r, "Brier skill score",
+         not i_splitOn or na(trBss) ? "" : f_sgnStr(trBss, "#.####"),
          na(trBss) ? color.gray : (trBss > 0 ? color.lime : color.red),
-         na(i_splitOn ? hoBss : trBss) ? "n/a" :
-              f_sgnStr(i_splitOn ? hoBss : trBss, "#.#####"),
+         not i_splitOn or na(vaBss) ? "" : f_sgnStr(vaBss, "#.####"),
+         na(vaBss) ? color.gray : (vaBss > 0 ? color.lime : color.red),
+         na(bss) ? "n/a" : f_sgnStr(bss, "#.#####"),
          na(bss) ? color.gray : (bss > 0 ? color.lime : color.red))
     r += 1
 
-    f_row2(r, "Size MAE vs EWMA",
-         not i_splitOn ? "" : na(trSk) ? "n/a" : f_sgnStr(trSk * 100.0, "#.#") + "%",
+    f_row3(r, "Size MAE vs EWMA",
+         not i_splitOn or na(trSk) ? "" : f_sgnStr(trSk * 100.0, "#.#") + "%",
          na(trSk) ? color.gray : (trSk > 0 ? color.lime : color.red),
+         not i_splitOn or na(vaSk) ? "" : f_sgnStr(vaSk * 100.0, "#.#") + "%",
+         na(vaSk) ? color.gray : (vaSk > 0 ? color.lime : color.red),
          na(szSkill) ? "n/a" : f_sgnStr(szSkill * 100.0, "#.##") + "%",
          na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red))
     r += 1
 
-    f_row2(r, "Band coverage (t " + str.tostring(i_bandHi - i_bandLo, "#") + "%)",
+    f_row3(r, "Band coverage (t " + str.tostring(i_bandHi - i_bandLo, "#") + "%)",
          not i_splitOn ? "" : f_pctStr(trCov), color.silver,
+         not i_splitOn ? "" : f_pctStr(vaCov), color.silver,
          f_pctStr(szCov), color.silver)
     r += 1
 
-    // How much of the training-window skill survived into the untouched data.
-    // A large drop means the parameters were fitted to the training window.
-    if i_splitOn and not na(trSk) and not na(hoSk)
-        drop = (hoSk - trSk) * 100.0
+    // How much of the training-window skill survived into data the model never
+    // learned from. A large drop means the parameters were fitted to TRAIN.
+    if i_splitOn and not na(trSk) and not na(szSkill)
+        drop = (szSkill - trSk) * 100.0
         f_row(r, "  size skill carried over",
              f_sgnStr(drop, "#.##") + " pp",
              drop > -3.0 ? color.lime : drop > -8.0 ? color.yellow : color.red)
@@ -797,7 +907,7 @@ if barstate.islast and i_showPnl
     thin    = na(bss) or scN < 200
     sig     = not thin and bss > 0 and not na(scZ) and scZ > 2.0
     marg    = not thin and bss > 0 and not sig
-    scope   = useHold ? "HOLDOUT" : "WALK-FWD"
+    scope   = vPhase == 2 ? "TEST" : vPhase == 1 ? "VALID" : "WALK-FWD"
     verdict = switch
         thin => scope + " COLOUR: not enough data yet"
         sig  => scope + " COLOUR: edge, keep testing"
@@ -810,17 +920,18 @@ if barstate.islast and i_showPnl
         =>      color.red
     table.cell(pnl, 0, r, verdict, text_color = vClr, text_size = f_txt(i_pnlSize),
          text_halign = text.align_left)
-    table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
-    table.cell(pnl, 2, r,
-         na(szSkill) ? "" : (szSkill > 0 ? "SIZE: usable" : "SIZE: no gain"),
-         text_color = na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red),
-         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+    f_cell(1, r, "", color.silver)
+    f_cell(2, r, "", color.silver)
+    f_cell(3, r, na(szSkill) ? "" : (szSkill > 0 ? "SIZE: usable" : "SIZE: no gain"),
+         na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red))
 
 
-// The holdout region, tinted so it is obvious which bars the right-hand column
-// of the scorecard was measured on.
-bgcolor(i_splitOn and i_tint and inHold ? color.new(color.blue, 93) : na,
-     title = "Holdout region")
+// The later windows, tinted so it is obvious which bars each scorecard column
+// was measured on. Dead bars are marked separately — they are in no column.
+bgcolor(i_splitOn and i_tint and phase == 1 ? color.new(color.blue, 93) :
+     i_splitOn and i_tint and phase == 2 ? color.new(color.purple, 88) : na,
+     title = "Validation / test regions")
+bgcolor(i_deadOn and isDead ? color.new(color.orange, 85) : na, title = "Dead bar")
 
 
 // -----------------------------------------------------------------------------
