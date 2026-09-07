@@ -1,0 +1,704 @@
+// =============================================================================
+// Next Candle Predictor — colour probability + size forecast, with a scorecard
+// -----------------------------------------------------------------------------
+// Forecasts two things about the bar that is currently forming:
+//
+//   COLOUR   P(next candle closes green), from a hierarchical Markov chain over
+//            the last 1..N candle colours with empirical-Bayes back-off:
+//
+//                p0 = unconditional green rate (shrunk toward 0.5)
+//                pk = (green_k + s * p(k-1)) / (total_k + s)
+//
+//            Level k is a blend of its own observed frequency and its parent's
+//            estimate; a pattern with few samples collapses back onto the
+//            shorter pattern instead of reporting a meaningless 100%. This is
+//            the same "combine levels 1..7" idea used by the pattern-count
+//            indicators on TradingView, written as the shrinkage estimator it
+//            actually is.
+//
+//   SIZE     E[range] of the next candle, as an EWMA of realised range scaled
+//            by a state-conditional multiplier (state = colour pattern x
+//            volatility bucket), shrunk toward 1.0. Plus an 80% band from the
+//            rolling distribution of realised/predicted error, and a predicted
+//            body and wick split, drawn as a projected candle.
+//
+// THE SCORECARD IS THE POINT.
+// Every forecast is stored at bar close and scored against the bar that
+// actually follows it, so the panel's quality rows are walk-forward and
+// out-of-sample by construction — the counts behind a forecast never contain
+// the bar being forecast. What they show, on ES 15m over ~42k bars, is:
+//
+//     colour  50.29% accurate vs 50.61% for always-predicting-the-majority.
+//             Brier skill score -0.0005. NO EDGE. Deeper patterns are worse,
+//             monotonically (-0.0001 at N=1 down to -0.0093 at N=8) — that is
+//             overfitting, measured.
+//     size    10.7% lower MAE than a plain EWMA, 79.6% coverage on the 80%
+//             band. REAL, and stable across timeframes.
+//
+// So: read the colour probability as a calibration check, not a signal, and
+// trade the size forecast (position sizing, stop distance, target distance,
+// option premium) which is the part that actually carries information.
+// Run backtest_next_candle_predictor.py to reproduce those numbers, or just
+// watch the SCORECARD rows fill in on your own symbol.
+//
+// Repainting: nothing repaints. The displayed forecast is locked at the close
+// of the previous bar and is never revised while the bar it describes is
+// forming. An optional provisional row shows the next-bar forecast including
+// the live bar, and is explicitly labelled as such.
+// =============================================================================
+
+//@version=6
+
+indicator("Next Candle Predictor",
+     shorttitle        = "NCP",
+     overlay           = true,
+     max_boxes_count   = 500,
+     max_lines_count   = 500,
+     max_labels_count  = 500)
+
+
+// -----------------------------------------------------------------------------
+// CONSTANTS
+// -----------------------------------------------------------------------------
+// Levels 1..8 are laid end to end in one flat array. Level k owns 2^k slots
+// starting at offset 2^k - 2, so the whole ladder fits in 2^9 - 2 = 510 slots.
+MAXN        = 8
+IDX_PER_CTX = 510
+SIZE_STATES = 24     // 3 volatility buckets x 8 colour patterns (levels 0..3)
+RENORM_CAP  = 1e100  // rescale decayed counts before they overflow
+
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+G_COL = "Colour model"
+G_SZE = "Size model"
+G_PRJ = "Projected candle"
+G_QLT = "Scorecard"
+G_PNL = "Panel"
+G_ALT = "Alerts"
+
+i_nPrev   = input.int(3, "Pattern length N (candles)", minval = 1, maxval = MAXN,
+     group = G_COL,
+     tooltip = "How many previous candle colours define the state. The measured " +
+               "out-of-sample skill on ES falls as N rises — N=1..3 is the honest " +
+               "range, anything deeper is memorising noise.")
+i_basis   = input.string("Close vs Open", "Colour basis",
+     options = ["Close vs Open", "Close vs Previous Close"], group = G_COL,
+     tooltip = "Close vs Open is the visual candle colour. Close vs Previous " +
+               "Close is the sign of the bar's return — cleaner statistically " +
+               "because it has no doji ambiguity.")
+i_dojiPct = input.float(0.0, "Doji threshold (body <= % of range)", minval = 0.0,
+     maxval = 50.0, step = 0.5, group = G_COL,
+     tooltip = "Bars whose body is this small are re-classified by the rule below. " +
+               "0 disables doji handling.")
+i_dojiAs  = input.string("Close vs Previous Close", "Classify doji as",
+     options = ["Green", "Red", "Close vs Previous Close"], group = G_COL)
+i_sLink   = input.float(50.0, "Back-off strength s (level -> parent)", minval = 0.0,
+     step = 5.0, group = G_COL,
+     tooltip = "Prior weight pulling each level toward the level above it. " +
+               "Large s = trust short patterns, small s = trust the deep pattern. " +
+               "s is measured in pseudo-observations.")
+i_sRoot   = input.float(10.0, "Root prior strength (level 1 -> 0.5)", minval = 0.0,
+     step = 1.0, group = G_COL)
+i_hLife   = input.int(0, "Count half-life in bars (0 = no decay)", minval = 0,
+     maxval = 100000, group = G_COL,
+     tooltip = "Exponentially down-weights old observations so the model tracks a " +
+               "changing market. Implemented as a growing weight, not a rescan.")
+i_useReg  = input.bool(false, "Split counts by HTF regime", group = G_COL,
+     tooltip = "Keeps two independent count spaces, one for EMA-fast-above-slow " +
+               "and one for below. Doubles the state space — needs a lot of history.")
+i_regTf   = input.timeframe("240", "Regime timeframe", group = G_COL)
+i_regFast = input.int(20, "Regime EMA fast", minval = 1, group = G_COL)
+i_regSlow = input.int(50, "Regime EMA slow", minval = 1, group = G_COL)
+
+i_lam     = input.float(0.94, "Range EWMA lambda", minval = 0.50, maxval = 0.999,
+     step = 0.005, group = G_SZE,
+     tooltip = "Decay of the range EWMA. 0.94 is the RiskMetrics convention; " +
+               "lower reacts faster, higher is smoother.")
+i_sizeN   = input.int(2, "Size pattern length (colours)", minval = 0, maxval = 3,
+     group = G_SZE,
+     tooltip = "Colour context for the size multiplier. 0 uses volatility " +
+               "buckets only.")
+i_vbLo    = input.float(0.75, "Vol bucket: low if range/EWMA <", minval = 0.1,
+     step = 0.05, group = G_SZE)
+i_vbHi    = input.float(1.30, "Vol bucket: high if range/EWMA >=", minval = 0.2,
+     step = 0.05, group = G_SZE)
+i_sMult   = input.float(40.0, "Multiplier shrink strength", minval = 0.0, step = 5.0,
+     group = G_SZE,
+     tooltip = "Prior weight pulling each state's multiplier back toward 1.0 " +
+               "(i.e. back toward the plain EWMA).")
+i_bandLo  = input.float(10.0, "Band lower percentile", minval = 0.5, maxval = 49.0,
+     step = 0.5, group = G_SZE)
+i_bandHi  = input.float(90.0, "Band upper percentile", minval = 51.0, maxval = 99.5,
+     step = 0.5, group = G_SZE)
+i_bandWin = input.int(300, "Band calibration window (bars)", minval = 50,
+     maxval = 2000, group = G_SZE,
+     tooltip = "Rolling sample of realised/predicted range ratios used for the " +
+               "band. Larger is smoother but slower to adapt.")
+
+i_drawPrj = input.bool(true, "Draw projected candle", group = G_PRJ)
+i_prjUp   = input.color(color.new(color.teal, 55), "Projected up", group = G_PRJ)
+i_prjDn   = input.color(color.new(color.red, 55), "Projected down", group = G_PRJ)
+i_drawBand = input.bool(true, "Draw range band", group = G_PRJ)
+
+i_burnIn  = input.int(500, "Burn-in bars before scoring", minval = 0, maxval = 20000,
+     group = G_QLT,
+     tooltip = "Forecasts made before this many bars are excluded from the " +
+               "scorecard, so the model is not judged on its cold start.")
+i_showLive = input.bool(false, "Show provisional next-bar row (repaints)",
+     group = G_QLT,
+     tooltip = "Adds a row with the forecast for the bar AFTER the one forming, " +
+               "which uses the live bar's colour and therefore changes tick to tick.")
+
+i_showPnl = input.bool(true, "Show panel", group = G_PNL)
+i_pnlPos  = input.string("Top right", "Panel position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left",
+                "Middle right", "Middle left"], group = G_PNL)
+i_pnlSize = input.string("Small", "Panel text size",
+     options = ["Tiny", "Small", "Normal", "Large"], group = G_PNL)
+i_showLad = input.bool(true, "Show per-level probability ladder", group = G_PNL)
+
+i_alertOn = input.bool(false, "Enable colour alerts", group = G_ALT)
+i_alertP  = input.float(60.0, "Alert when P(green) >= or P(red) >= (%)",
+     minval = 50.0, maxval = 99.0, step = 0.5, group = G_ALT)
+i_alertN  = input.int(100, "Minimum effective samples for an alert", minval = 1,
+     group = G_ALT)
+i_alertSk = input.bool(true, "Only alert while the Brier skill score is positive",
+     group = G_ALT,
+     tooltip = "Suppresses alerts on symbols where the colour model is measurably " +
+               "no better than the base rate. Leave this on.")
+
+
+// -----------------------------------------------------------------------------
+// BAR FACTS
+// -----------------------------------------------------------------------------
+rngBar  = high - low
+bodyAbs = math.abs(close - open)
+atrVal  = ta.atr(14)
+
+isDoji   = i_dojiPct > 0.0 and rngBar > 0.0 and (bodyAbs / rngBar) * 100.0 <= i_dojiPct
+byCC     = close > nz(close[1], open)
+rawGreen = i_basis == "Close vs Open" ? close > open : byCC
+dojiCol  = i_dojiAs == "Green" ? true : i_dojiAs == "Red" ? false : byCC
+isGrn    = isDoji ? dojiCol : rawGreen
+
+// Regime context, one bit. Fetched unconditionally so its history stays intact.
+[regFast, regSlow] = request.security(syminfo.tickerid, i_regTf,
+     [ta.ema(close, i_regFast), ta.ema(close, i_regSlow)],
+     barmerge.gaps_off, barmerge.lookahead_off)
+ctx = i_useReg and not na(regFast) and not na(regSlow) ? (regFast >= regSlow ? 1 : 0) : 0
+
+
+// -----------------------------------------------------------------------------
+// HELPERS  (top level — Pine forbids nested function definitions)
+// -----------------------------------------------------------------------------
+
+// Pattern id of the k colours starting `off` bars back, oldest bit weighted 2^j.
+// Reading from a pre-filled bit buffer instead of the history operator keeps the
+// indices constant-qualified and avoids "cannot determine referencing length".
+f_patId(array<int> bf, int k, int off) =>
+    int idv = 0
+    int pw  = 1
+    for j = 0 to k - 1
+        idv := idv + array.get(bf, off + j) * pw
+        pw  := pw * 2
+    idv
+
+// Wilson score interval — honest small-sample bounds on a proportion.
+f_wilson(float p, float n, float z) =>
+    float lo = na
+    float hi = na
+    if n > 0
+        den = 1.0 + z * z / n
+        ctr = p + z * z / (2.0 * n)
+        adj = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n))
+        lo := (ctr - adj) / den
+        hi := (ctr + adj) / den
+    [lo, hi]
+
+f_scaleArr(array<float> a, float k) =>
+    for i = 0 to array.size(a) - 1
+        array.set(a, i, array.get(a, i) * k)
+    true
+
+f_pos(string s) =>
+    switch s
+        "Top right"     => position.top_right
+        "Top left"      => position.top_left
+        "Bottom right"  => position.bottom_right
+        "Bottom left"   => position.bottom_left
+        "Middle right"  => position.middle_right
+        => position.middle_left
+
+f_txt(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        => size.large
+
+f_pctStr(float v) =>
+    na(v) ? "n/a" : str.tostring(v * 100.0, "#.##") + "%"
+
+f_sgnStr(float v, string fmt) =>
+    na(v) ? "n/a" : (v >= 0 ? "+" : "") + str.tostring(v, fmt)
+
+
+// -----------------------------------------------------------------------------
+// STATE
+// -----------------------------------------------------------------------------
+// Colour model: two count spaces (regime off / on), 510 slots each.
+var array<float> cTot = array.new<float>(IDX_PER_CTX * 2, 0.0)
+var array<float> cGrn = array.new<float>(IDX_PER_CTX * 2, 0.0)
+var float gTot = 0.0
+var float gGrn = 0.0
+var float wNow = 1.0                       // current observation weight (decay)
+
+var array<int> LVLB = array.new<int>(MAXN + 1, 0)   // level -> array offset
+var array<int> bits = array.new<int>(MAXN + 2, 0)   // colour bit buffer
+var array<float> pLad = array.new<float>(MAXN + 1, na)
+
+// Size model.
+var array<float> sSum  = array.new<float>(SIZE_STATES, 0.0)   // sum of range ratios
+var array<float> sCnt  = array.new<float>(SIZE_STATES, 0.0)
+var array<float> sBody = array.new<float>(SIZE_STATES, 0.0)   // sum of body/range
+var array<float> sBCnt = array.new<float>(SIZE_STATES, 0.0)
+var array<float> errWin = array.new<float>(0)                 // realised/predicted
+var float ew       = na                                        // range EWMA
+var float bodyGSum = 0.0
+var float bodyGCnt = 0.0
+var float upShrGSum = 0.0                                      // upper wick share, green
+var float upShrGCnt = 0.0
+var float upShrRSum = 0.0                                      // upper wick share, red
+var float upShrRCnt = 0.0
+
+// The forecast locked at the previous close, and scored on this bar.
+var float pendP     = na
+var float pendBase  = na
+var float pendRng   = na
+var float pendNaive = na
+var float pendLo    = na
+var float pendHi    = na
+var float pendBody  = na
+var float pendHigh  = na
+var float pendLow   = na
+var float pendEw    = na
+var int   pendState = na
+var float pendN     = na
+
+// Scorecard.
+var float scN        = 0.0
+var float scHits     = 0.0
+var float scGreen    = 0.0
+var float scBrier    = 0.0
+var float scBrierRef = 0.0
+var float scLogLoss  = 0.0
+var float szN        = 0.0
+var float szMae      = 0.0
+var float szMaeRef   = 0.0
+var float szCover    = 0.0
+
+if barstate.isfirst
+    int pw = 2
+    for k = 1 to MAXN
+        array.set(LVLB, k, pw - 2)
+        pw := pw * 2
+
+// Refill the bit buffer every bar (deterministic, so realtime ticks are safe).
+// bits[0] is the current bar, bits[1] the previous, and so on. In v6 a bool is
+// never na, so references past the start of history read as false, not na.
+array.set(bits, 0, isGrn ? 1 : 0)
+array.set(bits, 1, isGrn[1] ? 1 : 0)
+array.set(bits, 2, isGrn[2] ? 1 : 0)
+array.set(bits, 3, isGrn[3] ? 1 : 0)
+array.set(bits, 4, isGrn[4] ? 1 : 0)
+array.set(bits, 5, isGrn[5] ? 1 : 0)
+array.set(bits, 6, isGrn[6] ? 1 : 0)
+array.set(bits, 7, isGrn[7] ? 1 : 0)
+array.set(bits, 8, isGrn[8] ? 1 : 0)
+array.set(bits, 9, isGrn[9] ? 1 : 0)
+
+warm = bar_index >= MAXN + 3
+
+
+// -----------------------------------------------------------------------------
+// 1. SCORE THE FORECAST LOCKED AT THE PREVIOUS CLOSE
+// -----------------------------------------------------------------------------
+// Runs only on confirmed bars: array state must never be mutated by an
+// unconfirmed tick, because arrays do not roll back the way `var` scalars do.
+if barstate.isconfirmed and not na(pendP)
+    y     = array.get(bits, 0)
+    score = bar_index > i_burnIn
+
+    if score
+        scN       += 1.0
+        scGreen   += y
+        scHits    += ((pendP >= 0.5) == (y == 1)) ? 1.0 : 0.0
+        scBrier   += math.pow(pendP - y, 2)
+        scBrierRef += math.pow(pendBase - y, 2)
+        pc         = math.max(math.min(pendP, 0.999999), 0.000001)
+        scLogLoss += -(y * math.log(pc) + (1 - y) * math.log(1.0 - pc))
+
+    if pendRng > 0.0
+        if score
+            szN     += 1.0
+            szMae   += math.abs(pendRng - rngBar)
+            szMaeRef += math.abs(pendNaive - rngBar)
+            szCover += (not na(pendLo) and rngBar >= pendLo and rngBar <= pendHi) ? 1.0 : 0.0
+        // The calibration window is always fed, burn-in or not.
+        array.push(errWin, rngBar / pendRng)
+        if array.size(errWin) > i_bandWin
+            array.shift(errWin)
+
+    // 2. Attach this bar's outcome to the size state that was live when the
+    //    forecast was made. This is the only place sSum/sCnt ever grow.
+    if not na(pendState) and pendEw > 0.0
+        array.set(sSum, pendState, array.get(sSum, pendState) + rngBar / pendEw)
+        array.set(sCnt, pendState, array.get(sCnt, pendState) + 1.0)
+        if rngBar > 0.0
+            br = bodyAbs / rngBar
+            array.set(sBody, pendState, array.get(sBody, pendState) + br)
+            array.set(sBCnt, pendState, array.get(sBCnt, pendState) + 1.0)
+            bodyGSum += br
+            bodyGCnt += 1.0
+            nonBody = rngBar - bodyAbs
+            if nonBody > 0.0
+                if isGrn
+                    upShrGSum += (high - math.max(open, close)) / nonBody
+                    upShrGCnt += 1.0
+                else
+                    upShrRSum += (high - math.max(open, close)) / nonBody
+                    upShrRCnt += 1.0
+
+
+// -----------------------------------------------------------------------------
+// 3. FOLD THIS BAR'S COLOUR OUTCOME INTO THE MARKOV COUNTS
+// -----------------------------------------------------------------------------
+// The key to the whole script: the pattern is read at offset 1 (the bars BEFORE
+// this one) and the outcome is this bar. A forecast is therefore always built
+// from counts that cannot contain the bar it is forecasting.
+if barstate.isconfirmed and warm
+    yNow   = array.get(bits, 0)
+    ctxUpd = nz(ctx[1], 0)                 // regime as it stood at the pattern
+    gTot  += wNow
+    gGrn  += wNow * yNow
+    for k = 1 to i_nPrev
+        idx = ctxUpd * IDX_PER_CTX + array.get(LVLB, k) + f_patId(bits, k, 1)
+        array.set(cTot, idx, array.get(cTot, idx) + wNow)
+        array.set(cGrn, idx, array.get(cGrn, idx) + wNow * yNow)
+
+    if i_hLife > 0
+        wNow := wNow * math.pow(2.0, 1.0 / i_hLife)
+        if wNow > RENORM_CAP                // rescale before the weight overflows
+            f_scaleArr(cTot, 1.0 / wNow)
+            f_scaleArr(cGrn, 1.0 / wNow)
+            gTot := gTot / wNow
+            gGrn := gGrn / wNow
+            wNow := 1.0
+
+
+// -----------------------------------------------------------------------------
+// 4. ADVANCE THE RANGE EWMA
+// -----------------------------------------------------------------------------
+prevEw = ew
+if barstate.isconfirmed
+    ew := na(prevEw) ? rngBar : i_lam * prevEw + (1.0 - i_lam) * rngBar
+
+
+// -----------------------------------------------------------------------------
+// 5. BUILD THE FORECAST FOR THE NEXT BAR
+// -----------------------------------------------------------------------------
+// Computed on every bar so the panel can show it, but only committed to the
+// pend* slots on a confirmed close — which is what makes it non-repainting.
+
+// -- colour ladder ------------------------------------------------------------
+baseP = (gGrn + i_sRoot * 0.5) / (gTot + i_sRoot)
+float pRun  = baseP
+float nAtN  = 0.0
+if warm
+    for k = 1 to i_nPrev
+        idx = ctx * IDX_PER_CTX + array.get(LVLB, k) + f_patId(bits, k, 0)
+        tK  = array.get(cTot, idx) / wNow          // effective (decayed) counts
+        gK  = array.get(cGrn, idx) / wNow
+        pRun := (gK + i_sLink * pRun) / (tK + i_sLink)
+        array.set(pLad, k, pRun)
+        if k == i_nPrev
+            nAtN := tK
+pGnext = pRun
+
+// -- size ---------------------------------------------------------------------
+volRatio = na(prevEw) or prevEw <= 0.0 ? 1.0 : rngBar / prevEw
+vBucket  = volRatio < i_vbLo ? 0 : volRatio < i_vbHi ? 1 : 2
+sState   = vBucket * 8 + (i_sizeN > 0 and warm ? f_patId(bits, i_sizeN, 0) : 0)
+
+sMultN   = (array.get(sSum, sState) + i_sMult * 1.0) / (array.get(sCnt, sState) + i_sMult)
+rngNext  = na(ew) or ew <= 0.0 ? na : ew * sMultN
+rngNaive = ew
+
+globBody = bodyGCnt > 0.0 ? bodyGSum / bodyGCnt : 0.5
+bodyRat  = (array.get(sBody, sState) + i_sMult * globBody) /
+           (array.get(sBCnt, sState) + i_sMult)
+bodyNext = na(rngNext) ? na : rngNext * bodyRat
+
+upShrG = upShrGCnt > 0.0 ? (upShrGSum + 10.0 * 0.5) / (upShrGCnt + 10.0) : 0.5
+upShrR = upShrRCnt > 0.0 ? (upShrRSum + 10.0 * 0.5) / (upShrRCnt + 10.0) : 0.5
+
+// -- band ---------------------------------------------------------------------
+enoughErr = array.size(errWin) >= 30
+float qLo = enoughErr ? array.percentile_linear_interpolation(errWin, i_bandLo) : na
+float qHi = enoughErr ? array.percentile_linear_interpolation(errWin, i_bandHi) : na
+loNext = na(rngNext) or na(qLo) ? na : rngNext * qLo
+hiNext = na(rngNext) or na(qHi) ? na : rngNext * qHi
+
+// -- projected geometry, anchored on the next bar's expected open (this close) -
+predUp   = pGnext >= 0.5
+anchor   = close
+nonBodyN = na(rngNext) or na(bodyNext) ? na : math.max(rngNext - bodyNext, 0.0)
+predClose = na(bodyNext) ? na : (predUp ? anchor + bodyNext : anchor - bodyNext)
+predHigh  = na(nonBodyN) ? na :
+     (predUp ? predClose + nonBodyN * upShrG : anchor + nonBodyN * upShrR)
+predLow   = na(nonBodyN) ? na :
+     (predUp ? anchor - nonBodyN * (1.0 - upShrG) : predClose - nonBodyN * (1.0 - upShrR))
+
+if barstate.isconfirmed and warm
+    pendP     := pGnext
+    pendBase  := baseP
+    pendRng   := rngNext
+    pendNaive := rngNaive
+    pendLo    := loNext
+    pendHi    := hiNext
+    pendBody  := bodyNext
+    pendHigh  := predHigh
+    pendLow   := predLow
+    pendEw    := ew
+    pendState := sState
+    pendN     := nAtN
+
+
+// -----------------------------------------------------------------------------
+// SCORECARD DERIVATIONS
+// -----------------------------------------------------------------------------
+scAcc   = scN > 0.0 ? scHits / scN : na
+scBase  = scN > 0.0 ? scGreen / scN : na
+scMaj   = na(scBase) ? na : math.max(scBase, 1.0 - scBase)
+scSe    = na(scMaj) or scN <= 0.0 ? na : math.sqrt(scMaj * (1.0 - scMaj) / scN)
+scZ     = na(scSe) or scSe <= 0.0 ? na : (scAcc - scMaj) / scSe
+bs      = scN > 0.0 ? scBrier / scN : na
+bsRef   = scN > 0.0 ? scBrierRef / scN : na
+bss     = na(bs) or na(bsRef) or bsRef <= 0.0 ? na : 1.0 - bs / bsRef
+szSkill = szN > 0.0 and szMaeRef > 0.0 ? 1.0 - (szMae / szMaeRef) : na
+szCov   = szN > 0.0 ? szCover / szN : na
+
+// The displayed forecast is the one locked at the previous close — it describes
+// the bar that is forming right now and does not move while it forms.
+shownP    = nz(pendP, pGnext)
+shownRng  = nz(pendRng, rngNext)
+shownLo   = pendLo
+shownHi   = pendHi
+shownBody = nz(pendBody, bodyNext)
+shownN    = nz(pendN, nAtN)
+[wLo, wHi] = f_wilson(shownP, shownN, 1.96)
+
+
+// -----------------------------------------------------------------------------
+// PROJECTED CANDLE
+// -----------------------------------------------------------------------------
+// Drawn over the bar that is forming, so forecast and reality sit side by side.
+// A candle is drawn as two vertical lines at the same x: a thick one for the
+// body and a thin one for the high-low range. A box needs width and would be
+// invisible on a single bar.
+var line prjBody = na
+var line prjWick = na
+var line prjBand = na
+
+if barstate.islast
+    line.delete(prjBody)
+    line.delete(prjWick)
+    line.delete(prjBand)
+
+    if i_drawPrj and not na(pendHigh) and not na(pendLow) and not na(pendBody)
+        up   = pendP >= 0.5
+        clr  = up ? i_prjUp : i_prjDn
+        anc  = close[1]                        // where the forecast was anchored
+        bTop = up ? anc + pendBody : anc
+        bBot = up ? anc : anc - pendBody
+
+        // The wide scenario: the same shape stretched to the top of its band.
+        if i_drawBand and not na(pendHi) and pendRng > 0.0
+            kHi = pendHi / pendRng
+            prjBand := line.new(bar_index, anc - (anc - pendLow) * kHi,
+                 bar_index, anc + (pendHigh - anc) * kHi,
+                 color = color.new(color.gray, 55),
+                 style = line.style_dotted, width = 1, xloc = xloc.bar_index)
+
+        prjWick := line.new(bar_index, pendLow, bar_index, pendHigh,
+             color = clr, width = 1, xloc = xloc.bar_index)
+        prjBody := line.new(bar_index, bBot, bar_index, bTop,
+             color = clr, width = 6, xloc = xloc.bar_index)
+
+
+// -----------------------------------------------------------------------------
+// PANEL
+// -----------------------------------------------------------------------------
+var table pnl = table.new(f_pos(i_pnlPos), 2, 24,
+     bgcolor = color.new(color.black, 15), border_width = 1,
+     border_color = color.new(color.gray, 60), frame_width = 1,
+     frame_color = color.new(color.gray, 40))
+
+f_row(int r, string k, string v, color vc) =>
+    table.cell(pnl, 0, r, k, text_color = color.new(color.silver, 0),
+         text_size = f_txt(i_pnlSize), text_halign = text.align_left)
+    table.cell(pnl, 1, r, v, text_color = vc,
+         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+    true
+
+f_hdr(int r, string s) =>
+    table.cell(pnl, 0, r, s, text_color = color.new(color.aqua, 0),
+         text_size = f_txt(i_pnlSize), text_halign = text.align_left)
+    table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
+    true
+
+if barstate.islast and i_showPnl
+    table.clear(pnl, 0, 0, 1, 23)
+    int r = 0
+
+    f_hdr(r, "COLOUR — bar now forming")
+    r += 1
+    dirTxt = na(shownP) ? "n/a" : (shownP >= 0.5 ? "GREEN" : "RED")
+    dirClr = na(shownP) ? color.gray : (shownP >= 0.5 ? color.lime : color.red)
+    conf   = na(shownP) ? na : math.max(shownP, 1.0 - shownP)
+    f_row(r, "Direction", dirTxt + "  " + f_pctStr(conf), dirClr)
+    r += 1
+    f_row(r, "P(green)", f_pctStr(shownP), color.white)
+    r += 1
+    f_row(r, "95% CI (Wilson)",
+         na(wLo) ? "n/a" : f_pctStr(wLo) + " .. " + f_pctStr(wHi), color.silver)
+    r += 1
+    f_row(r, "Base rate P(green)", f_pctStr(baseP), color.silver)
+    r += 1
+    edge = na(shownP) ? na : shownP - baseP
+    f_row(r, "Edge vs base rate",
+         na(edge) ? "n/a" : f_sgnStr(edge * 100.0, "#.##") + " pp",
+         na(edge) ? color.gray : (math.abs(edge) > 0.02 ? color.yellow : color.silver))
+    r += 1
+    f_row(r, "Samples at level " + str.tostring(i_nPrev),
+         str.tostring(shownN, "#"), shownN < 50 ? color.orange : color.silver)
+    r += 1
+
+    if i_showLad
+        string lad = ""
+        for k = 1 to i_nPrev
+            v = array.get(pLad, k)
+            lad := lad + "L" + str.tostring(k) + " " +
+                 (na(v) ? "-" : str.tostring(v * 100.0, "#.#")) + (k < i_nPrev ? "  " : "")
+        f_row(r, "Ladder P(green) — live", lad, color.new(color.silver, 30))
+        r += 1
+
+    if i_showLive
+        f_row(r, "Next bar (provisional)", f_pctStr(pGnext), color.new(color.orange, 0))
+        r += 1
+
+    f_hdr(r, "SIZE — bar now forming")
+    r += 1
+    f_row(r, "Expected range",
+         na(shownRng) ? "n/a" : str.tostring(shownRng, format.mintick), color.white)
+    r += 1
+    f_row(r, "  in ATR(14) units",
+         na(shownRng) or na(atrVal) or atrVal <= 0 ? "n/a" :
+         str.tostring(shownRng / atrVal, "#.##") + " x", color.silver)
+    r += 1
+    f_row(r, str.tostring(i_bandHi - i_bandLo, "#") + "% band",
+         na(shownLo) ? "n/a" : str.tostring(shownLo, format.mintick) + " .. " +
+         str.tostring(shownHi, format.mintick), color.silver)
+    r += 1
+    f_row(r, "Expected body",
+         na(shownBody) ? "n/a" : str.tostring(shownBody, format.mintick), color.silver)
+    r += 1
+    f_row(r, "Vol bucket / state",
+         (vBucket == 0 ? "LOW" : vBucket == 1 ? "MID" : "HIGH") + "  #" +
+         str.tostring(sState, "#"), color.silver)
+    r += 1
+
+    f_hdr(r, "SCORECARD — walk-forward, out-of-sample")
+    r += 1
+    f_row(r, "Scored bars", str.tostring(scN, "#"),
+         scN < 200 ? color.orange : color.silver)
+    r += 1
+    f_row(r, "Colour accuracy", f_pctStr(scAcc), color.white)
+    r += 1
+    f_row(r, "  always-majority", f_pctStr(scMaj), color.silver)
+    r += 1
+    accEdge = na(scAcc) or na(scMaj) ? na : scAcc - scMaj
+    f_row(r, "  edge (z)",
+         na(accEdge) ? "n/a" : f_sgnStr(accEdge * 100.0, "#.##") + " pp  (z " +
+         f_sgnStr(scZ, "#.##") + ")",
+         na(accEdge) ? color.gray : (accEdge > 0 ? color.lime : color.red))
+    r += 1
+    f_row(r, "Brier skill score",
+         na(bss) ? "n/a" : f_sgnStr(bss, "#.#####"),
+         na(bss) ? color.gray : (bss > 0 ? color.lime : color.red))
+    r += 1
+    f_row(r, "Size MAE vs EWMA",
+         na(szSkill) ? "n/a" : f_sgnStr(szSkill * 100.0, "#.##") + "%",
+         na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red))
+    r += 1
+    f_row(r, "Band coverage",
+         na(szCov) ? "n/a" : f_pctStr(szCov) + "  (target " +
+         str.tostring(i_bandHi - i_bandLo, "#") + "%)", color.silver)
+    r += 1
+
+    // The verdict. This row exists so the script cannot be mistaken for a
+    // signal generator on a symbol where the colour model has no skill.
+    thin    = na(bss) or scN < 200
+    sig     = not thin and bss > 0 and not na(scZ) and scZ > 2.0
+    marg    = not thin and bss > 0 and not sig
+    verdict = switch
+        thin => "COLOUR: not enough data yet"
+        sig  => "COLOUR: edge, keep testing"
+        marg => "COLOUR: marginal, not significant"
+        =>      "COLOUR: NO EDGE — trade the size row"
+    vClr = switch
+        thin => color.gray
+        sig  => color.lime
+        marg => color.yellow
+        =>      color.red
+    table.cell(pnl, 0, r, verdict, text_color = vClr, text_size = f_txt(i_pnlSize),
+         text_halign = text.align_left)
+    table.cell(pnl, 1, r,
+         na(szSkill) ? "" : (szSkill > 0 ? "SIZE: usable" : "SIZE: no gain"),
+         text_color = na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red),
+         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+
+
+// -----------------------------------------------------------------------------
+// PLOTS  (data-window only — nothing here belongs on the price scale)
+// -----------------------------------------------------------------------------
+plot(shownP,   "P(green)",        color = color.teal,  display = display.data_window)
+plot(shownRng, "Expected range",  color = color.white, display = display.data_window)
+plot(shownLo,  "Band low",        color = color.gray,  display = display.data_window)
+plot(shownHi,  "Band high",       color = color.gray,  display = display.data_window)
+plot(bss,      "Brier skill",     color = color.olive, display = display.data_window)
+plot(nz(szSkill), "Size skill",   color = color.olive, display = display.data_window)
+
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+skillOk  = not i_alertSk or (not na(bss) and bss > 0.0)
+thr      = i_alertP / 100.0
+fireUp   = i_alertOn and barstate.isconfirmed and not na(pendP) and
+     pendP >= thr and pendN >= i_alertN and skillOk
+fireDn   = i_alertOn and barstate.isconfirmed and not na(pendP) and
+     (1.0 - pendP) >= thr and pendN >= i_alertN and skillOk
+
+if fireUp
+    alert(str.format("{0} {1}: P(green)={2}%  n={3}  expected range={4}",
+         syminfo.ticker, timeframe.period, str.tostring(pendP * 100.0, "#.#"),
+         str.tostring(pendN, "#"), str.tostring(pendRng, format.mintick)),
+         alert.freq_once_per_bar_close)
+if fireDn
+    alert(str.format("{0} {1}: P(red)={2}%  n={3}  expected range={4}",
+         syminfo.ticker, timeframe.period, str.tostring((1.0 - pendP) * 100.0, "#.#"),
+         str.tostring(pendN, "#"), str.tostring(pendRng, format.mintick)),
+         alert.freq_once_per_bar_close)
