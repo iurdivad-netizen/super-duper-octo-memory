@@ -119,87 +119,154 @@ The predicted body and wick split come from the same state, as shrunk means of
 `body/range` and `upper wick / non-body range`, which is what makes the
 projected ghost candle a shape rather than a bar.
 
-## Train / holdout split
+## Train / validation / test split
 
 Walk-forward already makes every bar out-of-sample, so the split is not there to
 fix a leak. It answers two things walk-forward structurally cannot:
 
-1. **Is a parameter choice overfit?** If you tune `N`, `s`, `lambda` or the vol
-   buckets by watching the panel, the panel is no longer an independent read —
-   you have fitted to it. Tune on TRAIN, look at HOLDOUT once.
+1. **Is a parameter choice overfit?** The moment you tune `N`, `s` or `lambda` by
+   watching the panel, the panel is no longer an independent read.
 2. **Is the learned structure stable over time?** With learning frozen at the
-   boundary, the holdout asks whether what the model learned years ago still
-   describes the market now. Walk-forward can never answer this, because it
-   keeps relearning.
+   boundary, the later windows ask whether what the model learned still holds.
 
-`i_splitOn` turns it on; split by percent of chart (drifts as bars arrive) or by
-a fixed date (stable, and what you want for a repeated read). The panel then
-shows TRAIN and HOLDOUT side by side, the holdout region is tinted, and the
-verdict row switches to reading the holdout column.
+Three windows, default 75 / 20 / 5:
+
+| window | role |
+|---|---|
+| **TRAIN** (75%) | the model fits its counts here |
+| **VALID** (20%) | compare parameter settings here — read it as often as you like |
+| **TEST** (5%) | read **once**, at the end, and change nothing afterwards |
+
+Learning freezes at the end of TRAIN, so VALID and TEST are both clean reads of
+the same fitted model. The Python `--tune` runs the stricter two-pass variant:
+pass 1 freezes at 75% to produce the VALID column used for selection, pass 2
+freezes at 95% so the TEST column is read by a model fitted on everything before
+it, which is what live deployment looks like. Pine is single-pass and so uses the
+simpler freeze-at-TRAIN semantics.
 
 ### What is frozen, and what is not
 
-Frozen with `i_freeze`: the Markov counts, the size multiplier table, the
-body/wick shares, and the band's error-ratio window — everything *fitted*.
+Frozen: the Markov counts, the size multiplier table, the body/wick shares, and
+the band's error-ratio window — everything *fitted*.
 
-**Not** frozen: the range EWMA. It is state, not a parameter. A frozen EWMA
-would forecast the training window's volatility level forever, which would make
-the holdout meaningless rather than honest.
+**Not** frozen: the range EWMA. It is state, not a parameter. A frozen EWMA would
+forecast the training window's volatility level forever.
 
 ### What it measures
 
-`--split 0.75` on ES 15m (32,208 train / 10,737 holdout), defaults, frozen:
+ES 15m, defaults, 31,707 / 8,589 / 2,148 scored bars:
 
 ```
-                            TRAIN         HOLDOUT
-  model accuracy           50.21%          50.98%
-  edge over majority      -0.43 pp        +0.43 pp
-    z-score                 -1.52           +0.89
-  Brier skill score      -0.00087        +0.00047
-  size skill vs EWMA      +11.74%          +7.59%
-  80% band coverage        79.67%          76.20%
+                         TRAIN         VALID          TEST
+  model accuracy        50.21%        51.25%        49.53%
+  edge over majority   -0.43 pp      +0.73 pp      -1.16 pp
+    z-score              -1.52         +1.36         -1.08
+  Brier skill        -0.00087      +0.00071      -0.00001
+  size skill vs EWMA   +11.74%        +7.35%        +8.99%
+  80% band coverage     79.67%        76.11%        80.87%
 ```
 
-Read carefully, because this is where people fool themselves. The holdout colour
-BSS is **positive** — and it means nothing: z = +0.89 is well inside noise, and
-running the identical split with `--no-freeze` flips the same holdout to
-−0.05 pp (z −0.10). One switch, same data, the "edge" changes sign. That is the
-signature of noise, and it is exactly why the panel prints the z-score next to
-the edge rather than the edge alone.
+The colour row wanders across zero — negative, positive, negative — with |z|
+never reaching 2. That is what no signal looks like. The size row decays from
+train but holds at +9% on data the model never learned from, and coverage lands
+at 80.9% against an 80% target.
 
-The size half tells a different and more useful story. Skill decays from +11.74%
-to +7.59% — real degradation, but it stays clearly positive on data the model
-never saw. And band coverage falls to 76.2% frozen versus 79.5% still-learning:
-**the multipliers are stable, the band calibration is not.** So freeze for the
-stationarity test, but in live use let the band keep updating.
+Note coverage sags to 76.1% in VALID when frozen but is fine still-learning: the
+multipliers are stable, **the band calibration is not**. Freeze for the
+stationarity test; in live use let the band keep updating.
 
 ## Tuning without cheating
 
-`--tune` grids parameters on the TRAIN portion only, picks the winner there, and
-reads it once on the holdout. It also reports where the train-best config
-*actually ranks* on the holdout, which is the diagnostic that matters:
+`--tune` grids on TRAIN, selects on VALID, and reads TEST once. It also reports
+where the *train*-best config would have ranked on VALID — the diagnostic that
+says whether tuning transfers at all:
 
 ```
-colour — train-best: N=1  s_link=200    train BSS -0.00004  ->  holdout +0.00051
-         holdout spread over the grid: -0.00133 .. +0.00059
-         train-best lands at the 67th percentile on holdout
+colour — selected on VALID: N=3 s_link=200     valid BSS +0.00071
+         valid spread over 15 configs: -0.00100 .. +0.00071
+         the TRAIN-best config would rank at the 47th percentile on valid
 
-size   — train-best: lambda=0.97 shrink=40 size_n=2   train +16.90% -> holdout +11.76%
-         holdout spread over the grid: +3.52% .. +12.29%
-         train-best lands at the 92nd percentile on holdout
+size   — selected on VALID: lambda=0.97 shrink=100 size_n=3   valid +12.06%
+         valid spread over 36 configs: +3.22% .. +12.06%
+         the TRAIN-best config would rank at the 89th percentile on valid
 ```
 
-If tuning were pure noise-chasing the train-best config would land near the 50th
-percentile on holdout — no better than picking at random. Colour lands at the
-67th: barely distinguishable from chance, and its selected config still scores an
-accuracy edge of −0.00 pp. **Do not tune the colour model.** Size lands at the
-92nd: the selection transfers, and it lifts holdout skill from +7.59% at the
-defaults to **+11.76%** — a 55% relative improvement that survives on data the
-grid never touched.
+**47th percentile is worse than picking at random.** Tuning the colour model is
+provably noise-chasing, and the selected config still lands at −1.16 pp on TEST.
+Size lands at the 89th: selection transfers, and it lifts TEST skill from +8.99%
+at the defaults to **+13.49%**.
 
-The concrete finding: `lambda = 0.97` beats the 0.94 default. The RiskMetrics
-convention is calibrated for daily returns, not 15-minute candle ranges, and a
-slower EWMA fits this series better.
+The concrete finding: `lambda = 0.97` beats the 0.94 default. RiskMetrics' 0.94 is
+calibrated for daily returns, not intraday candle ranges.
+
+## Other symbols — and the dead-bar trap
+
+Nothing in the model is instrument-specific: colours are colours and sizes are
+normalised by their own EWMA. It runs on any symbol and timeframe as-is. But one
+data-quality problem will fabricate a spectacular fake edge, and it is worth
+understanding before trusting any panel on a new market.
+
+Walk-forward, defaults, one file per row:
+
+```
+symbol                bars   colour edge      z        BSS   size skill  coverage   dead
+es1_15m_tradingview  42,744       -0.29%  -1.18   -0.00047      +10.65%     79.7%   0.0%
+es1_3m_tradingview   20,419       -0.68%  -1.95   -0.00120       +3.04%     79.0%   0.0%
+eurusd_1h             4,779       -0.65%  -0.90   -0.00300       +8.53%     80.1%   0.1%
+xauusd_1h             1,959       -0.46%  -0.41   -0.00765       +2.65%     79.4%  27.5%
+btcusd_1h             1,799       +1.72%  +1.46   +0.00011       +5.89%     79.0%   0.0%
+aapl_1h               2,799       +0.39%  +0.42   -0.00420       +0.12%     79.8%   0.0%
+spy_1day              1,799       -1.61%  -1.37   -0.00790       +5.46%     80.1%   0.0%
+```
+
+Five asset classes, two timescales, and **not one |z| above 2 on colour**. The
+size model works everywhere but its magnitude varies a lot — ES 15m +10.7%,
+EURUSD 1h +8.5%, SPY daily +5.5%, AAPL 1h +0.1%. Band coverage is 79–80% on all
+seven, which is the strongest single result here: the uncertainty estimate is
+calibrated across instruments without any per-symbol tuning.
+
+### The dead-bar trap
+
+XAU/USD 1h from one feed *originally* scored **+7.18 pp at z = 7.63**, BSS
++0.078 — an edge an order of magnitude larger than anything else, which is
+exactly why it was worth distrusting rather than celebrating.
+
+The diagnosis, in order:
+
+1. Lag-1 transitions: `P(green | previous green) = 65.7%` vs
+   `P(green | previous red) = 41.4%`. A 24-point spread; no liquid market does
+   that at 1h.
+2. XAU bar opens never equalled the previous close (0.0% of bars). Switching to
+   the close-vs-previous-close basis, which ignores the open entirely, cut the
+   edge to +4.47 pp — so a large part was an open-price construction artifact.
+3. The remainder: **28.8% of the file was Saturday and Sunday bars**, with a
+   median range of **0.27 against 14.12 on weekdays**. Gold does not trade on
+   weekends. These are synthetic bars carrying a stale price.
+
+Drop them and the edge becomes **−1.07 pp at z = −0.95** — indistinguishable
+from every other instrument. The entire "edge" was dead bars.
+
+The filter now ships on by default. Each bar is compared against a rolling
+**median** range — a mean or an EWMA would be dragged down by the dead bars
+themselves — and anything under `i_deadPct` (5%) of it is excluded from counting,
+scoring, the EWMA, and any pattern containing one. It is inert on clean data
+(0.0–0.1% flagged on six of the seven files) and removed 27.5% of the XAU file.
+The panel reports the share it skipped; **above a few percent, go and look at
+your data.**
+
+### Using it on a new symbol
+
+- Add it to any chart; there is nothing to configure per instrument.
+- Check the **Dead bars skipped** row first. Orange means the feed is emitting
+  synthetic bars.
+- Set **Size basis** to *True range* on anything that gaps overnight (single
+  stocks, ETFs, futures across sessions) so the forecast covers the gap.
+- Expect the size skill to differ by market. Hourly single stocks were near zero
+  in this sample; index futures and FX majors were strong.
+- Let the scorecard fill before believing anything. Below ~200 scored bars the
+  panel says so.
+
+## Anti-repainting
 
 ## Anti-repainting
 
@@ -257,6 +324,13 @@ Leave that gate on.
   previous close, so the drawn shape is an approximation.
 - **The regime split is untested.** It doubles the state space and needs far more
   history than a typical chart holds. Default off.
+- **The 5% test window is small.** On a 5,000-bar chart it is 250 bars, where the
+  standard error on accuracy is about 3 pp — enough to validate the size model,
+  nowhere near enough to resolve a colour edge. Widen it, or judge colour on
+  VALID, on short histories.
+- **The dead-bar filter is a heuristic.** A genuinely quiet but real bar can be
+  flagged on very illiquid instruments. Check the skipped share before trusting
+  it, and lower `i_deadPct` if it is discarding live bars.
 - **The z-score treats bars as independent.** Overlapping patterns are
   autocorrelated, so the true effective sample size is smaller than `n` and the
   z is mildly optimistic. It does not change the conclusion here — the edge is
@@ -278,12 +352,17 @@ python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --nprev 3
 python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --sweep
 python3 backtest_next_candle_predictor.py data/es1_3m_tradingview.csv --basis close_close
 
-# train / holdout split, model frozen at the boundary
-python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75
-python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75 --no-freeze
+# every dataset in data/, one row each
+python3 backtest_next_candle_predictor.py --all
 
-# grid on train only, one read on the holdout (~65s)
-python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75 --tune
+# 75 / 20 / 5 split
+python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split3
+
+# grid on train, select on valid, read test once (~110s)
+python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --tune
+
+# turn the dead-bar filter off to see what it was protecting you from
+python3 backtest_next_candle_predictor.py data/xauusd_1h.csv --dead-pct 0 --burn-in 200
 ```
 
 The replica shares the model exactly — same pattern encoding, same back-off,
