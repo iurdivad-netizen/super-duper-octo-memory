@@ -48,6 +48,19 @@ for i, l in enumerate(code):
     if m and m.group(2) in GLOBAL_ONLY and len(m.group(1)) > 0:
         errs.append((i+1, f"{m.group(2)}() must be at global scope (indented {len(m.group(1))})"))
 
+# ---------- 2b. params that do not exist on the plot family ----------
+NO_OFFSET = ("plotcandle", "plotbar")
+for i, l in enumerate(code):
+    for fn in NO_OFFSET:
+        if re.search(rf"\b{fn}\s*\(", l) or (i > 0 and re.search(rf"\b{fn}\s*\(", code[i-1])):
+            if re.search(r"\boffset\s*=", l):
+                errs.append((i+1, f"{fn}() has no 'offset' parameter (only plot/plotshape/plotchar/plotarrow do)"))
+
+# ---------- 2c. Pine format strings have no '+' sign specifier ----------
+for i, l in enumerate(lines):          # raw source: strip() removes string bodies
+    if re.search(r'str\.tostring\s*\([^)]*,\s*"\+', l):
+        errs.append((i+1, "str.tostring format string cannot start with '+' -- prepend the sign yourself"))
+
 # ---------- 3. function defs must be at column 0 ----------
 for i, l in enumerate(code):
     if re.match(r"^\s+\w+\s*\([^)]*\)\s*=>\s*$", l):

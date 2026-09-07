@@ -264,10 +264,17 @@ normaliser. In order:
 
 ## Known limitations
 
-- **Not compiled by TradingView in this environment.** The script passes
-  `tools_pinelint.py` (0 errors) and every shared constant is checked against the
-  replica programmatically, but the replica validates the *model*, not Pine
-  syntax. Compile it before trusting it.
+- **Compile status: one pass through TradingView, two errors fixed, more may
+  remain.** The first real compile reported `plotcandle()` has no `offset`
+  parameter (CE10120) — only `plot`/`plotshape`/`plotchar`/`plotarrow` take one.
+  The projected candle genuinely belongs to the right of the last bar, so it is
+  now drawn with a `box` (body) plus a `line` (wick) at `bar_index + 1..3`;
+  drawing objects can be placed forward in time, `plotcandle` cannot. A second
+  latent error was found in the same pass: Pine format strings have no `+` sign
+  specifier, so `str.tostring(z, "+#.##")` is invalid — `f_signed()` prepends the
+  sign and handles `na` (which `str.tostring` renders as the string "NaN").
+  Both classes are now caught by `tools_pinelint.py`. The linter and the
+  constant-parity check are not a compiler; further errors may still surface.
 - **ATR warmup differs slightly.** The replica seeds Wilder's RMA with the first
   TR; `ta.atr()` seeds with an SMA of the first 14. They converge within ~50
   bars and the difference is inside the burn-in.
