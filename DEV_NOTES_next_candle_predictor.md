@@ -119,6 +119,88 @@ The predicted body and wick split come from the same state, as shrunk means of
 `body/range` and `upper wick / non-body range`, which is what makes the
 projected ghost candle a shape rather than a bar.
 
+## Train / holdout split
+
+Walk-forward already makes every bar out-of-sample, so the split is not there to
+fix a leak. It answers two things walk-forward structurally cannot:
+
+1. **Is a parameter choice overfit?** If you tune `N`, `s`, `lambda` or the vol
+   buckets by watching the panel, the panel is no longer an independent read —
+   you have fitted to it. Tune on TRAIN, look at HOLDOUT once.
+2. **Is the learned structure stable over time?** With learning frozen at the
+   boundary, the holdout asks whether what the model learned years ago still
+   describes the market now. Walk-forward can never answer this, because it
+   keeps relearning.
+
+`i_splitOn` turns it on; split by percent of chart (drifts as bars arrive) or by
+a fixed date (stable, and what you want for a repeated read). The panel then
+shows TRAIN and HOLDOUT side by side, the holdout region is tinted, and the
+verdict row switches to reading the holdout column.
+
+### What is frozen, and what is not
+
+Frozen with `i_freeze`: the Markov counts, the size multiplier table, the
+body/wick shares, and the band's error-ratio window — everything *fitted*.
+
+**Not** frozen: the range EWMA. It is state, not a parameter. A frozen EWMA
+would forecast the training window's volatility level forever, which would make
+the holdout meaningless rather than honest.
+
+### What it measures
+
+`--split 0.75` on ES 15m (32,208 train / 10,737 holdout), defaults, frozen:
+
+```
+                            TRAIN         HOLDOUT
+  model accuracy           50.21%          50.98%
+  edge over majority      -0.43 pp        +0.43 pp
+    z-score                 -1.52           +0.89
+  Brier skill score      -0.00087        +0.00047
+  size skill vs EWMA      +11.74%          +7.59%
+  80% band coverage        79.67%          76.20%
+```
+
+Read carefully, because this is where people fool themselves. The holdout colour
+BSS is **positive** — and it means nothing: z = +0.89 is well inside noise, and
+running the identical split with `--no-freeze` flips the same holdout to
+−0.05 pp (z −0.10). One switch, same data, the "edge" changes sign. That is the
+signature of noise, and it is exactly why the panel prints the z-score next to
+the edge rather than the edge alone.
+
+The size half tells a different and more useful story. Skill decays from +11.74%
+to +7.59% — real degradation, but it stays clearly positive on data the model
+never saw. And band coverage falls to 76.2% frozen versus 79.5% still-learning:
+**the multipliers are stable, the band calibration is not.** So freeze for the
+stationarity test, but in live use let the band keep updating.
+
+## Tuning without cheating
+
+`--tune` grids parameters on the TRAIN portion only, picks the winner there, and
+reads it once on the holdout. It also reports where the train-best config
+*actually ranks* on the holdout, which is the diagnostic that matters:
+
+```
+colour — train-best: N=1  s_link=200    train BSS -0.00004  ->  holdout +0.00051
+         holdout spread over the grid: -0.00133 .. +0.00059
+         train-best lands at the 67th percentile on holdout
+
+size   — train-best: lambda=0.97 shrink=40 size_n=2   train +16.90% -> holdout +11.76%
+         holdout spread over the grid: +3.52% .. +12.29%
+         train-best lands at the 92nd percentile on holdout
+```
+
+If tuning were pure noise-chasing the train-best config would land near the 50th
+percentile on holdout — no better than picking at random. Colour lands at the
+67th: barely distinguishable from chance, and its selected config still scores an
+accuracy edge of −0.00 pp. **Do not tune the colour model.** Size lands at the
+92nd: the selection transfers, and it lifts holdout skill from +7.59% at the
+defaults to **+11.76%** — a 55% relative improvement that survives on data the
+grid never touched.
+
+The concrete finding: `lambda = 0.97` beats the 0.94 default. The RiskMetrics
+convention is calibrated for daily returns, not 15-minute candle ranges, and a
+slower EWMA fits this series better.
+
 ## Anti-repainting
 
 The ordering inside a confirmed bar is the whole design:
@@ -156,6 +238,12 @@ the live bar are labelled: the probability ladder, and the optional
 - **SCORECARD** — Brier skill score above 0 means the probability forecast beats
   the base rate; the z-score tests the accuracy edge against always-majority.
   "Size MAE vs EWMA" above 0 means the state multiplier is earning its keep.
+  With the split on, the left column is TRAIN and the right is HOLDOUT; the right
+  column is the one that counts. **A positive BSS with |z| below 2 is noise, not
+  an edge** — the split section above shows the same holdout flipping sign on a
+  single setting change.
+- **Size skill carried over** — holdout skill minus train skill. Above −3 pp the
+  parameters generalise; below −8 pp they were fitted to the training window.
 - **Verdict row** — collapses the above into one line, so the script cannot be
   mistaken for a signal generator on a symbol where it has no skill.
 
@@ -173,6 +261,10 @@ Leave that gate on.
   autocorrelated, so the true effective sample size is smaller than `n` and the
   z is mildly optimistic. It does not change the conclusion here — the edge is
   negative, and a correction only widens the interval around zero.
+- **The split is an evaluation tool, not a live-trading mode.** Leaving
+  `i_freeze` on during live use means the model stops learning at the boundary
+  and never resumes. Turn the split off, or set freeze off, once you are done
+  evaluating.
 - **The band calibration window is a rolling sort.** At `i_bandWin` above ~1000
   on a long intraday chart this is the slowest part of the script.
 - Compiled against the v6 language rules but not run through TradingView's
@@ -185,6 +277,13 @@ Leave that gate on.
 python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --nprev 3
 python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --sweep
 python3 backtest_next_candle_predictor.py data/es1_3m_tradingview.csv --basis close_close
+
+# train / holdout split, model frozen at the boundary
+python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75
+python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75 --no-freeze
+
+# grid on train only, one read on the holdout (~65s)
+python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75 --tune
 ```
 
 The replica shares the model exactly — same pattern encoding, same back-off,

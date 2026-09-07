@@ -20,9 +20,23 @@ Two models are measured independently:
          (state = colour pattern x volatility bucket), shrunk toward 1.0.
          Benchmark: the plain EWMA (multiplier fixed at 1.0).
 
+TRAIN / HOLDOUT SPLIT
+Pass --split 0.75 to learn on the first 75% of the candles and report the last
+25% separately. With --freeze (the default) the model stops learning at the
+boundary, so the holdout answers a question walk-forward cannot: does what the
+model learned in the past still hold later, or has the market moved underneath
+it? The gap between the two columns is the overfit/decay measure.
+
+--tune runs a parameter grid on the TRAIN portion only, picks the winner there,
+and reports it once on the untouched holdout. It also prints where the
+train-best config actually ranks on the holdout — if it lands mid-pack, the
+tuning surface is noise and you should not tune.
+
 Usage:
     python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv
     python3 backtest_next_candle_predictor.py data/es1_3m_tradingview.csv --nprev 5
+    python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75
+    python3 backtest_next_candle_predictor.py data/es1_15m_tradingview.csv --split 0.75 --tune
 """
 
 from __future__ import annotations
@@ -162,82 +176,115 @@ def pct(sorted_vals, p):
 # -----------------------------------------------------------------------------
 # walk-forward run
 # -----------------------------------------------------------------------------
+def _blank():
+    return {"n": 0, "hits": 0, "green": 0, "brier": 0.0, "brier_ref": 0.0,
+            "ll": 0.0, "n_sz": 0, "mae": 0.0, "mae_ref": 0.0, "cover": 0,
+            "ape": 0.0, "body": 0.0, "body_n": 0}
+
+
+def _metrics(a):
+    """Turn raw accumulators into the numbers the panel reports."""
+    if not a["n"]:
+        return {"n": 0}
+    base = a["green"] / a["n"]
+    maj = max(base, 1 - base)
+    acc = a["hits"] / a["n"]
+    se = math.sqrt(maj * (1 - maj) / a["n"])
+    bs = a["brier"] / a["n"]
+    bs_ref = a["brier_ref"] / a["n"]
+    m = {
+        "n": a["n"], "base_green": base, "majority": maj, "accuracy": acc,
+        "edge": acc - maj, "z": (acc - maj) / se if se > 0 else 0.0,
+        "brier": bs, "brier_base": bs_ref,
+        "bss": 1 - bs / bs_ref if bs_ref > 0 else 0.0,
+        "logloss": a["ll"] / a["n"],
+    }
+    if a["n_sz"]:
+        m.update(n_size=a["n_sz"], mae=a["mae"] / a["n_sz"],
+                 mae_naive=a["mae_ref"] / a["n_sz"],
+                 skill=1 - a["mae"] / a["mae_ref"] if a["mae_ref"] > 0 else 0.0,
+                 mape=100 * a["ape"] / a["n_sz"],
+                 coverage=100 * a["cover"] / a["n_sz"],
+                 body_ratio=a["body"] / a["body_n"] if a["body_n"] else float("nan"))
+    return m
+
+
 def run(bars, nprev=3, s_link=50.0, s_root=10.0, lam=0.94, s_mult=40.0,
         size_n=2, burn_in=500, band_win=300, band_lo=0.10, band_hi=0.90,
-        basis="close_open"):
+        basis="close_open", split=None, freeze=True):
+    """Walk the bars once. Returns {"train": {...}, "hold": {...}}.
+
+    With split=None every scored bar lands in "train" and nothing is frozen —
+    that is the pure walk-forward mode. With split=0.75 the first 75% of bars
+    feed the model, the last 25% are scored separately, and (unless freeze is
+    False) the model stops learning at the boundary.
+    """
     if basis == "close_close":
         colors = [1] + [1 if bars[i][3] > bars[i - 1][3] else 0
                         for i in range(1, len(bars))]
     else:
         colors = [1 if c > o else 0 for o, h, l, c in bars]
 
+    split_at = int(len(bars) * split) if split else len(bars) + 1
+
     cm = ColorModel(nprev, s_link, s_root)
     sm = SizeModel(lam, s_mult, size_n)
-
-    n_sc = hits = green_seen = 0
-    brier = brier_base = logloss = 0.0
-    lvl_hits = [0] * (nprev + 1)
-    lvl_n = [0] * (nprev + 1)
-
-    n_sz = cover = 0
-    mae = mae_naive = ape = 0.0
+    acc = {"train": _blank(), "hold": _blank()}
     err_win = []
-    body_sum = body_cnt = 0.0
-
-    pend = None      # forecast built at the close of bar t-1, scored on bar t
+    pend = None
 
     for t in range(len(bars)):
         o, h, l, c = bars[t]
         rng = h - l
         body = abs(c - o)
-        prev_ew = sm.ew                       # EWMA as of the close of bar t-1
+        prev_ew = sm.ew
+        hold = t >= split_at
+        phase = "hold" if hold else "train"
+        # The EWMA is state, not a fitted parameter: freezing it would only make
+        # the holdout predict stale volatility. The counts are what get frozen.
+        learn = not (hold and freeze)
 
         # -- 1. score the forecast made at the close of bar t-1 ---------------
         if pend is not None:
             y = colors[t]
-            scoring = t > burn_in
-            if scoring:
-                n_sc += 1
-                green_seen += y
-                hits += 1 if ((pend["p"] >= 0.5) == (y == 1)) else 0
-                brier += (pend["p"] - y) ** 2
-                brier_base += (pend["base"] - y) ** 2
+            a = acc[phase]
+            if t > burn_in:
+                a["n"] += 1
+                a["green"] += y
+                a["hits"] += 1 if ((pend["p"] >= 0.5) == (y == 1)) else 0
+                a["brier"] += (pend["p"] - y) ** 2
+                a["brier_ref"] += (pend["base"] - y) ** 2
                 pc = min(max(pend["p"], 1e-6), 1 - 1e-6)
-                logloss += -(y * math.log(pc) + (1 - y) * math.log(1 - pc))
-                for k in range(1, nprev + 1):
-                    lvl_n[k] += 1
-                    lvl_hits[k] += 1 if ((pend["lad"][k - 1] >= 0.5) == (y == 1)) else 0
-
-            if pend["rng"] > 0:
-                if scoring:
-                    n_sz += 1
-                    mae += abs(pend["rng"] - rng)
-                    mae_naive += abs(pend["naive"] - rng)
-                    ape += (abs(pend["rng"] - rng) / rng) if rng > 0 else 0.0
+                a["ll"] += -(y * math.log(pc) + (1 - y) * math.log(1 - pc))
+                if pend["rng"] > 0:
+                    a["n_sz"] += 1
+                    a["mae"] += abs(pend["rng"] - rng)
+                    a["mae_ref"] += abs(pend["naive"] - rng)
+                    a["ape"] += (abs(pend["rng"] - rng) / rng) if rng > 0 else 0.0
                     if not math.isnan(pend["lo"]) and pend["lo"] <= rng <= pend["hi"]:
-                        cover += 1
-                # the error window is a rolling calibration sample, always fed
+                        a["cover"] += 1
+                    if rng > 0:
+                        a["body"] += body / rng
+                        a["body_n"] += 1
+
+            if learn and pend["rng"] > 0:
                 err_win.append(rng / pend["rng"])
                 if len(err_win) > band_win:
                     err_win.pop(0)
 
-            # the state that was live when the forecast was made now has an
-            # outcome attached to it -> fold the realised ratio into that state
-            if pend["state"] is not None and pend["ew"] > 0:
+            if learn and pend["state"] is not None and pend["ew"] > 0:
                 st = pend["state"]
                 sm.sum_r[st] += rng / pend["ew"]
                 sm.cnt[st] += 1.0
                 if rng > 0:
                     sm.body_r[st] += body / rng
                     sm.body_c[st] += 1.0
-                    body_sum += body / rng
-                    body_cnt += 1.0
 
         # -- 2. fold bar t's colour outcome into the Markov counts ------------
-        if t >= MAXN + 2:
+        if learn and t >= MAXN + 2:
             cm.update(colors, t, 0)
 
-        # -- 3. advance the EWMA with bar t, then forecast bar t+1 ------------
+        # -- 3. advance the EWMA, then forecast bar t+1 -----------------------
         sm.ew = rng if prev_ew is None else lam * prev_ew + (1 - lam) * rng
 
         pend = None
@@ -254,62 +301,125 @@ def run(bars, nprev=3, s_link=50.0, s_root=10.0, lam=0.94, s_mult=40.0,
                 "hi": prng * pct(sw, band_hi) if enough else float("nan"),
             }
 
-    # -- report ---------------------------------------------------------------
-    res = {"n": n_sc}
-    if n_sc:
-        base_green = green_seen / n_sc
-        majority = max(base_green, 1 - base_green)
-        acc = hits / n_sc
-        se = math.sqrt(majority * (1 - majority) / n_sc)
-        res.update(
-            base_green=base_green,
-            majority=majority,
-            accuracy=acc,
-            edge=acc - majority,
-            z=(acc - majority) / se if se > 0 else 0.0,
-            brier=brier / n_sc,
-            brier_base=brier_base / n_sc,
-            bss=1 - (brier / n_sc) / (brier_base / n_sc) if brier_base > 0 else 0.0,
-            logloss=logloss / n_sc,
-            levels=[(k, lvl_hits[k] / lvl_n[k]) for k in range(1, nprev + 1) if lvl_n[k]],
-        )
-    if n_sz:
-        res.update(
-            n_size=n_sz,
-            mae=mae / n_sz,
-            mae_naive=mae_naive / n_sz,
-            skill=1 - (mae / n_sz) / (mae_naive / n_sz),
-            mape=100 * ape / n_sz,
-            coverage=100 * cover / n_sz,
-            body_ratio=body_sum / body_cnt if body_cnt else float("nan"),
-        )
-    return res
+    return {"train": _metrics(acc["train"]), "hold": _metrics(acc["hold"])}
 
 
-def report(name, r):
+def _fmt_pair(a, b, key, scale=1.0, fmt="{:+.2f}", suffix=""):
+    def one(m):
+        if not m.get("n") or key not in m:
+            return "-"
+        return fmt.format(m[key] * scale) + suffix
+    return one(a), one(b)
+
+
+def report(name, res, split=None):
+    tr, ho = res["train"], res["hold"]
+    two = bool(split) and ho.get("n")
+    ca, cb = ("TRAIN", "HOLDOUT") if two else ("WALK-FORWARD", "")
+
     print(f"\n=== {name} ===")
-    if not r.get("n"):
+    if not tr.get("n"):
         print("  no scored bars")
         return
-    print(f"  scored bars                {r['n']}")
-    print("  -- colour ------------------------------------------------")
-    print(f"  base rate P(green)         {r['base_green']*100:6.2f}%")
-    print(f"  always-majority accuracy   {r['majority']*100:6.2f}%   <- the bar to beat")
-    print(f"  model accuracy             {r['accuracy']*100:6.2f}%")
-    print(f"  edge over majority         {r['edge']*100:+6.2f} pp   (z = {r['z']:+.2f})")
-    print(f"  Brier  model / base-rate   {r['brier']:.5f} / {r['brier_base']:.5f}")
-    print(f"  Brier skill score          {r['bss']:+.5f}   <- >0 means real skill")
-    print(f"  log loss                   {r['logloss']:.5f}")
-    print("  accuracy by back-off level: " +
-          "  ".join(f"L{k}={a*100:.2f}%" for k, a in r["levels"]))
-    if "n_size" in r:
-        print("  -- size --------------------------------------------------")
-        print(f"  MAE model / plain EWMA     {r['mae']:.4f} / {r['mae_naive']:.4f}")
-        print(f"  size skill vs EWMA         {r['skill']*100:+6.2f}%   <- >0 means the")
-        print("                                        state multiplier adds value")
-        print(f"  MAPE                       {r['mape']:6.2f}%")
-        print(f"  80% band coverage          {r['coverage']:6.2f}%   (target 80%)")
-        print(f"  mean body/range            {r['body_ratio']:6.3f}")
+    w = 16
+    print(f"  {'':26}{ca:>{w}}{cb:>{w}}")
+    print(f"  {'scored bars':26}{tr['n']:>{w},}" +
+          (f"{ho['n']:>{w},}" if two else ""))
+
+    print("  -- colour " + "-" * 46)
+    for label, key, sc, fmt, sfx in [
+            ("base rate P(green)",   "base_green", 100, "{:.2f}",  "%"),
+            ("always-majority acc.", "majority",   100, "{:.2f}",  "%"),
+            ("model accuracy",       "accuracy",   100, "{:.2f}",  "%"),
+            ("edge over majority",   "edge",       100, "{:+.2f}", " pp"),
+            ("  z-score",            "z",            1, "{:+.2f}", ""),
+            ("Brier skill score",    "bss",          1, "{:+.5f}", ""),
+            ("log loss",             "logloss",      1, "{:.5f}",  "")]:
+        a, b = _fmt_pair(tr, ho, key, sc, fmt, sfx)
+        print(f"  {label:26}{a:>{w}}" + (f"{b:>{w}}" if two else ""))
+
+    if "n_size" in tr:
+        print("  -- size " + "-" * 48)
+        for label, key, sc, fmt, sfx in [
+                ("MAE",               "mae",       1, "{:.4f}",  ""),
+                ("MAE, plain EWMA",   "mae_naive", 1, "{:.4f}",  ""),
+                ("skill vs EWMA",     "skill",   100, "{:+.2f}", "%"),
+                ("MAPE",              "mape",      1, "{:.2f}",  "%"),
+                ("80% band coverage", "coverage",  1, "{:.2f}",  "%")]:
+            a, b = _fmt_pair(tr, ho, key, sc, fmt, sfx)
+            print(f"  {label:26}{a:>{w}}" + (f"{b:>{w}}" if two else ""))
+
+    if two and "skill" in tr and "skill" in ho:
+        print("  -- decay " + "-" * 47)
+        print(f"  {'size skill drop':26}{'':>{w}}"
+              f"{(ho['skill'] - tr['skill']) * 100:>+{w}.2f} pp")
+
+
+# -----------------------------------------------------------------------------
+# parameter tuning — grid on TRAIN only, one read on HOLDOUT
+# -----------------------------------------------------------------------------
+def _rank_of(values, target, higher_is_better=True):
+    """Percentile rank of `target` within `values`. 100 = best, 50 = mid-pack."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return float("nan")
+    better = sum(1 for v in vals if (v > target if higher_is_better else v < target))
+    return 100.0 * (1.0 - better / len(vals))
+
+
+def _grid_note(label, ho_vals, chosen, scale=1.0, fmt="{:+.5f}"):
+    lo = min(v for v in ho_vals if v is not None) * scale
+    hi = max(v for v in ho_vals if v is not None) * scale
+    rk = _rank_of(ho_vals, chosen)
+    print(f"         holdout spread over the grid: {fmt.format(lo)} .. "
+          f"{fmt.format(hi)}")
+    print(f"         the train-best config lands at the {rk:.0f}th percentile "
+          f"on holdout   (~50th = tuning bought nothing)")
+
+
+def tune(bars, split=0.75, burn_in=500, basis="close_open", freeze=True):
+    print(f"\n{'=' * 68}")
+    print(f"TUNING — grid fitted on the first {split * 100:.0f}% of the bars, "
+          f"read once on the rest")
+    print("=" * 68)
+
+    # -- colour grid: pattern length x back-off strength ----------------------
+    grid_c, res_c = [], []
+    for n in (1, 2, 3, 4, 5):
+        for sl in (10.0, 50.0, 200.0):
+            grid_c.append((n, sl))
+            res_c.append(run(bars, nprev=n, s_link=sl, burn_in=burn_in,
+                             basis=basis, split=split, freeze=freeze))
+    tr_c = [r["train"].get("bss") for r in res_c]
+    ho_c = [r["hold"].get("bss") for r in res_c]
+    bi = max(range(len(tr_c)), key=lambda i: tr_c[i] if tr_c[i] is not None else -9)
+    print(f"\ncolour — train-best: N={grid_c[bi][0]}  s_link={grid_c[bi][1]:.0f}"
+          f"   train BSS {tr_c[bi]:+.5f}  ->  holdout BSS {ho_c[bi]:+.5f}")
+    _grid_note("colour", ho_c, ho_c[bi])
+
+    # -- size grid: EWMA decay x shrink strength x colour context -------------
+    grid_s, res_s = [], []
+    for lam in (0.90, 0.94, 0.97):
+        for smu in (10.0, 40.0, 100.0):
+            for sn in (0, 1, 2, 3):
+                grid_s.append((lam, smu, sn))
+                res_s.append(run(bars, lam=lam, s_mult=smu, size_n=sn,
+                                 burn_in=burn_in, basis=basis, split=split,
+                                 freeze=freeze))
+    tr_s = [r["train"].get("skill") for r in res_s]
+    ho_s = [r["hold"].get("skill") for r in res_s]
+    bj = max(range(len(tr_s)), key=lambda i: tr_s[i] if tr_s[i] is not None else -9)
+    lam, smu, sn = grid_s[bj]
+    print(f"\nsize   — train-best: lambda={lam}  shrink={smu:.0f}  size_n={sn}"
+          f"   train {tr_s[bj] * 100:+.2f}%  ->  holdout {ho_s[bj] * 100:+.2f}%")
+    _grid_note("size", ho_s, ho_s[bj], 100.0, "{:+.2f}%")
+
+    n, sl = grid_c[bi]
+    best = run(bars, nprev=n, s_link=sl, lam=lam, s_mult=smu, size_n=sn,
+               burn_in=burn_in, basis=basis, split=split, freeze=freeze)
+    report(f"SELECTED  N={n} s_link={sl:.0f} lambda={lam} shrink={smu:.0f} "
+           f"size_n={sn}", best, split)
+    return best
 
 
 def main():
@@ -319,6 +429,15 @@ def main():
     ap.add_argument("--nprev", type=int, default=3)
     ap.add_argument("--sweep", action="store_true",
                     help="run every pattern length 1..8 and compare")
+    ap.add_argument("--split", type=float, default=None, metavar="F",
+                    help="learn on the first F of the bars, report the rest "
+                         "separately (e.g. 0.75)")
+    ap.add_argument("--no-freeze", action="store_true",
+                    help="keep learning through the holdout instead of freezing "
+                         "the counts at the split")
+    ap.add_argument("--tune", action="store_true",
+                    help="grid-search on the train portion only, then read the "
+                         "winner once on the holdout")
     ap.add_argument("--basis", choices=["close_open", "close_close"],
                     default="close_open")
     ap.add_argument("--burn-in", type=int, default=500)
@@ -327,15 +446,26 @@ def main():
     if not os.path.exists(args.csv):
         sys.exit(f"no such file: {args.csv}")
     bars = load_ohlc(args.csv)
+    freeze = not args.no_freeze
     print(f"loaded {len(bars)} bars from {args.csv}  (basis: {args.basis})")
+    if args.split:
+        cut = int(len(bars) * args.split)
+        print(f"split at bar {cut}: {cut} train / {len(bars) - cut} holdout"
+              f"   (model {'frozen' if freeze else 'still learning'} in holdout)")
 
-    if args.sweep:
+    if args.tune:
+        tune(bars, split=args.split or 0.75, burn_in=args.burn_in,
+             basis=args.basis, freeze=freeze)
+    elif args.sweep:
         for n in range(1, MAXN + 1):
             report(f"N = {n}", run(bars, nprev=n, burn_in=args.burn_in,
-                                   basis=args.basis))
+                                   basis=args.basis, split=args.split,
+                                   freeze=freeze), args.split)
     else:
-        report(f"N = {args.nprev}", run(bars, nprev=args.nprev,
-                                        burn_in=args.burn_in, basis=args.basis))
+        report(f"N = {args.nprev}",
+               run(bars, nprev=args.nprev, burn_in=args.burn_in,
+                   basis=args.basis, split=args.split, freeze=freeze),
+               args.split)
 
 
 if __name__ == "__main__":
