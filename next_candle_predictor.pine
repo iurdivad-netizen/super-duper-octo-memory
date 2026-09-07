@@ -41,6 +41,16 @@
 // Run backtest_next_candle_predictor.py to reproduce those numbers, or just
 // watch the SCORECARD rows fill in on your own symbol.
 //
+// TRAIN / HOLDOUT SPLIT
+// Optionally learn on the first 75% of the chart and score the last 25%
+// separately, with learning frozen at the boundary. That answers a question
+// walk-forward cannot: does what the model learned in the past still hold
+// later? The panel then shows both columns side by side and the gap between
+// them is the decay. Use it to sanity-check any parameter you tuned by
+// watching the panel — tune on TRAIN, then look at HOLDOUT exactly once.
+// The range EWMA keeps running through the holdout because it is state, not a
+// fitted parameter; freezing it would only forecast stale volatility.
+//
 // Repainting: nothing repaints. The displayed forecast is locked at the close
 // of the previous bar and is never revised while the bar it describes is
 // forming. An optional provisional row shows the next-bar forecast including
@@ -67,6 +77,20 @@ IDX_PER_CTX = 510
 SIZE_STATES = 24     // 3 volatility buckets x 8 colour patterns (levels 0..3)
 RENORM_CAP  = 1e100  // rescale decayed counts before they overflow
 
+// Scorecard slot layout, one stride per phase (0 = train, 1 = holdout).
+SC_N      = 0
+SC_HIT    = 1
+SC_GRN    = 2
+SC_BRI    = 3
+SC_REF    = 4
+SC_LL     = 5
+SC_STRIDE = 6
+SZ_N      = 0
+SZ_MAE    = 1
+SZ_REF    = 2
+SZ_COV    = 3
+SZ_STRIDE = 4
+
 
 // -----------------------------------------------------------------------------
 // INPUTS
@@ -74,6 +98,7 @@ RENORM_CAP  = 1e100  // rescale decayed counts before they overflow
 G_COL = "Colour model"
 G_SZE = "Size model"
 G_PRJ = "Projected candle"
+G_SPL = "Train / holdout split"
 G_QLT = "Scorecard"
 G_PNL = "Panel"
 G_ALT = "Alerts"
@@ -141,6 +166,23 @@ i_drawPrj = input.bool(true, "Draw projected candle", group = G_PRJ)
 i_prjUp   = input.color(color.new(color.teal, 55), "Projected up", group = G_PRJ)
 i_prjDn   = input.color(color.new(color.red, 55), "Projected down", group = G_PRJ)
 i_drawBand = input.bool(true, "Draw range band", group = G_PRJ)
+
+i_splitOn  = input.bool(false, "Enable train / holdout split", group = G_SPL,
+     tooltip = "Learn on the first part of the chart, score the rest separately. " +
+               "Off = pure walk-forward over every bar.")
+i_splitBy  = input.string("Percent of chart", "Split by",
+     options = ["Percent of chart", "Date"], group = G_SPL,
+     tooltip = "Percent moves forward as new bars arrive, so the boundary drifts. " +
+               "Date is fixed, which is what you want for a repeated read.")
+i_trainPct = input.float(75.0, "Train share of chart (%)", minval = 10.0,
+     maxval = 95.0, step = 5.0, group = G_SPL)
+i_splitTs  = input.time(timestamp("01 Jan 2025 00:00 +0000"), "Split date",
+     group = G_SPL)
+i_freeze   = input.bool(true, "Freeze learning in the holdout", group = G_SPL,
+     tooltip = "On: counts stop updating at the split, so the holdout tests whether " +
+               "past structure still holds. Off: keep learning, and the holdout is " +
+               "just walk-forward restricted to recent bars.")
+i_tint     = input.bool(true, "Tint the holdout region", group = G_SPL)
 
 i_burnIn  = input.int(500, "Burn-in bars before scoring", minval = 0, maxval = 20000,
      group = G_QLT,
@@ -217,6 +259,10 @@ f_wilson(float p, float n, float z) =>
         hi := (ctr + adj) / den
     [lo, hi]
 
+f_bump(array<float> a, int i, float v) =>
+    array.set(a, i, array.get(a, i) + v)
+    true
+
 f_scaleArr(array<float> a, float k) =>
     for i = 0 to array.size(a) - 1
         array.set(a, i, array.get(a, i) * k)
@@ -287,17 +333,34 @@ var float pendEw    = na
 var int   pendState = na
 var float pendN     = na
 
-// Scorecard.
-var float scN        = 0.0
-var float scHits     = 0.0
-var float scGreen    = 0.0
-var float scBrier    = 0.0
-var float scBrierRef = 0.0
-var float scLogLoss  = 0.0
-var float szN        = 0.0
-var float szMae      = 0.0
-var float szMaeRef   = 0.0
-var float szCover    = 0.0
+// Scorecard, kept twice: slot 0 is the training phase (or every bar when the
+// split is off), slot 1 is the holdout.
+var array<float> scA = array.new<float>(SC_STRIDE * 2, 0.0)
+var array<float> szA = array.new<float>(SZ_STRIDE * 2, 0.0)
+
+// Read one phase's scorecard back out. Kept as functions so the train and the
+// holdout columns are computed by identical code.
+f_colStats(int ph) =>
+    b   = ph * SC_STRIDE
+    n   = array.get(scA, b + SC_N)
+    acc = n > 0.0 ? array.get(scA, b + SC_HIT) / n : na
+    bse = n > 0.0 ? array.get(scA, b + SC_GRN) / n : na
+    maj = na(bse) ? na : math.max(bse, 1.0 - bse)
+    se  = na(maj) or n <= 0.0 ? na : math.sqrt(maj * (1.0 - maj) / n)
+    z   = na(se) or se <= 0.0 ? na : (acc - maj) / se
+    bs  = n > 0.0 ? array.get(scA, b + SC_BRI) / n : na
+    ref = n > 0.0 ? array.get(scA, b + SC_REF) / n : na
+    bss = na(bs) or na(ref) or ref <= 0.0 ? na : 1.0 - bs / ref
+    [n, acc, maj, z, bss]
+
+f_szStats(int ph) =>
+    b   = ph * SZ_STRIDE
+    n   = array.get(szA, b + SZ_N)
+    mae = n > 0.0 ? array.get(szA, b + SZ_MAE) / n : na
+    ref = n > 0.0 ? array.get(szA, b + SZ_REF) / n : na
+    sk  = na(mae) or na(ref) or ref <= 0.0 ? na : 1.0 - mae / ref
+    cov = n > 0.0 ? array.get(szA, b + SZ_COV) / n : na
+    [n, sk, cov]
 
 if barstate.isfirst
     int pw = 2
@@ -321,6 +384,14 @@ array.set(bits, 9, isGrn[9] ? 1 : 0)
 
 warm = bar_index >= MAXN + 3
 
+// -- train / holdout phase ----------------------------------------------------
+// The EWMA is deliberately NOT frozen below: it is state that must track current
+// volatility, not a parameter fitted to the training window.
+splitBar = math.floor(last_bar_index * i_trainPct / 100.0)
+inHold   = i_splitOn and (i_splitBy == "Date" ? time > i_splitTs : bar_index > splitBar)
+learnOK  = not inHold or not i_freeze
+phase    = inHold ? 1 : 0
+
 
 // -----------------------------------------------------------------------------
 // 1. SCORE THE FORECAST LOCKED AT THE PREVIOUS CLOSE
@@ -331,29 +402,34 @@ if barstate.isconfirmed and not na(pendP)
     y     = array.get(bits, 0)
     score = bar_index > i_burnIn
 
+    sb    = phase * SC_STRIDE
+    zb    = phase * SZ_STRIDE
+
     if score
-        scN       += 1.0
-        scGreen   += y
-        scHits    += ((pendP >= 0.5) == (y == 1)) ? 1.0 : 0.0
-        scBrier   += math.pow(pendP - y, 2)
-        scBrierRef += math.pow(pendBase - y, 2)
-        pc         = math.max(math.min(pendP, 0.999999), 0.000001)
-        scLogLoss += -(y * math.log(pc) + (1 - y) * math.log(1.0 - pc))
+        pc = math.max(math.min(pendP, 0.999999), 0.000001)
+        f_bump(scA, sb + SC_N,   1.0)
+        f_bump(scA, sb + SC_GRN, y)
+        f_bump(scA, sb + SC_HIT, ((pendP >= 0.5) == (y == 1)) ? 1.0 : 0.0)
+        f_bump(scA, sb + SC_BRI, math.pow(pendP - y, 2))
+        f_bump(scA, sb + SC_REF, math.pow(pendBase - y, 2))
+        f_bump(scA, sb + SC_LL,  -(y * math.log(pc) + (1 - y) * math.log(1.0 - pc)))
 
     if pendRng > 0.0
         if score
-            szN     += 1.0
-            szMae   += math.abs(pendRng - rngBar)
-            szMaeRef += math.abs(pendNaive - rngBar)
-            szCover += (not na(pendLo) and rngBar >= pendLo and rngBar <= pendHi) ? 1.0 : 0.0
-        // The calibration window is always fed, burn-in or not.
-        array.push(errWin, rngBar / pendRng)
-        if array.size(errWin) > i_bandWin
-            array.shift(errWin)
+            f_bump(szA, zb + SZ_N,   1.0)
+            f_bump(szA, zb + SZ_MAE, math.abs(pendRng - rngBar))
+            f_bump(szA, zb + SZ_REF, math.abs(pendNaive - rngBar))
+            f_bump(szA, zb + SZ_COV,
+                 (not na(pendLo) and rngBar >= pendLo and rngBar <= pendHi) ? 1.0 : 0.0)
+        // Band calibration is a fitted quantity, so it freezes with the rest.
+        if learnOK
+            array.push(errWin, rngBar / pendRng)
+            if array.size(errWin) > i_bandWin
+                array.shift(errWin)
 
     // 2. Attach this bar's outcome to the size state that was live when the
     //    forecast was made. This is the only place sSum/sCnt ever grow.
-    if not na(pendState) and pendEw > 0.0
+    if learnOK and not na(pendState) and pendEw > 0.0
         array.set(sSum, pendState, array.get(sSum, pendState) + rngBar / pendEw)
         array.set(sCnt, pendState, array.get(sCnt, pendState) + 1.0)
         if rngBar > 0.0
@@ -378,7 +454,7 @@ if barstate.isconfirmed and not na(pendP)
 // The key to the whole script: the pattern is read at offset 1 (the bars BEFORE
 // this one) and the outcome is this bar. A forecast is therefore always built
 // from counts that cannot contain the bar it is forecasting.
-if barstate.isconfirmed and warm
+if barstate.isconfirmed and warm and learnOK
     yNow   = array.get(bits, 0)
     ctxUpd = nz(ctx[1], 0)                 // regime as it stood at the pattern
     gTot  += wNow
@@ -479,16 +555,21 @@ if barstate.isconfirmed and warm
 // -----------------------------------------------------------------------------
 // SCORECARD DERIVATIONS
 // -----------------------------------------------------------------------------
-scAcc   = scN > 0.0 ? scHits / scN : na
-scBase  = scN > 0.0 ? scGreen / scN : na
-scMaj   = na(scBase) ? na : math.max(scBase, 1.0 - scBase)
-scSe    = na(scMaj) or scN <= 0.0 ? na : math.sqrt(scMaj * (1.0 - scMaj) / scN)
-scZ     = na(scSe) or scSe <= 0.0 ? na : (scAcc - scMaj) / scSe
-bs      = scN > 0.0 ? scBrier / scN : na
-bsRef   = scN > 0.0 ? scBrierRef / scN : na
-bss     = na(bs) or na(bsRef) or bsRef <= 0.0 ? na : 1.0 - bs / bsRef
-szSkill = szN > 0.0 and szMaeRef > 0.0 ? 1.0 - (szMae / szMaeRef) : na
-szCov   = szN > 0.0 ? szCover / szN : na
+[trN, trAcc, trMaj, trZ, trBss] = f_colStats(0)
+[hoN, hoAcc, hoMaj, hoZ, hoBss] = f_colStats(1)
+[trSzN, trSk, trCov] = f_szStats(0)
+[hoSzN, hoSk, hoCov] = f_szStats(1)
+
+// The verdict always reads the untouched data: the holdout when a split is on,
+// otherwise the single walk-forward column.
+useHold = i_splitOn and hoN > 0.0
+scN     = useHold ? hoN   : trN
+scAcc   = useHold ? hoAcc : trAcc
+scMaj   = useHold ? hoMaj : trMaj
+scZ     = useHold ? hoZ   : trZ
+bss     = useHold ? hoBss : trBss
+szSkill = useHold ? hoSk  : trSk
+szCov   = useHold ? hoCov : trCov
 
 // The displayed forecast is the one locked at the previous close — it describes
 // the bar that is forming right now and does not move while it forms.
@@ -541,15 +622,28 @@ if barstate.islast
 // -----------------------------------------------------------------------------
 // PANEL
 // -----------------------------------------------------------------------------
-var table pnl = table.new(f_pos(i_pnlPos), 2, 24,
+var table pnl = table.new(f_pos(i_pnlPos), 3, 27,
      bgcolor = color.new(color.black, 15), border_width = 1,
      border_color = color.new(color.gray, 60), frame_width = 1,
      frame_color = color.new(color.gray, 40))
 
+// Single-value rows put the value in the rightmost column so it lines up with
+// the HOLDOUT column of the comparative rows below it.
 f_row(int r, string k, string v, color vc) =>
     table.cell(pnl, 0, r, k, text_color = color.new(color.silver, 0),
          text_size = f_txt(i_pnlSize), text_halign = text.align_left)
-    table.cell(pnl, 1, r, v, text_color = vc,
+    table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
+    table.cell(pnl, 2, r, v, text_color = vc,
+         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+    true
+
+// Comparative row: train value in column 1, holdout value in column 2.
+f_row2(int r, string k, string v1, color c1, string v2, color c2) =>
+    table.cell(pnl, 0, r, k, text_color = color.new(color.silver, 0),
+         text_size = f_txt(i_pnlSize), text_halign = text.align_left)
+    table.cell(pnl, 1, r, v1, text_color = c1,
+         text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+    table.cell(pnl, 2, r, v2, text_color = c2,
          text_size = f_txt(i_pnlSize), text_halign = text.align_right)
     true
 
@@ -557,10 +651,11 @@ f_hdr(int r, string s) =>
     table.cell(pnl, 0, r, s, text_color = color.new(color.aqua, 0),
          text_size = f_txt(i_pnlSize), text_halign = text.align_left)
     table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
+    table.cell(pnl, 2, r, "", text_size = f_txt(i_pnlSize))
     true
 
 if barstate.islast and i_showPnl
-    table.clear(pnl, 0, 0, 1, 23)
+    table.clear(pnl, 0, 0, 2, 26)
     int r = 0
 
     f_hdr(r, "COLOUR — bar now forming")
@@ -620,44 +715,94 @@ if barstate.islast and i_showPnl
          str.tostring(sState, "#"), color.silver)
     r += 1
 
-    f_hdr(r, "SCORECARD — walk-forward, out-of-sample")
+    f_hdr(r, "SCORECARD — out-of-sample")
     r += 1
-    f_row(r, "Scored bars", str.tostring(scN, "#"),
-         scN < 200 ? color.orange : color.silver)
+
+    // Column header. With the split off there is only one column of numbers and
+    // it sits on the right, where the HOLDOUT column would be.
+    f_row2(r, "", i_splitOn ? "TRAIN" : "", color.new(color.aqua, 30),
+         i_splitOn ? "HOLDOUT" : "WALK-FWD", color.new(color.aqua, 0))
     r += 1
-    f_row(r, "Colour accuracy", f_pctStr(scAcc), color.white)
+
+    if i_splitOn
+        splitTxt = switch
+            i_splitBy == "Date" =>
+                 str.format_time(i_splitTs, "yyyy-MM-dd", syminfo.timezone)
+            => "bar " + str.tostring(splitBar, "#") + "/" +
+                 str.tostring(last_bar_index, "#")
+        f_row(r, "Split at / holdout", splitTxt + "  " +
+             (i_freeze ? "(frozen)" : "(still learning)"),
+             color.new(color.aqua, 30))
+        r += 1
+
+    // -- comparative rows -----------------------------------------------------
+    f_row2(r, "Scored bars",
+         i_splitOn ? str.tostring(trN, "#") : "", color.silver,
+         str.tostring(i_splitOn ? hoN : trN, "#"),
+         (i_splitOn ? hoN : trN) < 200 ? color.orange : color.silver)
     r += 1
-    f_row(r, "  always-majority", f_pctStr(scMaj), color.silver)
+    f_row2(r, "Colour accuracy",
+         i_splitOn ? f_pctStr(trAcc) : "", color.silver,
+         f_pctStr(i_splitOn ? hoAcc : trAcc), color.white)
     r += 1
-    accEdge = na(scAcc) or na(scMaj) ? na : scAcc - scMaj
-    f_row(r, "  edge (z)",
-         na(accEdge) ? "n/a" : f_sgnStr(accEdge * 100.0, "#.##") + " pp  (z " +
-         f_sgnStr(scZ, "#.##") + ")",
-         na(accEdge) ? color.gray : (accEdge > 0 ? color.lime : color.red))
+    f_row2(r, "  always-majority",
+         i_splitOn ? f_pctStr(trMaj) : "", color.silver,
+         f_pctStr(i_splitOn ? hoMaj : trMaj), color.silver)
     r += 1
-    f_row(r, "Brier skill score",
-         na(bss) ? "n/a" : f_sgnStr(bss, "#.#####"),
+
+    trEdge = na(trAcc) or na(trMaj) ? na : trAcc - trMaj
+    hoEdge = na(hoAcc) or na(hoMaj) ? na : hoAcc - hoMaj
+    shEdge = i_splitOn ? hoEdge : trEdge
+    shZ    = i_splitOn ? hoZ : trZ
+    f_row2(r, "  edge (z)",
+         not i_splitOn ? "" : na(trEdge) ? "n/a" :
+              f_sgnStr(trEdge * 100.0, "#.##") + " (" + f_sgnStr(trZ, "#.#") + ")",
+         na(trEdge) ? color.gray : (trEdge > 0 ? color.lime : color.red),
+         na(shEdge) ? "n/a" :
+              f_sgnStr(shEdge * 100.0, "#.##") + " pp (z " + f_sgnStr(shZ, "#.#") + ")",
+         na(shEdge) ? color.gray : (shEdge > 0 ? color.lime : color.red))
+    r += 1
+
+    f_row2(r, "Brier skill score",
+         not i_splitOn ? "" : na(trBss) ? "n/a" : f_sgnStr(trBss, "#.####"),
+         na(trBss) ? color.gray : (trBss > 0 ? color.lime : color.red),
+         na(i_splitOn ? hoBss : trBss) ? "n/a" :
+              f_sgnStr(i_splitOn ? hoBss : trBss, "#.#####"),
          na(bss) ? color.gray : (bss > 0 ? color.lime : color.red))
     r += 1
-    f_row(r, "Size MAE vs EWMA",
+
+    f_row2(r, "Size MAE vs EWMA",
+         not i_splitOn ? "" : na(trSk) ? "n/a" : f_sgnStr(trSk * 100.0, "#.#") + "%",
+         na(trSk) ? color.gray : (trSk > 0 ? color.lime : color.red),
          na(szSkill) ? "n/a" : f_sgnStr(szSkill * 100.0, "#.##") + "%",
          na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red))
     r += 1
-    f_row(r, "Band coverage",
-         na(szCov) ? "n/a" : f_pctStr(szCov) + "  (target " +
-         str.tostring(i_bandHi - i_bandLo, "#") + "%)", color.silver)
+
+    f_row2(r, "Band coverage (t " + str.tostring(i_bandHi - i_bandLo, "#") + "%)",
+         not i_splitOn ? "" : f_pctStr(trCov), color.silver,
+         f_pctStr(szCov), color.silver)
     r += 1
+
+    // How much of the training-window skill survived into the untouched data.
+    // A large drop means the parameters were fitted to the training window.
+    if i_splitOn and not na(trSk) and not na(hoSk)
+        drop = (hoSk - trSk) * 100.0
+        f_row(r, "  size skill carried over",
+             f_sgnStr(drop, "#.##") + " pp",
+             drop > -3.0 ? color.lime : drop > -8.0 ? color.yellow : color.red)
+        r += 1
 
     // The verdict. This row exists so the script cannot be mistaken for a
     // signal generator on a symbol where the colour model has no skill.
     thin    = na(bss) or scN < 200
     sig     = not thin and bss > 0 and not na(scZ) and scZ > 2.0
     marg    = not thin and bss > 0 and not sig
+    scope   = useHold ? "HOLDOUT" : "WALK-FWD"
     verdict = switch
-        thin => "COLOUR: not enough data yet"
-        sig  => "COLOUR: edge, keep testing"
-        marg => "COLOUR: marginal, not significant"
-        =>      "COLOUR: NO EDGE — trade the size row"
+        thin => scope + " COLOUR: not enough data yet"
+        sig  => scope + " COLOUR: edge, keep testing"
+        marg => scope + " COLOUR: marginal, not significant"
+        =>      scope + " COLOUR: NO EDGE — trade the size row"
     vClr = switch
         thin => color.gray
         sig  => color.lime
@@ -665,10 +810,17 @@ if barstate.islast and i_showPnl
         =>      color.red
     table.cell(pnl, 0, r, verdict, text_color = vClr, text_size = f_txt(i_pnlSize),
          text_halign = text.align_left)
-    table.cell(pnl, 1, r,
+    table.cell(pnl, 1, r, "", text_size = f_txt(i_pnlSize))
+    table.cell(pnl, 2, r,
          na(szSkill) ? "" : (szSkill > 0 ? "SIZE: usable" : "SIZE: no gain"),
          text_color = na(szSkill) ? color.gray : (szSkill > 0 ? color.lime : color.red),
          text_size = f_txt(i_pnlSize), text_halign = text.align_right)
+
+
+// The holdout region, tinted so it is obvious which bars the right-hand column
+// of the scorecard was measured on.
+bgcolor(i_splitOn and i_tint and inHold ? color.new(color.blue, 93) : na,
+     title = "Holdout region")
 
 
 // -----------------------------------------------------------------------------
