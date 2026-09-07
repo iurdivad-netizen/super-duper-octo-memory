@@ -1,0 +1,576 @@
+// =============================================================================
+// Candle Forecast v2 — online-learned next-bar direction and size, with a
+//                      75 / 20 / 5 train / test / calibrate protocol on-chart
+// -----------------------------------------------------------------------------
+// WHAT THIS IS
+//
+// Two forecasts for the bar that is about to form, both produced by models that
+// TRAIN THEMSELVES ON YOUR CHART, in one pass, with no look-ahead:
+//
+//   DIRECTION  P(next candle closes green), from an online logistic regression
+//              over 16 scale-free features (normalised returns, close location,
+//              wick asymmetry, volatility state, volume participation, run
+//              length, autocorrelation regime, and two regime x momentum
+//              interactions).  Trained by AdaGrad SGD.
+//
+//   SIZE       E[true range of the next bar], as an EWMA anchor times exp() of
+//              a linear model over the same features, plus an 80% band taken
+//              from the empirical distribution of realised/predicted error.
+//
+// WHY IT IS BUILT THIS WAY
+//
+// The predecessor counted patterns of the last N candle COLOURS.  That is at
+// most N bits of information per prediction, spread across 2^N buckets, so it
+// cannot distinguish "no signal in colour sequences" from "no signal at all".
+// This version replaces the colour-bucket state with a continuous feature
+// vector and a gradient-trained model, which can express far more — and then
+// reports, honestly, that direction still has no edge.  That is now a much
+// stronger claim, because the model had the information and still found
+// nothing.  See DEV_NOTES_candle_forecast_v2.md for the ablation that shows
+// every direction feature is net noise.
+//
+// The size model is where the measured skill is: 6% to 18% lower mean absolute
+// error than ATR(14) across seven instruments and five asset classes, with band
+// coverage landing on 80% without any per-symbol tuning.
+//
+// THE 75 / 20 / 5 PROTOCOL
+//
+//   TRAIN  (first 75% of chart bars)  weights are fitted here, by SGD
+//   TEST   (next 20%)                 weights FROZEN — a clean out-of-sample read
+//   CALIB  (last 5%)                  weights still frozen; a two-parameter
+//                                     Platt rescale of the logit is fitted, and
+//                                     nothing else changes
+//   LIVE   (bars after the chart's history) everything frozen, calibration applied
+//
+// This maps onto Pine natively.  Gradient descent learns its own weights in a
+// single left-to-right pass, so no window ever needs a second visit — unlike a
+// grid search, which Pine structurally cannot run.  The panel's TEST column is
+// therefore the same number the reference implementation reports.
+//
+// ONE THING IS NOT FROZEN: the intercept, and the range EWMA.  Both are state,
+// not fitted parameters.  The unconditional green rate drifts (it is 55.7% on
+// one of the test files), and a frozen intercept would forecast the training
+// window's drift forever, losing to the trivial majority rule for reasons that
+// have nothing to do with the model's features.
+//
+// HOW TO READ IT
+//
+// Look at the TEST column, then the VERDICT row, then stop.  If the verdict says
+// no direction edge — which it will, on almost every symbol — then the direction
+// probability is a calibration diagnostic, not a signal.  Trade the size
+// forecast: stop distance, target distance, position size, option premium.
+// =============================================================================
+
+//@version=6
+indicator("Candle Forecast v2", shorttitle="CF2", overlay=true, max_bars_back=500)
+
+// -----------------------------------------------------------------------------
+// constants — mirrored exactly in backtest_candle_forecast_v2.py
+// -----------------------------------------------------------------------------
+ATR_LEN    = 14
+STOCH_LEN  = 20
+MOM_SLOW   = 20
+MOM_FAST   = 5
+VOL_LEN    = 20
+ACORR_LEN  = 50
+MEDIAN_LEN = 100
+NFEAT      = 17      // 16 features + bias
+NACC       = 15      // counters per phase
+NPHASE     = 4       // TRAIN, TEST, CALIB, LIVE
+
+// accumulator slots
+A_N     = 0
+A_HIT   = 1
+A_BHIT  = 2
+A_DSUM  = 3
+A_DSQ   = 4
+A_GREEN = 5
+A_LL    = 6
+A_LL0   = 7
+A_BR    = 8
+A_BR0   = 9
+A_SZ    = 10
+A_BASE  = 11
+A_ATR   = 12
+A_COV   = 13
+A_COVN  = 14
+
+// -----------------------------------------------------------------------------
+// inputs
+// -----------------------------------------------------------------------------
+gS = "Split protocol"
+i_trainPct = input.float(0.75, "TRAIN share of chart", minval=0.30, maxval=0.90, step=0.05, group=gS,
+     tooltip="Weights are fitted on this leading share of the chart's bars, then frozen.")
+i_testPct  = input.float(0.20, "TEST share", minval=0.05, maxval=0.50, step=0.05, group=gS,
+     tooltip="Frozen out-of-sample measurement window. This is the column that counts.")
+i_freeze   = input.bool(true, "Freeze weights after TRAIN", group=gS,
+     tooltip="On = the evaluation protocol. Off = continuous learning, which is what you want once " +
+             "you are done evaluating and running this live.")
+i_shade    = input.bool(true, "Shade the split windows", group=gS)
+
+gM = "Model"
+i_basis    = input.string("Close vs Open", "Direction basis", options=["Close vs Open", "Close vs prev Close"], group=gM)
+i_lr       = input.float(0.10, "Direction learning rate", minval=0.001, maxval=1.0, step=0.01, group=gM)
+i_slr      = input.float(0.05, "Size learning rate", minval=0.001, maxval=1.0, step=0.01, group=gM)
+i_l2       = input.float(0.01, "L2 regularisation", minval=0.0, maxval=1.0, step=0.001, group=gM,
+     tooltip="Shrinks weights toward zero. Size skill is flat across 1e-5..1e-1; direction log-loss " +
+             "improves monotonically as this rises, which is the measurement that says direction has no signal.")
+i_lam      = input.float(0.94, "Range EWMA lambda", minval=0.50, maxval=0.999, step=0.01, group=gM,
+     tooltip="The size model's anchor. 0.94 was selected on TRAIN across seven instruments; 0.97 " +
+             "(the RiskMetrics default) is measurably worse once you score against a fixed reference.")
+i_burnin   = input.int(200, "Burn-in bars", minval=50, maxval=2000, group=gM,
+     tooltip="Bars used to prime the feature normaliser before any weight update happens.")
+
+gB = "Size band"
+i_bandWin  = input.int(500, "Error-ratio window", minval=100, maxval=2000, group=gB)
+i_bandQ    = input.float(0.10, "Band tail", minval=0.01, maxval=0.25, step=0.01, group=gB,
+     tooltip="0.10 gives an 80% band. Coverage is measured in the scorecard — it should land near the target.")
+i_reQ      = input.int(20, "Quantile refresh (bars)", minval=1, maxval=100, group=gB,
+     tooltip="Sorting the error window every bar is the slowest thing this script can do, and rolling " +
+             "quantiles barely move in 20 bars. Set to 1 for exact-per-bar at a large speed cost.")
+
+gD = "Data quality"
+i_deadPct  = input.float(0.05, "Dead-bar threshold", minval=0.0, maxval=0.50, step=0.01, group=gD,
+     tooltip="Bars whose range is below this fraction of the rolling median range are excluded from " +
+             "scoring and learning. Synthetic weekend/holiday bars on some feeds will otherwise " +
+             "fabricate a spectacular fake edge. Set to 0 to disable and see what it was protecting you from.")
+
+gV = "Display"
+i_showGhost = input.bool(true, "Draw projected next candle", group=gV)
+i_showBand  = input.bool(true, "Plot size band", group=gV)
+i_panel     = input.bool(true, "Show panel", group=gV)
+i_panelPos  = input.string("Top right", "Panel position", options=["Top right","Top left","Bottom right","Bottom left"], group=gV)
+
+// -----------------------------------------------------------------------------
+// helpers — all top level, none nested
+// -----------------------------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_sigmoid(float z) =>
+    1.0 / (1.0 + math.exp(-f_clamp(z, -30.0, 30.0)))
+
+f_dot(array<float> w, array<float> x) =>
+    float s = 0.0
+    for i = 0 to NFEAT - 1
+        s += array.get(w, i) * array.get(x, i)
+    s
+
+// AdaGrad step.  biasOnly updates slot 0 alone, which is how the intercept keeps
+// tracking the drifting base rate while the feature weights stay frozen.
+f_sgd(array<float> w, array<float> g2, array<float> x, float err, float lr, float l2, bool biasOnly) =>
+    int last = biasOnly ? 0 : NFEAT - 1
+    for i = 0 to last
+        float g  = err * array.get(x, i) + (i == 0 ? 0.0 : l2 * array.get(w, i))
+        float gs = array.get(g2, i) + g * g
+        array.set(g2, i, gs)
+        array.set(w, i, array.get(w, i) - lr * g / (math.sqrt(gs) + 1e-8))
+
+// Welford push for the per-feature normaliser that makes this portable across
+// instruments and timeframes without a single per-symbol setting.
+f_normPush(array<float> mean, array<float> m2, int n, array<float> raw) =>
+    for i = 1 to NFEAT - 1
+        float mu = array.get(mean, i)
+        float d  = array.get(raw, i) - mu
+        float nm = mu + d / n
+        array.set(mean, i, nm)
+        array.set(m2, i, array.get(m2, i) + d * (array.get(raw, i) - nm))
+
+f_standardise(array<float> raw, array<float> mean, array<float> m2, int n, array<float> outv) =>
+    array.set(outv, 0, 1.0)
+    for i = 1 to NFEAT - 1
+        float sd = n > 1 ? math.sqrt(array.get(m2, i) / (n - 1)) : 0.0
+        array.set(outv, i, sd <= 1e-12 ? 0.0 : f_clamp((array.get(raw, i) - array.get(mean, i)) / sd, -5.0, 5.0))
+
+f_ringPush(array<float> a, float v, int cap) =>
+    array.push(a, v)
+    if array.size(a) > cap
+        array.shift(a)
+
+f_quantile(array<float> a, float q) =>
+    float res = na
+    int n = array.size(a)
+    if n > 0
+        array<float> cp = array.copy(a)
+        array.sort(cp, order.ascending)
+        float pos = q * (n - 1)
+        int lo = int(math.floor(pos))
+        int hi = math.min(lo + 1, n - 1)
+        res := array.get(cp, lo) + (array.get(cp, hi) - array.get(cp, lo)) * (pos - lo)
+    res
+
+f_accGet(array<float> a, int ph, int k) =>
+    array.get(a, ph * NACC + k)
+
+f_accAdd(array<float> a, int ph, int k, float v) =>
+    array.set(a, ph * NACC + k, array.get(a, ph * NACC + k) + v)
+
+f_pct(float x) =>
+    str.tostring(x * 100.0, "#.##") + "%"
+
+f_pp(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(x * 100.0, "#.##") + " pp"
+
+// Wilson score interval half-width, so a small sample cannot masquerade as a result.
+f_wilsonLo(float p, int n) =>
+    float z = 1.96
+    float d = 1.0 + z * z / n
+    float c = p + z * z / (2 * n)
+    float s = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    (c - s) / d
+
+f_wilsonHi(float p, int n) =>
+    float z = 1.96
+    float d = 1.0 + z * z / n
+    float c = p + z * z / (2 * n)
+    float s = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    (c + s) / d
+
+// -----------------------------------------------------------------------------
+// core series — every ta.* call is unconditional, on every bar, as required
+// -----------------------------------------------------------------------------
+float trv     = ta.tr(true)
+float atrv    = ta.atr(ATR_LEN)
+float rng     = high - low
+float bodyv   = close - open
+float uw      = high - math.max(open, close)
+float lw      = math.min(open, close) - low
+float hh      = ta.highest(high, STOCH_LEN)
+float llw     = ta.lowest(low, STOCH_LEN)
+float volAvg  = ta.sma(nz(volume, 0.0), VOL_LEN)
+float sgnNow  = bodyv > 0 ? 1.0 : bodyv < 0 ? -1.0 : 0.0
+float sgnPrev = nz(sgnNow[1], 0.0)
+float acorrV  = ta.sma(sgnNow * sgnPrev, ACORR_LEN)
+bool  volOk   = not na(volume) and volume > 0 and volAvg > 0
+float bodyFr  = rng > 0 ? math.abs(bodyv) / rng : 0.0
+float uwShare = (rng - math.abs(bodyv)) > 0 ? uw / (rng - math.abs(bodyv)) : 0.5
+
+// -----------------------------------------------------------------------------
+// persistent state
+// -----------------------------------------------------------------------------
+var array<float> W    = array.new<float>(NFEAT, 0.0)   // direction weights
+var array<float> G2   = array.new<float>(NFEAT, 0.0)
+var array<float> SW   = array.new<float>(NFEAT, 0.0)   // size weights
+var array<float> SG2  = array.new<float>(NFEAT, 0.0)
+var array<float> NMEAN= array.new<float>(NFEAT, 0.0)
+var array<float> NM2  = array.new<float>(NFEAT, 0.0)
+var int          normN = 0
+
+var array<float> RAW  = array.new<float>(NFEAT, 0.0)
+var array<float> XS   = array.new<float>(NFEAT, 0.0)   // standardised, this bar
+var array<float> XP   = array.new<float>(NFEAT, 0.0)   // standardised, locked forecast
+
+var array<float> ACC  = array.new<float>(NPHASE * NACC, 0.0)
+var array<float> BAND = array.new<float>(0)
+var array<float> MEDR = array.new<float>(0)
+
+var float plattA = 1.0
+var float plattB = 0.0
+var float ewma   = na
+var float runLen = 0.0
+var float ewBody = na          // EWMA of body/range, for the ghost candle shape
+var float ewUw   = na          // EWMA of upper-wick share of the non-body range
+var int   deadN  = 0
+var int   barsN  = 0
+
+// the forecast locked at the previous close
+var bool  pendOk    = false
+var float pendP     = na
+var float pendZ     = na
+var float pendRange = na
+var float pendEw    = na
+var float pendAtr   = na
+var float pendLo    = na
+var float pendHi    = na
+var float pendBody  = na
+var float pendUw    = na
+
+var float bandLoQ = na
+var float bandHiQ = na
+var float medRng  = na
+
+// split boundaries, fixed at the first executed bar so realtime bars cannot move them
+var int histLast = na
+if na(histLast)
+    histLast := last_bar_index
+int trainEnd = int(histLast * i_trainPct)
+int testEnd  = int(histLast * math.min(i_trainPct + i_testPct, 0.999))
+int phaseNow = bar_index <= trainEnd ? 0 : bar_index <= testEnd ? 1 : bar_index <= histLast ? 2 : 3
+
+// -----------------------------------------------------------------------------
+// the confirmed-bar block: score -> learn -> rebuild features -> lock
+// Nothing here runs on an unconfirmed tick.  `var` scalars roll back on realtime
+// ticks but array CONTENTS do not, so an ungated array.set would permanently
+// corrupt the model with every tick of the forming bar.
+// -----------------------------------------------------------------------------
+if barstate.isconfirmed
+    barsN += 1
+
+    // rolling median range, for the dead-bar filter
+    f_ringPush(MEDR, rng, MEDIAN_LEN)
+    if array.size(MEDR) >= 20 and (bar_index % 10 == 0 or na(medRng))
+        medRng := f_quantile(MEDR, 0.5)
+    bool dead = i_deadPct > 0 and not na(medRng) and medRng > 0 and rng < i_deadPct * medRng
+    if dead
+        deadN += 1
+
+    ewma := na(ewma) ? trv : i_lam * ewma + (1.0 - i_lam) * trv
+
+    // ---- 1. score the forecast that was locked at the previous close --------
+    if pendOk and not dead and pendAtr > 0
+        float y     = (i_basis == "Close vs Open" ? (close > open) : (close > nz(close[1], open))) ? 1.0 : 0.0
+        int   ph    = phaseNow
+        float gseen = f_accGet(ACC, 0, A_GREEN) + f_accGet(ACC, 1, A_GREEN) + f_accGet(ACC, 2, A_GREEN) + f_accGet(ACC, 3, A_GREEN)
+        float gtot  = f_accGet(ACC, 0, A_N)     + f_accGet(ACC, 1, A_N)     + f_accGet(ACC, 2, A_N)     + f_accGet(ACC, 3, A_N)
+        float pbase = (gseen + 0.5) / (gtot + 1.0)
+        float major = pbase >= 0.5 ? 1.0 : 0.0
+        float mHit  = ((pendP > 0.5) == (y == 1.0)) ? 1.0 : 0.0
+        float bHit  = major == y ? 1.0 : 0.0
+        float d     = mHit - bHit
+        float pClip = f_clamp(pendP, 1e-12, 1.0 - 1e-12)
+        float bClip = f_clamp(pbase, 1e-12, 1.0 - 1e-12)
+
+        f_accAdd(ACC, ph, A_N,     1.0)
+        f_accAdd(ACC, ph, A_GREEN, y)
+        f_accAdd(ACC, ph, A_HIT,   mHit)
+        f_accAdd(ACC, ph, A_BHIT,  bHit)
+        f_accAdd(ACC, ph, A_DSUM,  d)
+        f_accAdd(ACC, ph, A_DSQ,   d * d)
+        f_accAdd(ACC, ph, A_LL,   -(y == 1.0 ? math.log(pClip) : math.log(1.0 - pClip)))
+        f_accAdd(ACC, ph, A_LL0,  -(y == 1.0 ? math.log(bClip) : math.log(1.0 - bClip)))
+        f_accAdd(ACC, ph, A_BR,    math.pow(pendP - y, 2))
+        f_accAdd(ACC, ph, A_BR0,   math.pow(pbase - y, 2))
+        f_accAdd(ACC, ph, A_SZ,    math.abs(pendRange - trv) / pendAtr)
+        f_accAdd(ACC, ph, A_BASE,  math.abs(pendEw    - trv) / pendAtr)
+        f_accAdd(ACC, ph, A_ATR,   math.abs(pendAtr   - trv) / pendAtr)
+        if not na(pendLo)
+            f_accAdd(ACC, ph, A_COVN, 1.0)
+            f_accAdd(ACC, ph, A_COV, (trv >= pendLo and trv <= pendHi) ? 1.0 : 0.0)
+
+        // ---- 2. learn, in the window that owns learning ---------------------
+        bool learning = (bar_index <= trainEnd) or not i_freeze
+        if learning
+            float pd = f_sigmoid(f_dot(W, XP))
+            f_sgd(W, G2, XP, pd - y, i_lr, i_l2, false)
+            if pendEw > 0
+                float tgt = math.log(math.max(trv, 1e-12) / pendEw)
+                f_sgd(SW, SG2, XP, f_dot(SW, XP) - tgt, i_slr, i_l2, false)
+        else
+            // intercept only: it is state, not a parameter
+            float pd = f_sigmoid(f_dot(W, XP))
+            f_sgd(W, G2, XP, pd - y, i_lr, i_l2, true)
+            if bar_index > testEnd
+                // the 5% window recalibrates the frozen logit and nothing else
+                float pc = f_sigmoid(plattA * pendZ + plattB)
+                plattA -= 0.02 * (pc - y) * pendZ
+                plattB -= 0.02 * (pc - y)
+
+        if pendRange > 0
+            f_ringPush(BAND, trv / pendRange, i_bandWin)
+
+    // ---- 3. rebuild this bar's raw feature vector ---------------------------
+    runLen := (sgnNow != 0 and sgnNow == sgnPrev) ? f_clamp(runLen + sgnNow, -8.0, 8.0) : sgnNow
+    ewBody := na(ewBody) ? bodyFr  : i_lam * ewBody + (1.0 - i_lam) * bodyFr
+    ewUw   := na(ewUw)   ? uwShare : i_lam * ewUw   + (1.0 - i_lam) * uwShare
+
+    bool ok = atrv > 0 and bar_index >= math.max(MOM_SLOW, ACORR_LEN) and not na(acorrV)
+    if ok
+        array.set(RAW, 0,  1.0)
+        array.set(RAW, 1,  bodyv / atrv)
+        array.set(RAW, 2,  nz(bodyv[1], 0.0) / atrv)
+        array.set(RAW, 3,  nz(bodyv[2], 0.0) / atrv)
+        array.set(RAW, 4,  (close - close[MOM_FAST]) / atrv)
+        array.set(RAW, 5,  (close - close[MOM_SLOW]) / atrv)
+        array.set(RAW, 6,  rng > 0 ? 2.0 * (close - low) / rng - 1.0 : 0.0)
+        array.set(RAW, 7,  rng > 0 ? math.log(rng / atrv) : -5.0)
+        array.set(RAW, 8,  rng > 0 ? (uw - lw) / rng : 0.0)
+        array.set(RAW, 9,  hh > llw ? 2.0 * (close - llw) / (hh - llw) - 1.0 : 0.0)
+        array.set(RAW, 10, runLen / 8.0)
+        array.set(RAW, 11, volOk ? math.log(math.max(volume, 1.0) / math.max(volAvg, 1.0)) : 0.0)
+        array.set(RAW, 12, (open - nz(close[1], open)) / atrv)
+        array.set(RAW, 13, acorrV)
+        array.set(RAW, 14, bodyFr)
+        array.set(RAW, 15, array.get(RAW, 4) * acorrV)
+        array.set(RAW, 16, array.get(RAW, 9) * acorrV)
+
+    // ---- 4. lock the forecast for the next bar -----------------------------
+    pendOk := false
+    if ok
+        // standardise against statistics from bars strictly before this one,
+        // then fold this bar in — so a feature never normalises against itself
+        f_standardise(RAW, NMEAN, NM2, normN, XS)
+        bool primed = normN >= i_burnin
+        normN += 1
+        f_normPush(NMEAN, NM2, normN, RAW)
+
+        if primed and not dead
+            for i = 0 to NFEAT - 1
+                array.set(XP, i, array.get(XS, i))
+            pendZ     := f_dot(W, XP)
+            bool cal   = bar_index > testEnd or not i_freeze
+            pendP     := f_sigmoid(cal ? plattA * pendZ + plattB : pendZ)
+            pendRange := ewma * math.exp(f_clamp(f_dot(SW, XP), -1.5, 1.5))
+            pendEw    := ewma
+            pendAtr   := atrv
+            pendBody  := ewBody
+            pendUw    := ewUw
+            if array.size(BAND) >= 50 and (bar_index % i_reQ == 0 or na(bandLoQ))
+                bandLoQ := f_quantile(BAND, i_bandQ)
+                bandHiQ := f_quantile(BAND, 1.0 - i_bandQ)
+            pendLo := na(bandLoQ) ? na : pendRange * bandLoQ
+            pendHi := na(bandHiQ) ? na : pendRange * bandHiQ
+            pendOk := true
+
+// -----------------------------------------------------------------------------
+// derived read-outs for display
+// -----------------------------------------------------------------------------
+float dispRange = pendOk ? pendRange : na
+float dispLo    = pendOk ? pendLo : na
+float dispHi    = pendOk ? pendHi : na
+float dispP     = pendOk ? pendP : na
+
+// projected candle geometry, anchored on the current close
+float ghOpen = close
+float ghBody = na(dispRange) or na(pendBody) ? na : dispRange * pendBody * (dispP > 0.5 ? 1.0 : -1.0)
+float ghClose = na(ghBody) ? na : ghOpen + ghBody
+float ghNonBody = na(dispRange) or na(ghBody) ? na : math.max(dispRange - math.abs(ghBody), 0.0)
+float ghHigh = na(ghNonBody) ? na : math.max(ghOpen, ghClose) + ghNonBody * nz(pendUw, 0.5)
+float ghLow  = na(ghNonBody) ? na : math.min(ghOpen, ghClose) - ghNonBody * (1.0 - nz(pendUw, 0.5))
+
+bool showGhost = i_showGhost and pendOk and barstate.islast
+plotcandle(showGhost ? ghOpen : na, showGhost ? ghHigh : na, showGhost ? ghLow : na, showGhost ? ghClose : na,
+     title="Projected next candle", offset=1,
+     color=dispP > 0.5 ? color.new(color.teal, 55) : color.new(color.maroon, 55),
+     wickcolor=color.new(color.gray, 40), bordercolor=color.new(color.gray, 20))
+
+plot(i_showBand and pendOk ? close + dispHi / 2.0 : na, "Band high", color=color.new(color.gray, 50), style=plot.style_stepline)
+plot(i_showBand and pendOk ? close - dispHi / 2.0 : na, "Band low",  color=color.new(color.gray, 50), style=plot.style_stepline)
+
+color shadeCol = not i_shade ? na :
+     phaseNow == 0 ? color.new(color.blue,  95) :
+     phaseNow == 1 ? color.new(color.orange, 93) :
+     phaseNow == 2 ? color.new(color.purple, 93) : na
+bgcolor(shadeCol, title="Split window")
+
+// -----------------------------------------------------------------------------
+// panel
+// -----------------------------------------------------------------------------
+var table pnl = table.new(
+     i_panelPos == "Top right" ? position.top_right : i_panelPos == "Top left" ? position.top_left :
+     i_panelPos == "Bottom right" ? position.bottom_right : position.bottom_left,
+     5, 20, bgcolor=color.new(color.black, 12), border_width=1, border_color=color.new(color.gray, 60))
+
+f_cell(int c, int r, string t, color col) =>
+    table.cell(pnl, c, r, t, text_color=col, text_size=size.small, text_halign=text.align_left)
+
+if i_panel and barstate.islast
+    table.clear(pnl, 0, 0, 4, 19)
+    color hdr = color.new(color.white, 0)
+    color dim = color.new(color.silver, 25)
+
+    f_cell(0, 0, "CANDLE FORECAST v2", hdr)
+    f_cell(1, 0, syminfo.ticker + "  " + timeframe.period, dim)
+    f_cell(3, 0, "bars " + str.tostring(barsN), dim)
+
+    // ---- forecast --------------------------------------------------------
+    f_cell(0, 1, "FORECAST (locked at last close)", hdr)
+    if pendOk
+        f_cell(0, 2, "Direction", dim)
+        f_cell(1, 2, (dispP > 0.5 ? "GREEN " : "RED ") + f_pct(dispP > 0.5 ? dispP : 1.0 - dispP),
+             dispP > 0.5 ? color.new(color.teal, 0) : color.new(color.red, 20))
+        f_cell(0, 3, "Expected range", dim)
+        f_cell(1, 3, str.tostring(dispRange, format.mintick), hdr)
+        f_cell(0, 4, str.tostring(int((1.0 - 2.0 * i_bandQ) * 100)) + "% band", dim)
+        f_cell(1, 4, na(dispLo) ? "warming up" :
+             str.tostring(dispLo, format.mintick) + "  ..  " + str.tostring(dispHi, format.mintick), hdr)
+        f_cell(0, 5, "vs ATR(" + str.tostring(ATR_LEN) + ")", dim)
+        f_cell(1, 5, str.tostring(dispRange / atrv, "#.##") + "x", hdr)
+    else
+        f_cell(0, 2, "warming up — need " + str.tostring(i_burnin) + " bars of normaliser", dim)
+
+    // ---- scorecard -------------------------------------------------------
+    f_cell(0, 7, "SCORECARD", hdr)
+    f_cell(1, 7, "TRAIN", dim)
+    f_cell(2, 7, "TEST", color.new(color.orange, 0))
+    f_cell(3, 7, "CALIB", dim)
+    f_cell(4, 7, "LIVE", dim)
+
+    for ph = 0 to NPHASE - 1
+        int col = ph + 1
+        float n = f_accGet(ACC, ph, A_N)
+        if n < 1
+            f_cell(col, 8, "—", dim)
+        else
+            float acc  = f_accGet(ACC, ph, A_HIT)  / n
+            float bacc = f_accGet(ACC, ph, A_BHIT) / n
+            float m    = f_accGet(ACC, ph, A_DSUM) / n
+            float vr   = n > 1 ? (f_accGet(ACC, ph, A_DSQ) - n * m * m) / (n - 1) : 0.0
+            float z    = vr > 0 ? m / math.sqrt(vr / n) : 0.0
+            float lls  = f_accGet(ACC, ph, A_LL0) > 0 ? 1.0 - f_accGet(ACC, ph, A_LL) / f_accGet(ACC, ph, A_LL0) : na
+            float bss  = f_accGet(ACC, ph, A_BR0) > 0 ? 1.0 - f_accGet(ACC, ph, A_BR) / f_accGet(ACC, ph, A_BR0) : na
+            float ssk  = f_accGet(ACC, ph, A_ATR) > 0 ? 1.0 - f_accGet(ACC, ph, A_SZ) / f_accGet(ACC, ph, A_ATR) : na
+            float esk  = f_accGet(ACC, ph, A_BASE) > 0 ? 1.0 - f_accGet(ACC, ph, A_SZ) / f_accGet(ACC, ph, A_BASE) : na
+            float cvn  = f_accGet(ACC, ph, A_COVN)
+            float cov  = cvn > 0 ? f_accGet(ACC, ph, A_COV) / cvn : na
+            color zc   = math.abs(z) < 2.0 ? dim : z > 0 ? color.new(color.teal, 0) : color.new(color.red, 20)
+
+            f_cell(col, 8,  str.tostring(int(n)), dim)
+            f_cell(col, 9,  f_pct(acc), hdr)
+            f_cell(col, 10, f_pp(acc - bacc), zc)
+            f_cell(col, 11, str.tostring(z, "+#.##"), zc)
+            f_cell(col, 12, str.tostring(lls, "+#.#####"), dim)
+            f_cell(col, 13, str.tostring(bss, "+#.#####"), dim)
+            f_cell(col, 14, f_pp(ssk), ssk > 0.02 ? color.new(color.teal, 0) : dim)
+            f_cell(col, 15, f_pp(esk), dim)
+            f_cell(col, 16, na(cov) ? "—" : f_pct(cov), dim)
+
+    f_cell(0, 8,  "scored bars", dim)
+    f_cell(0, 9,  "accuracy", dim)
+    f_cell(0, 10, "edge vs majority", dim)
+    f_cell(0, 11, "paired z", dim)
+    f_cell(0, 12, "log-loss skill", dim)
+    f_cell(0, 13, "Brier skill", dim)
+    f_cell(0, 14, "size skill vs ATR", dim)
+    f_cell(0, 15, "size skill vs EWMA", dim)
+    f_cell(0, 16, "band coverage", dim)
+
+    // ---- verdict ---------------------------------------------------------
+    float tn   = f_accGet(ACC, 1, A_N)
+    float tacc = tn > 0 ? f_accGet(ACC, 1, A_HIT) / tn : na
+    float tm   = tn > 0 ? f_accGet(ACC, 1, A_DSUM) / tn : na
+    float tvr  = tn > 1 ? (f_accGet(ACC, 1, A_DSQ) - tn * tm * tm) / (tn - 1) : 0.0
+    float tz   = tvr > 0 ? tm / math.sqrt(tvr / tn) : 0.0
+    float tlls = f_accGet(ACC, 1, A_LL0) > 0 ? 1.0 - f_accGet(ACC, 1, A_LL) / f_accGet(ACC, 1, A_LL0) : na
+    float tssk = f_accGet(ACC, 1, A_ATR) > 0 ? 1.0 - f_accGet(ACC, 1, A_SZ) / f_accGet(ACC, 1, A_ATR) : na
+
+    string vDir = tn < 200 ? "DIRECTION: not enough TEST bars to say anything" :
+         (tz > 2.0 and tlls > 0) ? "DIRECTION: edge present — verify before trusting" :
+         tz < -2.0 ? "DIRECTION: worse than always-predict-majority" :
+         "DIRECTION: no edge. Read the probability as a diagnostic, not a signal."
+    color vCol = tn < 200 ? dim : (tz > 2.0 and tlls > 0) ? color.new(color.teal, 0) : color.new(color.orange, 10)
+    f_cell(0, 18, vDir, vCol)
+
+    string vSz = na(tssk) ? "SIZE: no TEST bars yet" :
+         tssk > 0.02 ? "SIZE: real skill, " + f_pp(tssk) + " lower MAE than ATR(" + str.tostring(ATR_LEN) + ")" :
+         "SIZE: no material skill on this symbol/timeframe"
+    f_cell(0, 19, vSz, na(tssk) ? dim : tssk > 0.02 ? color.new(color.teal, 0) : color.new(color.orange, 10))
+
+    // ---- data quality ----------------------------------------------------
+    float deadShare = barsN > 0 ? deadN / barsN : 0.0
+    f_cell(2, 18, "dead bars " + f_pct(deadShare), deadShare > 0.03 ? color.new(color.orange, 0) : dim)
+    f_cell(2, 19, volOk ? "volume feed: present" : "volume feed: ABSENT (size model loses its best input)",
+         volOk ? dim : color.new(color.orange, 10))
+    if tn >= 200
+        f_cell(3, 18, "95% CI " + f_pct(f_wilsonLo(tacc, int(tn))) + " .. " + f_pct(f_wilsonHi(tacc, int(tn))), dim)
+
+// -----------------------------------------------------------------------------
+// alerts — deliberately gated on the model having demonstrated skill on TEST
+// -----------------------------------------------------------------------------
+float aTn   = f_accGet(ACC, 1, A_N)
+float aTm   = aTn > 0 ? f_accGet(ACC, 1, A_DSUM) / aTn : na
+float aTvr  = aTn > 1 ? (f_accGet(ACC, 1, A_DSQ) - aTn * aTm * aTm) / (aTn - 1) : 0.0
+float aTz   = aTvr > 0 ? aTm / math.sqrt(aTvr / aTn) : 0.0
+bool  dirOk = aTn >= 200 and aTz > 2.0
+alertcondition(dirOk and pendOk and pendP > 0.60, "Direction: green (validated)", "CF2 green, model showed TEST edge")
+alertcondition(dirOk and pendOk and pendP < 0.40, "Direction: red (validated)",   "CF2 red, model showed TEST edge")
+alertcondition(pendOk and pendRange > 1.5 * atrv, "Expected range > 1.5x ATR",    "CF2 expects an unusually large bar")
