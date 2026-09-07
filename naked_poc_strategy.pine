@@ -296,6 +296,8 @@ var float lastVaW = na      // prior session value-area width
 var float lastClsPos = na   // where the prior session closed inside its value area (0..1)
 var float sessOpenPx = na   // opening price of the CURRENT session (playbook A)
 var array<float> pocHist  = array.new<float>()   // recent POCs, for migration
+var array<float> zTopHist = array.new<float>()   // recent POC zones, for the N-back source
+var array<float> zBotHist = array.new<float>()
 var array<float> vaWHist  = array.new<float>()   // recent VA widths, for the width regime
 
 // -----------------------------------------------------------------------------
@@ -395,8 +397,12 @@ if sessEnd and sessOpen
         lastClsPos := lastVaW > 0.0 ? math.max(0.0, math.min(1.0, (close[1] - prof.val) / lastVaW)) : na
 
         pocHist.push(prof.poc)
-        if pocHist.size() > 10
+        zTopHist.push(prof.zoneTop)
+        zBotHist.push(prof.zoneBot)
+        if pocHist.size() > 20
             pocHist.shift()
+            zTopHist.shift()
+            zBotHist.shift()
         vaWHist.push(lastVaW)
         if vaWHist.size() > i_binLook
             vaWHist.shift()
@@ -536,6 +542,15 @@ i_playbook   = input.string("B - Trend pullback to POC", "Playbook",
      tooltip = "B enters a pullback into the prior POC zone that holds. A enters when the session opens outside prior value and rotates back into it. They are different systems -- run them separately before running Both.")
 i_aBalance   = input.bool(true, "A: require balance regime", group = GRP_SETUP,
      tooltip = "Return-to-value is a balance-day trade. Off = take it in any regime.")
+i_pocSource  = input.string("Previous session", "POC to trade",
+     options = ["Previous session", "N sessions back", "Developing (current session)"], group = GRP_SETUP,
+     tooltip = "Which POC zone playbook B reacts to. Previous session is a FIXED level, which is what makes an interaction with it informative. The developing POC migrates toward wherever price is spending time, so a pullback into it is partly tautological -- see the dev notes before trusting a backtest of it.")
+i_pocBack    = input.int(1, "Sessions back", minval = 1, maxval = 20, group = GRP_SETUP,
+     tooltip = "Used only by 'N sessions back'. 1 is identical to 'Previous session'.")
+i_devMinBars = input.int(12, "Developing: min bars before valid", minval = 1, maxval = 200, group = GRP_SETUP,
+     tooltip = "The developing POC is noise early in the session. 12 bars = one hour on a 5m chart.")
+i_devRecalc  = input.int(3, "Developing: recompute every N bars", minval = 1, maxval = 20, group = GRP_SETUP,
+     tooltip = "Rebuilding the profile on every bar multiplies engine cost by the bar count per session. 3 bars = every 15 minutes on 5m.")
 i_bTrend     = input.bool(false, "B: require trend regime (wide VA)", group = GRP_SETUP,
      tooltip = "Continuation is a trend-day trade. Off by default so the VA-width regime can be A/B tested rather than assumed.")
 
@@ -585,6 +600,7 @@ i_flatSess   = input.session("0930-1555", "Position-holding window", group = GRP
 i_eodFlat    = input.bool(true, "Flatten at end of session", group = GRP_EXEC)
 i_maxTrades  = input.int(2, "Max trades per session", minval = 1, maxval = 10, group = GRP_EXEC)
 i_showDash   = input.bool(true, "Show strategy dashboard", group = GRP_EXEC)
+i_showRefPoc = input.bool(true, "Plot the reference POC being traded", group = GRP_EXEC)
 
 // -----------------------------------------------------------------------------
 // Target engine -- top-level functions, arrays passed in explicitly
@@ -651,6 +667,11 @@ bool filterOff = i_filterMode == "None"
 // -----------------------------------------------------------------------------
 // 6. Setup state machines
 // -----------------------------------------------------------------------------
+var int   sessBars   = 0    // bars elapsed inside the current session
+var float devPoc     = na   // developing (current-session) POC and zone
+var float devZoneTop = na
+var float devZoneBot = na
+
 var int  bLastSide = 0      // last side price was fully on, relative to the POC zone
 var bool bTouched  = false
 var int  bApproach = 0      // side price came FROM when it reached the zone
@@ -659,6 +680,10 @@ var bool aFired    = false
 var int  tradesToday = 0
 
 if sessStart
+    sessBars    := 0
+    devPoc      := na
+    devZoneTop  := na
+    devZoneBot  := na
     bLastSide   := 0
     bTouched    := false
     bApproach   := 0
@@ -667,11 +692,67 @@ if sessStart
     aOpenSide   := not na(lastVah) and not na(lastVal) and not na(sessOpenPx) ?
          (sessOpenPx > lastVah ? 1 : sessOpenPx < lastVal ? -1 : 0) : 0
 
-bool haveZone = not na(lastZoneTop) and not na(lastZoneBot)
+if inSess
+    sessBars += 1
+
+// ---- POC source selection ---------------------------------------------------
+// Only playbook B's reference zone follows this setting. Playbook A needs a
+// COMPLETED prior session (a session cannot have opened outside a value area
+// that did not exist yet), and the value-area stop stays anchored to a
+// completed session because a developing VA is a moving target and a stop on a
+// moving structural level is not a stop.
+bool devWanted = i_pocSource == "Developing (current session)"
+
+// f_buildProfile is pure -- no var state, no ta.* calls -- so it is safe to call
+// from a conditional block. Double-distribution detection is disabled here: it
+// is noise on a partial profile and costs cycles on every recompute.
+if devWanted and inSess and sessBars >= i_devMinBars and sessBars % i_devRecalc == 0 and
+     not na(sessBinSize) and sessBinSize > 0.0
+    SessionProfile dp = f_buildProfile(binMap, sessBinSize, i_vaPct, i_zoneMode,
+         i_zoneTicks, i_zoneAtr, i_zoneExp, atrDaily, false, i_ddValley, i_ddPeak)
+    if not na(dp.poc)
+        devPoc     := dp.poc
+        devZoneTop := dp.zoneTop
+        devZoneBot := dp.zoneBot
+
+int  backIdx  = math.min(i_pocBack, pocHist.size())
+bool haveBack = backIdx >= 1 and pocHist.size() >= backIdx
+
+float refPoc     = na
+float refZoneTop = na
+float refZoneBot = na
+if devWanted
+    refPoc     := devPoc
+    refZoneTop := devZoneTop
+    refZoneBot := devZoneBot
+else if i_pocSource == "N sessions back" and haveBack
+    refPoc     := pocHist.get(pocHist.size()  - backIdx)
+    refZoneTop := zTopHist.get(zTopHist.size() - backIdx)
+    refZoneBot := zBotHist.get(zBotHist.size() - backIdx)
+else if i_pocSource == "Previous session"
+    refPoc     := lastPoc
+    refZoneTop := lastZoneTop
+    refZoneBot := lastZoneBot
+
+bool haveZone = not na(refZoneTop) and not na(refZoneBot)
 
 // -- Playbook B: pullback into the prior POC zone that holds -------------------
-int  bSide  = haveZone ? (low > lastZoneTop ? 1 : high < lastZoneBot ? -1 : 0) : 0
+int  bSide  = haveZone ? (low > refZoneTop ? 1 : high < refZoneBot ? -1 : 0) : 0
 bool inZone = haveZone and bSide == 0
+
+// A developing zone MIGRATES during the session, so a latch armed against an
+// earlier zone position can fire much later against a materially different
+// level. Invalidate the latch when the reference moves by a full bin -- the
+// zone is quantised to bins, so a sub-bin wobble is not a real move. Fixed
+// sources never move intra-session, so this only ever triggers on Developing.
+float zoneMoveTol = nz(sessBinSize, syminfo.mintick)
+bool  zoneShifted = devWanted and bTouched and
+     (math.abs(nz(refZoneTop - refZoneTop[1], 0.0)) > zoneMoveTol or
+      math.abs(nz(refZoneBot - refZoneBot[1], 0.0)) > zoneMoveTol)
+if zoneShifted
+    bTouched  := false
+    bApproach := 0
+    bLastSide := 0
 
 if inSess and bSide != 0
     bLastSide := bSide
@@ -681,8 +762,8 @@ if inSess and inZone and not bTouched and bLastSide != 0
 
 // Reclaim: a close back out of the zone on the side price approached from.
 bool bRegimeOk = not i_bTrend or wideVA
-bool bLongSig  = bTouched and bApproach ==  1 and haveZone and bRegimeOk and close > lastZoneTop
-bool bShortSig = bTouched and bApproach == -1 and haveZone and bRegimeOk and close < lastZoneBot
+bool bLongSig  = bTouched and bApproach ==  1 and haveZone and bRegimeOk and close > refZoneTop
+bool bShortSig = bTouched and bApproach == -1 and haveZone and bRegimeOk and close < refZoneBot
 
 // -- Playbook A: opened outside value, rotates back in ------------------------
 bool aRegimeOk = not i_aBalance or narrowVA
@@ -745,7 +826,7 @@ float entPx = close   // planning price; the fill is the next bar's open
 // ---- stop -------------------------------------------------------------------
 float rawStop = switch i_stopMode
     "Beyond value area" => candDir == 1 ? lastVal - buf : lastVah + buf
-    "Beyond POC zone"   => candDir == 1 ? lastZoneBot - buf : lastZoneTop + buf
+    "Beyond POC zone"   => candDir == 1 ? refZoneBot - buf : refZoneTop + buf
     => candDir == 1 ? entPx - i_stopAtr * nz(atrDaily) : entPx + i_stopAtr * nz(atrDaily)
 
 // The stop must actually be on the losing side of entry -- a value area that has
@@ -919,6 +1000,9 @@ prevPos := strategy.position_size
 // -----------------------------------------------------------------------------
 // 10. Plots
 // -----------------------------------------------------------------------------
+plot(i_showRefPoc and not na(refPoc) ? refPoc : na, "Reference POC",
+     color = color.new(color.orange, 20), style = plot.style_linebr, linewidth = 1)
+
 plot(strategy.position_size != 0 ? sStop : na, "Active stop",
      color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
 plot(strategy.position_size != 0 ? sT1 : na, "Target 1",
@@ -1007,8 +1091,11 @@ if barstate.islast and i_showDash
 
     table.cell(dTbl, 0, 10, "Live nPOCs", text_color = tc, text_size = SZ2)
     table.cell(dTbl, 1, 10, str.tostring(npPrice.size()), text_color = tc, text_size = SZ2)
-    table.cell(dTbl, 2, 10, "Prior POC", text_color = tc, text_size = SZ2)
-    table.cell(dTbl, 3, 10, f_num(lastPoc, format.mintick), text_color = tc, text_size = SZ2)
+    string srcTag = devWanted ? "dev" :
+         i_pocSource == "N sessions back" ? "back " + str.tostring(i_pocBack) : "prev"
+    table.cell(dTbl, 2, 10, "Ref POC (" + srcTag + ")", text_color = tc, text_size = SZ2)
+    table.cell(dTbl, 3, 10, f_num(refPoc, format.mintick),
+         text_color = na(refPoc) ? color.new(color.orange, 0) : tc, text_size = SZ2)
 
     table.cell(dTbl, 0, 11, "Trades this session", text_color = tc, text_size = SZ2)
     table.cell(dTbl, 1, 11, str.tostring(tradesToday) + "/" + str.tostring(i_maxTrades), text_color = tc, text_size = SZ2)

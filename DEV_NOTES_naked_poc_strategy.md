@@ -58,6 +58,55 @@ Three-phase latch, mirroring the pattern already used in `initial_balance_strate
 
 Direction must agree with the regime filter (unless the filter is off).
 
+### Which POC playbook B reacts to
+
+`POC to trade` selects the reference zone:
+
+| Source | Zone |
+|---|---|
+| **Previous session** (default) | The last completed session's POC zone — a fixed level |
+| **N sessions back** | An older completed session's POC zone (1 is identical to Previous) |
+| **Developing (current session)** | The POC of the session in progress, rebuilt as volume accumulates |
+
+**Scope is deliberately narrow — only playbook B follows this setting.**
+
+- **Playbook A** always uses a *completed* prior session. A session cannot have
+  opened outside a value area that did not exist yet, so "developing" is
+  incoherent for it.
+- **The value-area stop** stays anchored to a completed session. A developing VA
+  is a moving target, and a stop on a moving structural level is not a stop.
+- **The `Beyond POC zone` stop** does follow the selection, because that stop is
+  explicitly about the zone being traded.
+- **nPOC targets are unaffected.** They come from the naked stack of completed
+  sessions, which is correct regardless of what triggered the entry.
+
+#### The developing POC chases price — read this before backtesting it
+
+The previous-session POC is a **fixed** level. That is precisely what makes an
+interaction with it informative: price either respects a line drawn yesterday or
+it does not.
+
+The developing POC migrates toward wherever price is currently spending time.
+"Price pulled back into the POC zone and held" therefore becomes partly
+tautological — the zone moved to price, not the other way round. Worse, on the
+signal bar the developing profile already includes that bar's own volume, so the
+zone the reclaim is measured against was partly placed by the bar doing the
+reclaiming. That is not lookahead (nothing future is used) but it is circular,
+and it will tend to flatter a backtest.
+
+Treat any result from the developing source as suspect until it beats the
+previous-session source on the same settings.
+
+#### Cost and staleness
+
+Rebuilding the profile multiplies engine cost by the number of bars per session,
+so `Developing: recompute every N bars` throttles it (default 3 = every 15
+minutes on 5m), and `min bars before valid` (default 12) suppresses the early
+session where the POC is noise. Both apply only when the developing source is
+selected; the fixed sources cost nothing.
+
+A migrating zone also invalidates a latched setup — see bug 6 below.
+
 ### A — Return to value
 
 1. Session **opens outside** the prior value area
@@ -211,7 +260,19 @@ A no-op self-assignment left over from an attempt to stop playbook B consuming
 playbook A's once-per-session budget. Replaced with `aFired := true` inside the
 A branch only.
 
-### 5. Dead code
+### 5. Stale setup latch against a migrating developing zone
+
+Playbook B's latch records the side price approached the zone from. With a fixed
+zone that is stable for the whole session, but the **developing** zone moves: a
+latch armed against an early zone position could fire much later against a
+materially different level, and a zone migrating past stationary price could flip
+the recorded approach side outright.
+
+**Fix:** the latch is invalidated when the reference zone moves by more than one
+bin. The zone is quantised to bins, so a sub-bin wobble is not a real move, and
+fixed sources never trigger it.
+
+### 6. Dead code
 
 Unused `stopMode` variable, three `nz(x, na)` calls (a no-op that reads as a
 mistake), and the `i_showStats` input carried over from the indicator whose table
@@ -239,6 +300,8 @@ measurement tool gets turned back into a curve fit.
 2. Turn the filter to `Profile regime` → did it improve avg R, or only cut N?
 3. Enable the fallback → does the split table show nPOC targets beating it?
 4. Only then try Playbook A, Both, and scale-out
+5. Last of all, the developing POC source — and only believe it if it beats
+   `Previous session` on identical settings, given the circularity above
 
 Step 1 is the honest baseline. Everything after it should have to justify itself
 against that number.
