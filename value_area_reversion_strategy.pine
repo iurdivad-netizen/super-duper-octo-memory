@@ -1,0 +1,1002 @@
+//@version=6
+// =============================================================================
+// Value Area Reversion Strategy (VARS-S)
+// =============================================================================
+// Strategy conversion of the "Value Area Reversion Signals" indicator (VARS).
+//
+// The profile engine and the reclaim-signal state machine in sections 3-7 are a
+// faithful port of the indicator. Do not edit one without the other, or the
+// strategy stops trading the signals the indicator draws.
+//
+// WHAT THE INDICATOR PROVIDED
+//   An anchored (18:00 America/New_York) volume profile, its value area, and a
+//   "reclaim" signal: price breaks out of the value area, the breakout volume
+//   decelerates, then an engulfing bar with dominant opposite-side volume closes
+//   back inside the value area.
+//
+// WHAT THE INDICATOR DID NOT PROVIDE  -- and therefore what is NEW here
+//   No stop, no target, no invalidation, no sizing, no session handling. All of
+//   the P&L comes from those choices, none of which the original author made.
+//   They are inputs here rather than buried constants, because they are the part
+//   of this system most likely to be wrong.
+//
+// STRUCTURAL LIMITS -- read before trusting any backtest
+//
+//   1. THE SIGNAL IS RARE. A reclaim needs six conjunctive conditions (breakout,
+//      >= 2 breakout bars, decelerating breakout volume, return inside the VA,
+//      an engulfing bar, and reclaim volume exceeding both the opposite side and
+//      the last breakout bar). Expect single-digit signals per month on 5m. Any
+//      parameter tuned on that sample is fitted to noise, not to an edge.
+//
+//   2. VOLUME SIDING IS A PROXY. currentUpVolume / currentDownVolume assign the
+//      WHOLE bar's volume to one side based on close >= open. This is not
+//      delta. "Volume was slowing" therefore means "the bar's total volume fell
+//      while the bar happened to close down", which is a much weaker statement
+//      than order-flow deceleration. A bullish bar during a bearish breakout
+//      contributes zero down-volume and does not update the deceleration state
+//      at all -- that quirk is preserved for fidelity, not because it is right.
+//
+//   3. THE DEVELOPING VALUE AREA IS UNSTABLE. When a session bar makes a new
+//      extreme, the profile range and bin size are rebuilt and every level moves.
+//      Early in a session the current-day VA is built from a handful of bars and
+//      is close to meaningless. This is why current-day signals default OFF,
+//      matching the indicator.
+//
+//   4. GEOMETRY IS THE REAL CONSTRAINT. A stop at the breakout extreme and a
+//      target at the POC frequently produce sub-1R trades. The min-R filter
+//      exists to reject those, and it will reject a large share of signals. The
+//      dashboard reports how many, because a strategy that filters away 70% of
+//      an already-rare signal is a different strategy than the one you thought
+//      you were testing.
+//
+//   5. FILLS. Entries are issued at signal-bar close and fill at the next bar's
+//      open, so a gap through the stop exits immediately at a worse price. That
+//      is realistic, not a bug. Set commission and slippage for your instrument
+//      before reading any equity curve; the defaults are ES-shaped placeholders.
+// =============================================================================
+
+strategy("Value Area Reversion Strategy", "VARS-S", overlay = true,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 50000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.50,
+     slippage                = 2,
+     pyramiding              = 0,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false,
+     max_bars_back           = 5000,
+     max_boxes_count         = 500,
+     max_lines_count         = 50,
+     max_labels_count        = 500)
+
+// -----------------------------------------------------------------------------
+// 1 - Constants
+// -----------------------------------------------------------------------------
+string ANCHOR_TIMEZONE = "America/New_York"
+int    ANCHOR_HOUR     = 18
+
+string GRP_SIGNAL = "1 - Signals"
+string GRP_PROF   = "2 - Profile"
+string GRP_ENTRY  = "3 - Entry filters"
+string GRP_STOP   = "4 - Stop loss"
+string GRP_TGT    = "5 - Targets"
+string GRP_MGMT   = "6 - Trade management"
+string GRP_SIZE   = "7 - Position sizing"
+string GRP_DISP   = "8 - Display"
+
+string SRC_PREV = "Previous session value area"
+string SRC_CURR = "Current session value area"
+string SRC_BOTH = "Both (previous takes priority)"
+
+string DIR_BOTH  = "Both"
+string DIR_LONG  = "Long only"
+string DIR_SHORT = "Short only"
+
+string SL_BREAKOUT = "Breakout extreme"
+string SL_SIGNAL   = "Signal bar extreme"
+string SL_ATR      = "ATR from entry"
+string SL_VAEDGE   = "Broken value-area edge"
+
+string TP_POC    = "Reference POC"
+string TP_OPP    = "Opposite value-area edge"
+string TP_R      = "R multiple"
+string TP_ATR    = "ATR multiple"
+
+string SZ_FIXED = "Fixed contracts"
+string SZ_RISK  = "Risk % of equity"
+
+// -----------------------------------------------------------------------------
+// 2 - Inputs
+// -----------------------------------------------------------------------------
+// -- Signals (ported from the indicator) --
+string signalSourceInput = input.string(SRC_PREV, "Signal source", options = [SRC_PREV, SRC_CURR, SRC_BOTH], group = GRP_SIGNAL,
+     tooltip = "Which value area the reclaim signal is measured against. The indicator defaults to the previous session only; the developing current-session VA is unstable early in a session.")
+int maxReversionBarsInput = input.int(10, "Maximum bars to signal after breakout", minval = 1, maxval = 100, group = GRP_SIGNAL,
+     tooltip = "A reclaim signal is only allowed within this many bars after price first breaks the value area.")
+
+// -- Profile (ported verbatim) --
+int rowsInput = input.int(60, "Rows", minval = 10, maxval = 150, group = GRP_PROF,
+     tooltip = "Number of price rows used to build the anchored volume profile.")
+float valueAreaPercentInput = input.float(70.0, "Value area (%)", minval = 50.0, maxval = 99.0, step = 0.5, group = GRP_PROF,
+     tooltip = "Percentage of the profile volume included in the value area, expanded outward from the POC.")
+int profileWidthInput = input.int(30, "Maximum profile width (bars)", minval = 5, maxval = 200, group = GRP_PROF,
+     tooltip = "Maximum horizontal width of the profile histogram. The profile starts at the 18:00 anchor bar.")
+float insignificantThresholdInput = input.float(20.0, "Insignificant volume threshold (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = GRP_PROF,
+     tooltip = "Profile rows below this percentage of the highest-volume row are colored grey.")
+
+// -- Entry filters --
+string tradeDirectionInput = input.string(DIR_BOTH, "Trade direction", options = [DIR_BOTH, DIR_LONG, DIR_SHORT], group = GRP_ENTRY)
+bool useTradingWindowInput = input.bool(false, "Restrict entries to a session window", group = GRP_ENTRY,
+     tooltip = "OFF: trade any signal in the 18:00-anchored day, overnight included. ON: only inside the window below. Overnight reclaims form on thin volume, which is exactly the input the signal trusts most.")
+string tradingWindowInput = input.session("0930-1600", "Entry window", group = GRP_ENTRY)
+float minRewardRiskInput = input.float(1.0, "Minimum reward:risk", minval = 0.0, maxval = 10.0, step = 0.1, group = GRP_ENTRY,
+     tooltip = "Signals whose final target is closer than this multiple of the stop distance are skipped. Raising this filters away a large share of an already-rare signal -- watch the skip count on the dashboard.")
+float minStopTicksInput = input.float(4.0, "Minimum stop distance (ticks)", minval = 1.0, step = 1.0, group = GRP_ENTRY,
+     tooltip = "Rejects degenerate geometry where the signal bar sits on top of the breakout extreme.")
+float maxStopAtrInput = input.float(3.0, "Maximum stop distance (ATR)", minval = 0.0, step = 0.25, group = GRP_ENTRY,
+     tooltip = "Rejects signals whose stop is unreasonably far. 0 disables the check.")
+int maxTradesPerSessionInput = input.int(2, "Maximum entries per anchored session", minval = 1, maxval = 20, group = GRP_ENTRY)
+
+// -- Stop loss --
+string stopModeInput = input.string(SL_BREAKOUT, "Stop placement", options = [SL_BREAKOUT, SL_SIGNAL, SL_ATR, SL_VAEDGE], group = GRP_STOP,
+     tooltip = "Breakout extreme: the furthest point reached outside the value area during the excursion, which is the level that invalidates the reclaim.")
+float stopBufferAtrInput = input.float(0.10, "Stop buffer (ATR)", minval = 0.0, step = 0.05, group = GRP_STOP)
+float stopAtrMultInput = input.float(1.5, "Stop ATR multiple", minval = 0.1, step = 0.1, group = GRP_STOP,
+     tooltip = "Only used when stop placement is 'ATR from entry'.")
+int atrLengthInput = input.int(14, "ATR length", minval = 1, maxval = 200, group = GRP_STOP)
+
+// -- Targets --
+bool usePartialInput = input.bool(true, "Scale out at the first target", group = GRP_TGT,
+     tooltip = "The POC is a much higher-probability touch than the far value-area edge. Taking part of the position there is what makes the sub-1R geometry survivable.")
+float partialPercentInput = input.float(50.0, "First target size (% of position)", minval = 5.0, maxval = 95.0, step = 5.0, group = GRP_TGT)
+string firstTargetInput = input.string(TP_POC, "First target", options = [TP_POC, TP_OPP, TP_R, TP_ATR], group = GRP_TGT)
+string finalTargetInput = input.string(TP_OPP, "Final target", options = [TP_OPP, TP_POC, TP_R, TP_ATR], group = GRP_TGT)
+float firstTargetRInput = input.float(1.0, "First target R multiple", minval = 0.1, step = 0.1, group = GRP_TGT)
+float finalTargetRInput = input.float(2.0, "Final target R multiple", minval = 0.1, step = 0.1, group = GRP_TGT)
+float firstTargetAtrInput = input.float(1.0, "First target ATR multiple", minval = 0.1, step = 0.1, group = GRP_TGT)
+float finalTargetAtrInput = input.float(2.0, "Final target ATR multiple", minval = 0.1, step = 0.1, group = GRP_TGT)
+
+// -- Trade management --
+bool moveToBreakevenInput = input.bool(true, "Move stop to breakeven after the first target", group = GRP_MGMT)
+float breakevenOffsetAtrInput = input.float(0.05, "Breakeven offset (ATR)", minval = 0.0, step = 0.05, group = GRP_MGMT)
+bool exitOnRebreakInput = input.bool(true, "Exit if price closes back outside the value area", group = GRP_MGMT,
+     tooltip = "The thesis of the trade is that the breakout failed. A close back outside the reference value area says it did not. This usually exits before the stop and is the single most consequential management setting here.")
+int maxBarsInTradeInput = input.int(0, "Time stop (bars, 0 = off)", minval = 0, maxval = 500, group = GRP_MGMT,
+     tooltip = "Mean-reversion trades that have not resolved are decaying option premium. 0 disables.")
+bool flatAtAnchorInput = input.bool(true, "Close positions at the 18:00 anchor rollover", group = GRP_MGMT,
+     tooltip = "At the anchor the reference value area is replaced, so an open trade's levels no longer exist. Holding through it is holding a position whose thesis has been deleted.")
+
+// -- Sizing --
+string sizingModeInput = input.string(SZ_FIXED, "Position sizing", options = [SZ_FIXED, SZ_RISK], group = GRP_SIZE)
+int fixedQtyInput = input.int(1, "Fixed contracts", minval = 1, group = GRP_SIZE)
+float riskPercentInput = input.float(0.5, "Risk % of equity", minval = 0.01, maxval = 10.0, step = 0.05, group = GRP_SIZE)
+int maxQtyInput = input.int(20, "Maximum contracts", minval = 1, group = GRP_SIZE)
+
+// -- Display --
+bool showProfileInput = input.bool(true, "Show current profile", group = GRP_DISP)
+bool showPreviousProfileInput = input.bool(true, "Show previous profile", group = GRP_DISP)
+bool showLevelsInput = input.bool(true, "Show value-area levels", group = GRP_DISP)
+bool showPocInput = input.bool(false, "Show POC", group = GRP_DISP)
+bool showDashboardInput = input.bool(true, "Show dashboard", group = GRP_DISP)
+bool showSignalMarkersInput = input.bool(true, "Show reclaim markers", group = GRP_DISP)
+color valueAreaHighColorInput = input.color(color.new(#089981, 0), "VAH", group = GRP_DISP)
+color valueAreaLowColorInput = input.color(color.new(#f23645, 0), "VAL", group = GRP_DISP)
+color pocColorInput = input.color(color.new(#5b9cf6, 0), "POC", group = GRP_DISP)
+color upVolumeColorInput = input.color(color.new(#089981, 35), "Up-volume profile", group = GRP_DISP)
+color downVolumeColorInput = input.color(color.new(#f23645, 35), "Down-volume profile", group = GRP_DISP)
+color profileOutlineColorInput = input.color(color.new(color.gray, 100), "Profile outline", group = GRP_DISP)
+color insignificantProfileColorInput = input.color(color.new(color.gray, 20), "Insignificant profile rows", group = GRP_DISP)
+color bullishReclaimSignalColorInput = input.color(#089981, "Bullish reclaim", group = GRP_DISP)
+color bearishReclaimSignalColorInput = input.color(#f23645, "Bearish reclaim", group = GRP_DISP)
+
+bool useCurrentSignals  = signalSourceInput == SRC_CURR or signalSourceInput == SRC_BOTH
+bool usePreviousSignals = signalSourceInput == SRC_PREV or signalSourceInput == SRC_BOTH
+
+// -----------------------------------------------------------------------------
+// 3 - Profile helper functions (ported verbatim from the indicator)
+// -----------------------------------------------------------------------------
+addVolumeToBins(array<float> bins, float barLow, float barHigh, float barVolume, float rangeLow, float binSize, int rows) =>
+    int binCount = array.size(bins)
+    if barVolume > 0 and binSize > 0 and binCount > 0
+        int firstIndex = int(math.floor((barLow - rangeLow) / binSize))
+        int lastIndex = int(math.floor((barHigh - rangeLow) / binSize))
+        firstIndex := math.max(0, math.min(binCount - 1, firstIndex))
+        lastIndex := math.max(0, math.min(binCount - 1, lastIndex))
+        if firstIndex <= lastIndex
+            float volumePerBin = barVolume / (lastIndex - firstIndex + 1)
+            for binIndex = firstIndex to lastIndex
+                if binIndex >= 0 and binIndex < binCount
+                    array.set(bins, binIndex, array.get(bins, binIndex) + volumePerBin)
+
+resetBins(array<float> bins, int rows) =>
+    array.clear(bins)
+    for binIndex = 0 to rows - 1
+        array.push(bins, 0.0)
+
+getProfileLevels(array<float> bins, float rangeLow, float stepSize, float valueAreaPercent) =>
+    int binCount = array.size(bins)
+    float totalVolume = 0.0
+    float maximumVolume = 0.0
+    int pocBinIndex = 0
+    if binCount > 0
+        for binIndex = 0 to binCount - 1
+            float binVolume = array.get(bins, binIndex)
+            totalVolume += binVolume
+            if binVolume > maximumVolume
+                maximumVolume := binVolume
+                pocBinIndex := binIndex
+    float targetVolume = totalVolume * valueAreaPercent / 100.0
+    float accumulatedVolume = maximumVolume
+    int valueAreaLowBinIndex = pocBinIndex
+    int valueAreaHighBinIndex = pocBinIndex
+    if totalVolume > 0
+        for expansion = 1 to binCount
+            if accumulatedVolume >= targetVolume
+                break
+            int lowerIndex = pocBinIndex - expansion
+            int upperIndex = pocBinIndex + expansion
+            bool canExpandLower = lowerIndex >= 0 and lowerIndex < binCount
+            bool canExpandUpper = upperIndex >= 0 and upperIndex < binCount
+            float lowerVolume = 0.0
+            float upperVolume = 0.0
+            if canExpandLower
+                lowerVolume := array.get(bins, lowerIndex)
+            if canExpandUpper
+                upperVolume := array.get(bins, upperIndex)
+            if canExpandLower and (not canExpandUpper or lowerVolume >= upperVolume)
+                accumulatedVolume += lowerVolume
+                valueAreaLowBinIndex := lowerIndex
+            else if canExpandUpper
+                accumulatedVolume += upperVolume
+                valueAreaHighBinIndex := upperIndex
+    float valueAreaLow = totalVolume > 0 ? rangeLow + valueAreaLowBinIndex * stepSize : na
+    float valueAreaHigh = totalVolume > 0 ? rangeLow + (valueAreaHighBinIndex + 1) * stepSize : na
+    float pointOfControl = totalVolume > 0 ? rangeLow + (pocBinIndex + 0.5) * stepSize : na
+    [valueAreaHigh, valueAreaLow, pointOfControl]
+
+// -----------------------------------------------------------------------------
+// 4 - Persistent state
+// -----------------------------------------------------------------------------
+var array<float> barHighArray = array.new_float()
+var array<float> barLowArray = array.new_float()
+var array<float> upVolumeArray = array.new_float()
+var array<float> downVolumeArray = array.new_float()
+var array<float> profileVolumeArray = array.new_float()
+var array<float> profileUpVolumeArray = array.new_float()
+var array<float> profileDownVolumeArray = array.new_float()
+var array<float> previousProfileVolumeArray = array.new_float()
+var array<float> previousProfileUpVolumeArray = array.new_float()
+var array<float> previousProfileDownVolumeArray = array.new_float()
+var array<box> profileBoxArray = array.new<box>()
+
+var bool  bearishBreakoutActive = false
+var bool  bullishBreakoutActive = false
+var bool  bearishVolumeWasSlowing = false
+var bool  bullishVolumeWasSlowing = false
+var float lastBearishBreakoutVolume = na
+var float lastBullishBreakoutVolume = na
+var int   bearishBreakoutBars = 0
+var int   bullishBreakoutBars = 0
+var float bearishBreakoutLow = na
+var float bullishBreakoutHigh = na
+
+var bool  previousBearishBreakoutActive = false
+var bool  previousBullishBreakoutActive = false
+var bool  previousBearishVolumeWasSlowing = false
+var bool  previousBullishVolumeWasSlowing = false
+var float previousLastBearishBreakoutVolume = na
+var float previousLastBullishBreakoutVolume = na
+var int   previousBearishBreakoutBars = 0
+var int   previousBullishBreakoutBars = 0
+var float previousBearishBreakoutLow = na
+var float previousBullishBreakoutHigh = na
+
+var int   activeAnchorTimestamp = na
+var int   activeAnchorBarIndex = na
+var float profileLow = na
+var float profileHigh = na
+var float binSize = na
+var int   previousAnchorBarIndex = na
+var float previousProfileLow = na
+var float previousBinSize = na
+var bool  hasPreviousProfile = false
+
+var int sessionEntryCount = 0
+
+// -----------------------------------------------------------------------------
+// 5 - Anchor detection and rollover
+// -----------------------------------------------------------------------------
+int localYear = year(time, ANCHOR_TIMEZONE)
+int localMonth = month(time, ANCHOR_TIMEZONE)
+int localDay = dayofmonth(time, ANCHOR_TIMEZONE)
+int todaysAnchorTimestamp = timestamp(ANCHOR_TIMEZONE, localYear, localMonth, localDay, ANCHOR_HOUR, 0)
+int anchorTimestamp = time >= todaysAnchorTimestamp ? todaysAnchorTimestamp : timestamp(ANCHOR_TIMEZONE, localYear, localMonth, localDay - 1, ANCHOR_HOUR, 0)
+bool isNewAnchor = na(activeAnchorTimestamp) or anchorTimestamp != activeAnchorTimestamp
+
+if isNewAnchor
+    if not na(activeAnchorTimestamp) and not na(profileLow) and array.size(profileVolumeArray) > 0
+        previousProfileVolumeArray := array.copy(profileVolumeArray)
+        previousProfileUpVolumeArray := array.copy(profileUpVolumeArray)
+        previousProfileDownVolumeArray := array.copy(profileDownVolumeArray)
+        previousAnchorBarIndex := activeAnchorBarIndex
+        previousProfileLow := profileLow
+        previousBinSize := binSize
+        hasPreviousProfile := true
+    activeAnchorTimestamp := anchorTimestamp
+    activeAnchorBarIndex := bar_index
+    array.clear(barHighArray)
+    array.clear(barLowArray)
+    array.clear(upVolumeArray)
+    array.clear(downVolumeArray)
+    bearishBreakoutActive := false
+    bullishBreakoutActive := false
+    bearishVolumeWasSlowing := false
+    bullishVolumeWasSlowing := false
+    lastBearishBreakoutVolume := na
+    lastBullishBreakoutVolume := na
+    bearishBreakoutBars := 0
+    bullishBreakoutBars := 0
+    bearishBreakoutLow := na
+    bullishBreakoutHigh := na
+    previousBearishBreakoutActive := false
+    previousBullishBreakoutActive := false
+    previousBearishVolumeWasSlowing := false
+    previousBullishVolumeWasSlowing := false
+    previousLastBearishBreakoutVolume := na
+    previousLastBullishBreakoutVolume := na
+    previousBearishBreakoutBars := 0
+    previousBullishBreakoutBars := 0
+    previousBearishBreakoutLow := na
+    previousBullishBreakoutHigh := na
+    sessionEntryCount := 0
+    profileLow := na
+    profileHigh := na
+    binSize := na
+    resetBins(profileVolumeArray, rowsInput)
+    resetBins(profileUpVolumeArray, rowsInput)
+    resetBins(profileDownVolumeArray, rowsInput)
+
+// -----------------------------------------------------------------------------
+// 6 - Volume accumulation and profile rebuild
+// -----------------------------------------------------------------------------
+float currentVolume = nz(volume, 0.0)
+float currentUpVolume = close >= open ? currentVolume : 0.0
+float currentDownVolume = close < open ? currentVolume : 0.0
+array.push(barHighArray, high)
+array.push(barLowArray, low)
+array.push(upVolumeArray, currentUpVolume)
+array.push(downVolumeArray, currentDownVolume)
+
+bool rangeChanged = na(profileLow) or low < profileLow or high > profileHigh
+if rangeChanged
+    profileLow := na(profileLow) ? low : math.min(profileLow, low)
+    profileHigh := na(profileHigh) ? high : math.max(profileHigh, high)
+    binSize := math.max((profileHigh - profileLow) / rowsInput, syminfo.mintick)
+    resetBins(profileVolumeArray, rowsInput)
+    resetBins(profileUpVolumeArray, rowsInput)
+    resetBins(profileDownVolumeArray, rowsInput)
+    int storedBars = array.size(barHighArray)
+    for storedBarIndex = 0 to storedBars - 1
+        float storedHigh = array.get(barHighArray, storedBarIndex)
+        float storedLow = array.get(barLowArray, storedBarIndex)
+        float storedUpVolume = array.get(upVolumeArray, storedBarIndex)
+        float storedDownVolume = array.get(downVolumeArray, storedBarIndex)
+        addVolumeToBins(profileUpVolumeArray, storedLow, storedHigh, storedUpVolume, profileLow, binSize, rowsInput)
+        addVolumeToBins(profileDownVolumeArray, storedLow, storedHigh, storedDownVolume, profileLow, binSize, rowsInput)
+        addVolumeToBins(profileVolumeArray, storedLow, storedHigh, storedUpVolume + storedDownVolume, profileLow, binSize, rowsInput)
+else
+    addVolumeToBins(profileUpVolumeArray, low, high, currentUpVolume, profileLow, binSize, rowsInput)
+    addVolumeToBins(profileDownVolumeArray, low, high, currentDownVolume, profileLow, binSize, rowsInput)
+    addVolumeToBins(profileVolumeArray, low, high, currentVolume, profileLow, binSize, rowsInput)
+
+// -----------------------------------------------------------------------------
+// 7 - Value area levels
+// -----------------------------------------------------------------------------
+int profileBinCount = array.size(profileVolumeArray)
+float totalProfileVolume = 0.0
+float maximumBinVolume = 0.0
+int pocIndex = 0
+for binIndex = 0 to profileBinCount - 1
+    float binVolume = array.get(profileVolumeArray, binIndex)
+    totalProfileVolume += binVolume
+    if binVolume > maximumBinVolume
+        maximumBinVolume := binVolume
+        pocIndex := binIndex
+
+float valueAreaTarget = totalProfileVolume * valueAreaPercentInput / 100.0
+float valueAreaAccumulated = maximumBinVolume
+int valueAreaLowIndex = pocIndex
+int valueAreaHighIndex = pocIndex
+if totalProfileVolume > 0
+    for expansion = 1 to profileBinCount
+        if valueAreaAccumulated >= valueAreaTarget
+            break
+        int lowerIndex = pocIndex - expansion
+        int upperIndex = pocIndex + expansion
+        bool canExpandLower = lowerIndex >= 0 and lowerIndex < profileBinCount
+        bool canExpandUpper = upperIndex >= 0 and upperIndex < profileBinCount
+        float lowerVolume = 0.0
+        float upperVolume = 0.0
+        if canExpandLower
+            lowerVolume := array.get(profileVolumeArray, lowerIndex)
+        if canExpandUpper
+            upperVolume := array.get(profileVolumeArray, upperIndex)
+        if canExpandLower and (not canExpandUpper or lowerVolume >= upperVolume)
+            valueAreaAccumulated += lowerVolume
+            valueAreaLowIndex := lowerIndex
+        else if canExpandUpper
+            valueAreaAccumulated += upperVolume
+            valueAreaHighIndex := upperIndex
+
+float valueAreaLow = totalProfileVolume > 0 ? profileLow + valueAreaLowIndex * binSize : na
+float valueAreaHigh = totalProfileVolume > 0 ? profileLow + (valueAreaHighIndex + 1) * binSize : na
+float pointOfControl = totalProfileVolume > 0 ? profileLow + (pocIndex + 0.5) * binSize : na
+[previousValueAreaHigh, previousValueAreaLow, previousPointOfControl] = getProfileLevels(previousProfileVolumeArray, previousProfileLow, previousBinSize, valueAreaPercentInput)
+
+// -----------------------------------------------------------------------------
+// 8 - Reclaim signal state machines (ported, plus breakout-extreme tracking)
+// -----------------------------------------------------------------------------
+float atrValue = ta.atr(atrLengthInput)
+
+bool bullishEngulfing = close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+bool bearishEngulfing = close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+
+bool bullishReclaimSignal = false
+bool bearishReclaimSignal = false
+bool hasValueArea = not na(valueAreaLow) and not na(valueAreaHigh)
+if hasValueArea
+    if close < valueAreaLow
+        bullishBreakoutActive := false
+        bullishBreakoutBars := 0
+        bullishVolumeWasSlowing := false
+        lastBullishBreakoutVolume := na
+        bullishBreakoutHigh := na
+        if not bearishBreakoutActive
+            bearishVolumeWasSlowing := false
+            lastBearishBreakoutVolume := na
+            bearishBreakoutBars := 1
+            bearishBreakoutLow := low
+        else
+            bearishBreakoutBars += 1
+            bearishBreakoutLow := math.min(nz(bearishBreakoutLow, low), low)
+        bearishBreakoutActive := true
+        if currentDownVolume > 0
+            if not na(lastBearishBreakoutVolume) and currentDownVolume < lastBearishBreakoutVolume
+                bearishVolumeWasSlowing := true
+            lastBearishBreakoutVolume := currentDownVolume
+    else if close > valueAreaHigh
+        bearishBreakoutActive := false
+        bearishBreakoutBars := 0
+        bearishVolumeWasSlowing := false
+        lastBearishBreakoutVolume := na
+        bearishBreakoutLow := na
+        if not bullishBreakoutActive
+            bullishVolumeWasSlowing := false
+            lastBullishBreakoutVolume := na
+            bullishBreakoutBars := 1
+            bullishBreakoutHigh := high
+        else
+            bullishBreakoutBars += 1
+            bullishBreakoutHigh := math.max(nz(bullishBreakoutHigh, high), high)
+        bullishBreakoutActive := true
+        if currentUpVolume > 0
+            if not na(lastBullishBreakoutVolume) and currentUpVolume < lastBullishBreakoutVolume
+                bullishVolumeWasSlowing := true
+            lastBullishBreakoutVolume := currentUpVolume
+    else
+        bullishReclaimSignal := bullishEngulfing and bearishBreakoutActive and bearishBreakoutBars <= maxReversionBarsInput and bearishVolumeWasSlowing and currentUpVolume > currentDownVolume and currentUpVolume > nz(lastBearishBreakoutVolume, 0.0)
+        bearishReclaimSignal := bearishEngulfing and bullishBreakoutActive and bullishBreakoutBars <= maxReversionBarsInput and bullishVolumeWasSlowing and currentDownVolume > currentUpVolume and currentDownVolume > nz(lastBullishBreakoutVolume, 0.0)
+        bearishBreakoutActive := false
+        bullishBreakoutActive := false
+        bearishBreakoutBars := 0
+        bullishBreakoutBars := 0
+        bearishVolumeWasSlowing := false
+        bullishVolumeWasSlowing := false
+        lastBearishBreakoutVolume := na
+        lastBullishBreakoutVolume := na
+
+bool previousBullishReclaimSignal = false
+bool previousBearishReclaimSignal = false
+bool hasPreviousSignalValueArea = hasPreviousProfile and not na(previousValueAreaLow) and not na(previousValueAreaHigh)
+if hasPreviousSignalValueArea
+    if close < previousValueAreaLow
+        previousBullishBreakoutActive := false
+        previousBullishBreakoutBars := 0
+        previousBullishVolumeWasSlowing := false
+        previousLastBullishBreakoutVolume := na
+        previousBullishBreakoutHigh := na
+        if not previousBearishBreakoutActive
+            previousBearishVolumeWasSlowing := false
+            previousLastBearishBreakoutVolume := na
+            previousBearishBreakoutBars := 1
+            previousBearishBreakoutLow := low
+        else
+            previousBearishBreakoutBars += 1
+            previousBearishBreakoutLow := math.min(nz(previousBearishBreakoutLow, low), low)
+        previousBearishBreakoutActive := true
+        if currentDownVolume > 0
+            if not na(previousLastBearishBreakoutVolume) and currentDownVolume < previousLastBearishBreakoutVolume
+                previousBearishVolumeWasSlowing := true
+            previousLastBearishBreakoutVolume := currentDownVolume
+    else if close > previousValueAreaHigh
+        previousBearishBreakoutActive := false
+        previousBearishBreakoutBars := 0
+        previousBearishVolumeWasSlowing := false
+        previousLastBearishBreakoutVolume := na
+        previousBearishBreakoutLow := na
+        if not previousBullishBreakoutActive
+            previousBullishVolumeWasSlowing := false
+            previousLastBullishBreakoutVolume := na
+            previousBullishBreakoutBars := 1
+            previousBullishBreakoutHigh := high
+        else
+            previousBullishBreakoutBars += 1
+            previousBullishBreakoutHigh := math.max(nz(previousBullishBreakoutHigh, high), high)
+        previousBullishBreakoutActive := true
+        if currentUpVolume > 0
+            if not na(previousLastBullishBreakoutVolume) and currentUpVolume < previousLastBullishBreakoutVolume
+                previousBullishVolumeWasSlowing := true
+            previousLastBullishBreakoutVolume := currentUpVolume
+    else
+        previousBullishReclaimSignal := bullishEngulfing and previousBearishBreakoutActive and previousBearishBreakoutBars <= maxReversionBarsInput and previousBearishVolumeWasSlowing and currentUpVolume > currentDownVolume and currentUpVolume > nz(previousLastBearishBreakoutVolume, 0.0)
+        previousBearishReclaimSignal := bearishEngulfing and previousBullishBreakoutActive and previousBullishBreakoutBars <= maxReversionBarsInput and previousBullishVolumeWasSlowing and currentDownVolume > currentUpVolume and currentDownVolume > nz(previousLastBullishBreakoutVolume, 0.0)
+        previousBearishBreakoutActive := false
+        previousBullishBreakoutActive := false
+        previousBearishBreakoutBars := 0
+        previousBullishBreakoutBars := 0
+        previousBearishVolumeWasSlowing := false
+        previousBullishVolumeWasSlowing := false
+        previousLastBearishBreakoutVolume := na
+        previousLastBullishBreakoutVolume := na
+
+// -----------------------------------------------------------------------------
+// 9 - Signal selection and reference levels
+// -----------------------------------------------------------------------------
+// Previous-session signals take priority: that value area is fixed for the whole
+// session, while the current-session one is still being built from the same bars
+// the signal is measured against.
+bool prevLongSignal  = usePreviousSignals and previousBullishReclaimSignal
+bool prevShortSignal = usePreviousSignals and previousBearishReclaimSignal
+bool currLongSignal  = useCurrentSignals and bullishReclaimSignal
+bool currShortSignal = useCurrentSignals and bearishReclaimSignal
+
+int signalDirection = 0
+int signalSource = 0
+if prevLongSignal
+    signalDirection := 1
+    signalSource := 1
+else if prevShortSignal
+    signalDirection := -1
+    signalSource := 1
+else if currLongSignal
+    signalDirection := 1
+    signalSource := 2
+else if currShortSignal
+    signalDirection := -1
+    signalSource := 2
+
+float refValueAreaHigh = signalSource == 1 ? previousValueAreaHigh : valueAreaHigh
+float refValueAreaLow  = signalSource == 1 ? previousValueAreaLow : valueAreaLow
+float refPointOfControl = signalSource == 1 ? previousPointOfControl : pointOfControl
+float refBreakoutLow   = signalSource == 1 ? previousBearishBreakoutLow : bearishBreakoutLow
+float refBreakoutHigh  = signalSource == 1 ? previousBullishBreakoutHigh : bullishBreakoutHigh
+
+// -----------------------------------------------------------------------------
+// 10 - Trade geometry
+// -----------------------------------------------------------------------------
+float tickSize = syminfo.mintick
+float stopBuffer = stopBufferAtrInput * nz(atrValue, 0.0)
+float entryProxy = close
+
+float rawStop = na
+if signalDirection == 1
+    rawStop := switch stopModeInput
+        SL_BREAKOUT => math.min(nz(refBreakoutLow, low), low) - stopBuffer
+        SL_SIGNAL   => low - stopBuffer
+        SL_ATR      => entryProxy - stopAtrMultInput * nz(atrValue, 0.0)
+        SL_VAEDGE   => nz(refValueAreaLow, low) - stopBuffer
+        => math.min(nz(refBreakoutLow, low), low) - stopBuffer
+else if signalDirection == -1
+    rawStop := switch stopModeInput
+        SL_BREAKOUT => math.max(nz(refBreakoutHigh, high), high) + stopBuffer
+        SL_SIGNAL   => high + stopBuffer
+        SL_ATR      => entryProxy + stopAtrMultInput * nz(atrValue, 0.0)
+        SL_VAEDGE   => nz(refValueAreaHigh, high) + stopBuffer
+        => math.max(nz(refBreakoutHigh, high), high) + stopBuffer
+
+float stopDistance = signalDirection == 1 ? entryProxy - rawStop : signalDirection == -1 ? rawStop - entryProxy : na
+
+// Target ladder. A POC or opposite-edge target can sit on the wrong side of the
+// entry when the reclaim bar closes far into the value area; those signals fall
+// back to the R-multiple rather than being traded with an inverted target.
+float rawFirstTarget = na
+float rawFinalTarget = na
+if signalDirection != 0 and not na(stopDistance)
+    float sign = signalDirection
+    rawFirstTarget := switch firstTargetInput
+        TP_POC => refPointOfControl
+        TP_OPP => signalDirection == 1 ? refValueAreaHigh : refValueAreaLow
+        TP_R   => entryProxy + sign * firstTargetRInput * stopDistance
+        TP_ATR => entryProxy + sign * firstTargetAtrInput * nz(atrValue, 0.0)
+        => refPointOfControl
+    rawFinalTarget := switch finalTargetInput
+        TP_OPP => signalDirection == 1 ? refValueAreaHigh : refValueAreaLow
+        TP_POC => refPointOfControl
+        TP_R   => entryProxy + sign * finalTargetRInput * stopDistance
+        TP_ATR => entryProxy + sign * finalTargetAtrInput * nz(atrValue, 0.0)
+        => signalDirection == 1 ? refValueAreaHigh : refValueAreaLow
+
+bool finalTargetValid = signalDirection == 1 ? not na(rawFinalTarget) and rawFinalTarget > entryProxy + tickSize : signalDirection == -1 ? not na(rawFinalTarget) and rawFinalTarget < entryProxy - tickSize : false
+float finalTarget = finalTargetValid ? rawFinalTarget : signalDirection != 0 and not na(stopDistance) ? entryProxy + signalDirection * finalTargetRInput * stopDistance : na
+
+bool firstTargetValid = false
+if signalDirection == 1 and not na(rawFirstTarget) and not na(finalTarget)
+    firstTargetValid := rawFirstTarget > entryProxy + tickSize and rawFirstTarget < finalTarget
+else if signalDirection == -1 and not na(rawFirstTarget) and not na(finalTarget)
+    firstTargetValid := rawFirstTarget < entryProxy - tickSize and rawFirstTarget > finalTarget
+float firstTarget = firstTargetValid ? rawFirstTarget : finalTarget
+bool takePartial = usePartialInput and firstTargetValid
+
+float rewardRisk = not na(stopDistance) and stopDistance > 0 and not na(finalTarget) ? math.abs(finalTarget - entryProxy) / stopDistance : na
+
+// -----------------------------------------------------------------------------
+// 11 - Entry filters
+// -----------------------------------------------------------------------------
+bool inTradingWindow = not useTradingWindowInput or not na(time(timeframe.period, tradingWindowInput, ANCHOR_TIMEZONE))
+bool directionAllowed = tradeDirectionInput == DIR_BOTH or (tradeDirectionInput == DIR_LONG and signalDirection == 1) or (tradeDirectionInput == DIR_SHORT and signalDirection == -1)
+bool stopDistanceOk = not na(stopDistance) and stopDistance >= minStopTicksInput * tickSize and (maxStopAtrInput <= 0.0 or na(atrValue) or stopDistance <= maxStopAtrInput * atrValue)
+bool rewardRiskOk = not na(rewardRisk) and rewardRisk >= minRewardRiskInput
+bool sessionRoomOk = sessionEntryCount < maxTradesPerSessionInput
+bool flatNow = strategy.position_size == 0
+
+bool tradeAllowed = signalDirection != 0 and barstate.isconfirmed and directionAllowed and inTradingWindow and stopDistanceOk and rewardRiskOk and sessionRoomOk and flatNow and not isNewAnchor
+
+// -----------------------------------------------------------------------------
+// 12 - Position sizing
+// -----------------------------------------------------------------------------
+float riskPerUnit = not na(stopDistance) ? stopDistance * syminfo.pointvalue : na
+float riskCapital = strategy.equity * riskPercentInput / 100.0
+int riskQty = not na(riskPerUnit) and riskPerUnit > 0 ? int(math.floor(riskCapital / riskPerUnit)) : 0
+int orderQty = sizingModeInput == SZ_FIXED ? fixedQtyInput : math.max(1, math.min(maxQtyInput, riskQty))
+
+// -----------------------------------------------------------------------------
+// 13 - Trade state
+// -----------------------------------------------------------------------------
+var int    tradeDirection = 0
+var int    tradeSourceId = 0
+var string activeEntryId = ""
+var float  activeStop = na
+var float  activeFirstTarget = na
+var float  activeFinalTarget = na
+var float  initialQty = na
+var float  tradeRiskDistance = na
+var float  tradeRefVaLow = na
+var float  tradeRefVaHigh = na
+var int    tradeEntryBar = na
+var bool   breakevenDone = false
+var bool   partialFilled = false
+var bool   tradeTakesPartial = false
+
+var int signalsSeen = 0
+var int signalsSkipped = 0
+if signalDirection != 0
+    signalsSeen += 1
+    if not tradeAllowed
+        signalsSkipped += 1
+
+// -----------------------------------------------------------------------------
+// 14 - Stats bookkeeping (indexed by entry bar so partial exits fold together)
+// -----------------------------------------------------------------------------
+var map<int, float> riskByEntry = map.new<int, float>()
+var map<int, float> qtyByEntry = map.new<int, float>()
+var map<int, float> srcByEntry = map.new<int, float>()
+var map<int, float> fracByEntry = map.new<int, float>()
+var map<int, float> rByEntry = map.new<int, float>()
+var int processedClosedTrades = 0
+var array<int> tradeCountBySource = array.from(0, 0)
+var array<int> winCountBySource = array.from(0, 0)
+var array<float> sumRBySource = array.from(0.0, 0.0)
+
+// -----------------------------------------------------------------------------
+// 15 - Entries
+// -----------------------------------------------------------------------------
+string longEntryId = signalSource == 1 ? "L-PVA" : "L-CVA"
+string shortEntryId = signalSource == 1 ? "S-PVA" : "S-CVA"
+
+if tradeAllowed and signalDirection == 1
+    strategy.entry(longEntryId, strategy.long, qty = orderQty)
+    tradeDirection := 1
+    tradeSourceId := signalSource
+    activeEntryId := longEntryId
+    activeStop := rawStop
+    activeFirstTarget := firstTarget
+    activeFinalTarget := finalTarget
+    initialQty := orderQty
+    tradeRiskDistance := stopDistance
+    tradeRefVaLow := refValueAreaLow
+    tradeRefVaHigh := refValueAreaHigh
+    tradeEntryBar := bar_index
+    breakevenDone := false
+    partialFilled := false
+    tradeTakesPartial := takePartial
+    sessionEntryCount += 1
+    map.put(riskByEntry, bar_index, stopDistance)
+    map.put(qtyByEntry, bar_index, float(orderQty))
+    map.put(srcByEntry, bar_index, float(signalSource))
+
+if tradeAllowed and signalDirection == -1
+    strategy.entry(shortEntryId, strategy.short, qty = orderQty)
+    tradeDirection := -1
+    tradeSourceId := signalSource
+    activeEntryId := shortEntryId
+    activeStop := rawStop
+    activeFirstTarget := firstTarget
+    activeFinalTarget := finalTarget
+    initialQty := orderQty
+    tradeRiskDistance := stopDistance
+    tradeRefVaLow := refValueAreaLow
+    tradeRefVaHigh := refValueAreaHigh
+    tradeEntryBar := bar_index
+    breakevenDone := false
+    partialFilled := false
+    tradeTakesPartial := takePartial
+    sessionEntryCount += 1
+    map.put(riskByEntry, bar_index, stopDistance)
+    map.put(qtyByEntry, bar_index, float(orderQty))
+    map.put(srcByEntry, bar_index, float(signalSource))
+
+// -----------------------------------------------------------------------------
+// 16 - Trade management
+// -----------------------------------------------------------------------------
+float openSize = math.abs(strategy.position_size)
+
+// Detect the first-target fill: the position shrank without going flat.
+if tradeDirection != 0 and openSize > 0 and not na(initialQty) and openSize < initialQty - 0.0000001
+    partialFilled := true
+
+if moveToBreakevenInput and partialFilled and not breakevenDone and tradeDirection != 0 and not na(tradeRiskDistance)
+    float beOffset = breakevenOffsetAtrInput * nz(atrValue, 0.0)
+    activeStop := strategy.position_avg_price + tradeDirection * beOffset
+    breakevenDone := true
+
+// Issued on the SIGNAL bar as well as every bar the position is open. The entry
+// is a market order that fills at the next bar's open; waiting for the fill to
+// be visible before bracketing it would leave one full bar unprotected.
+if tradeDirection != 0 and not na(activeStop) and not na(activeFinalTarget) and activeEntryId != ""
+    if tradeTakesPartial and not partialFilled
+        strategy.exit("VA-TP1", activeEntryId, qty_percent = partialPercentInput, stop = activeStop, limit = activeFirstTarget)
+    strategy.exit("VA-TP2", activeEntryId, stop = activeStop, limit = activeFinalTarget)
+
+// Invalidation: the trade says the breakout failed. A close back outside the
+// reference value area says it did not.
+bool longRebreak = tradeDirection == 1 and not na(tradeRefVaLow) and close < tradeRefVaLow
+bool shortRebreak = tradeDirection == -1 and not na(tradeRefVaHigh) and close > tradeRefVaHigh
+if exitOnRebreakInput and openSize > 0 and (longRebreak or shortRebreak)
+    strategy.close_all(comment = "VA re-break")
+
+bool timeStopHit = maxBarsInTradeInput > 0 and tradeDirection != 0 and not na(tradeEntryBar) and bar_index - tradeEntryBar >= maxBarsInTradeInput
+if timeStopHit and openSize > 0
+    strategy.close_all(comment = "Time stop")
+
+if flatAtAnchorInput and isNewAnchor and openSize > 0
+    strategy.close_all(comment = "Anchor rollover")
+
+// Position sync: clear the state machine once flat so a stale stop cannot leak
+// into the next trade.
+// Guarded on bar_index: on the signal bar the entry has not filled yet, so an
+// unguarded flat check would erase the trade state before it is ever used.
+if strategy.position_size == 0 and tradeDirection != 0 and not na(tradeEntryBar) and bar_index > tradeEntryBar
+    tradeDirection := 0
+    tradeSourceId := 0
+    activeEntryId := ""
+    activeStop := na
+    activeFirstTarget := na
+    activeFinalTarget := na
+    initialQty := na
+    tradeRiskDistance := na
+    tradeRefVaLow := na
+    tradeRefVaHigh := na
+    tradeEntryBar := na
+    breakevenDone := false
+    partialFilled := false
+    tradeTakesPartial := false
+
+// -----------------------------------------------------------------------------
+// 17 - Closed-trade accounting
+// -----------------------------------------------------------------------------
+if strategy.closedtrades > processedClosedTrades
+    for tradeIndex = processedClosedTrades to strategy.closedtrades - 1
+        int entryBar = strategy.closedtrades.entry_bar_index(tradeIndex)
+        if map.contains(riskByEntry, entryBar)
+            float storedRisk = map.get(riskByEntry, entryBar)
+            float storedQty = map.get(qtyByEntry, entryBar)
+            float storedSource = map.get(srcByEntry, entryBar)
+            float closedSize = strategy.closedtrades.size(tradeIndex)
+            float sizeSign = closedSize >= 0 ? 1.0 : -1.0
+            float entryFill = strategy.closedtrades.entry_price(tradeIndex)
+            float exitFill = strategy.closedtrades.exit_price(tradeIndex)
+            float sizeFraction = storedQty > 0 ? math.abs(closedSize) / storedQty : 1.0
+            float partialR = storedRisk > 0 ? (exitFill - entryFill) * sizeSign / storedRisk * sizeFraction : 0.0
+            map.put(rByEntry, entryBar, nz(map.get(rByEntry, entryBar), 0.0) + partialR)
+            map.put(fracByEntry, entryBar, nz(map.get(fracByEntry, entryBar), 0.0) + sizeFraction)
+            if map.get(fracByEntry, entryBar) >= 0.999
+                float totalR = map.get(rByEntry, entryBar)
+                int sourceIndex = storedSource == 1.0 ? 0 : 1
+                array.set(tradeCountBySource, sourceIndex, array.get(tradeCountBySource, sourceIndex) + 1)
+                array.set(sumRBySource, sourceIndex, array.get(sumRBySource, sourceIndex) + totalR)
+                if totalR > 0
+                    array.set(winCountBySource, sourceIndex, array.get(winCountBySource, sourceIndex) + 1)
+                map.remove(riskByEntry, entryBar)
+                map.remove(qtyByEntry, entryBar)
+                map.remove(srcByEntry, entryBar)
+                map.remove(rByEntry, entryBar)
+                map.remove(fracByEntry, entryBar)
+    processedClosedTrades := strategy.closedtrades
+
+// -----------------------------------------------------------------------------
+// 18 - Signal accounting by source
+// -----------------------------------------------------------------------------
+var array<int> signalsBySource = array.from(0, 0)
+var array<int> skippedBySource = array.from(0, 0)
+if signalDirection != 0
+    int srcIdx = signalSource == 1 ? 0 : 1
+    array.set(signalsBySource, srcIdx, array.get(signalsBySource, srcIdx) + 1)
+    if not tradeAllowed
+        array.set(skippedBySource, srcIdx, array.get(skippedBySource, srcIdx) + 1)
+
+// -----------------------------------------------------------------------------
+// 19 - Value-area levels on the chart
+// -----------------------------------------------------------------------------
+bool drawCurrentLevels = showLevelsInput and useCurrentSignals
+bool drawPreviousLevels = showLevelsInput and hasPreviousProfile
+
+plot(drawCurrentLevels and not na(valueAreaHigh) ? valueAreaHigh : na, "Current VAH", color = valueAreaHighColorInput, style = plot.style_linebr, linewidth = 2)
+plot(drawCurrentLevels and not na(valueAreaLow) ? valueAreaLow : na, "Current VAL", color = valueAreaLowColorInput, style = plot.style_linebr, linewidth = 2)
+plot(drawCurrentLevels and showPocInput and not na(pointOfControl) ? pointOfControl : na, "Current POC", color = pocColorInput, style = plot.style_linebr, linewidth = 2)
+plot(drawPreviousLevels and not na(previousValueAreaHigh) ? previousValueAreaHigh : na, "Previous VAH", color = color.new(valueAreaHighColorInput, 25), style = plot.style_linebr, linewidth = 1)
+plot(drawPreviousLevels and not na(previousValueAreaLow) ? previousValueAreaLow : na, "Previous VAL", color = color.new(valueAreaLowColorInput, 25), style = plot.style_linebr, linewidth = 1)
+plot(drawPreviousLevels and showPocInput and not na(previousPointOfControl) ? previousPointOfControl : na, "Previous POC", color = color.new(pocColorInput, 25), style = plot.style_linebr, linewidth = 1)
+
+plot(tradeDirection != 0 and not na(activeStop) ? activeStop : na, "Active stop", color = color.new(color.red, 20), style = plot.style_linebr, linewidth = 1)
+plot(tradeDirection != 0 and not na(activeFinalTarget) ? activeFinalTarget : na, "Active target", color = color.new(color.teal, 20), style = plot.style_linebr, linewidth = 1)
+
+plotshape(showSignalMarkersInput and prevLongSignal, "Previous VA bullish reclaim", style = shape.triangleup, location = location.belowbar, color = bullishReclaimSignalColorInput, text = "PVA", textcolor = color.white, size = size.tiny)
+plotshape(showSignalMarkersInput and prevShortSignal, "Previous VA bearish reclaim", style = shape.triangledown, location = location.abovebar, color = bearishReclaimSignalColorInput, text = "PVA", textcolor = color.white, size = size.tiny)
+plotshape(showSignalMarkersInput and currLongSignal, "Current VA bullish reclaim", style = shape.triangleup, location = location.belowbar, color = bullishReclaimSignalColorInput, text = "CVA", textcolor = color.white, size = size.tiny)
+plotshape(showSignalMarkersInput and currShortSignal, "Current VA bearish reclaim", style = shape.triangledown, location = location.abovebar, color = bearishReclaimSignalColorInput, text = "CVA", textcolor = color.white, size = size.tiny)
+plotshape(showSignalMarkersInput and signalDirection != 0 and not tradeAllowed, "Filtered signal", style = shape.xcross, location = location.abovebar, color = color.new(color.gray, 30), size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// 20 - Profile histograms (ported from the indicator, redrawn on the last bar)
+// -----------------------------------------------------------------------------
+if barstate.islast
+    if array.size(profileBoxArray) > 0
+        for boxIndex = 0 to array.size(profileBoxArray) - 1
+            box.delete(array.get(profileBoxArray, boxIndex))
+        array.clear(profileBoxArray)
+
+    if showProfileInput and totalProfileVolume > 0 and maximumBinVolume > 0
+        int barsSinceAnchor = math.max(1, bar_index - activeAnchorBarIndex + 1)
+        int availableWidth = math.max(1, math.min(profileWidthInput, barsSinceAnchor))
+        for binIndex = 0 to profileBinCount - 1
+            float binVolume = array.get(profileVolumeArray, binIndex)
+            if binVolume > 0
+                float upBinVolume = array.get(profileUpVolumeArray, binIndex)
+                float downBinVolume = array.get(profileDownVolumeArray, binIndex)
+                float rowBottom = profileLow + binIndex * binSize
+                float rowTop = rowBottom + binSize
+                bool insignificantBin = binVolume < maximumBinVolume * insignificantThresholdInput / 100.0
+                if insignificantBin
+                    int insignificantWidth = math.max(1, int(math.round(availableWidth * binVolume / maximumBinVolume)))
+                    box insignificantBox = box.new(activeAnchorBarIndex, rowTop, activeAnchorBarIndex + insignificantWidth, rowBottom, xloc = xloc.bar_index, border_color = profileOutlineColorInput, bgcolor = insignificantProfileColorInput)
+                    array.push(profileBoxArray, insignificantBox)
+                else
+                    int downWidth = int(math.round(availableWidth * downBinVolume / maximumBinVolume))
+                    int upWidth = int(math.round(availableWidth * upBinVolume / maximumBinVolume))
+                    downWidth := downBinVolume > 0 ? math.max(1, downWidth) : 0
+                    upWidth := upBinVolume > 0 ? math.max(1, upWidth) : 0
+                    if downWidth > 0
+                        box downBox = box.new(activeAnchorBarIndex, rowTop, activeAnchorBarIndex + downWidth, rowBottom, xloc = xloc.bar_index, border_color = profileOutlineColorInput, bgcolor = downVolumeColorInput)
+                        array.push(profileBoxArray, downBox)
+                    if upWidth > 0
+                        box upBox = box.new(activeAnchorBarIndex + downWidth, rowTop, activeAnchorBarIndex + downWidth + upWidth, rowBottom, xloc = xloc.bar_index, border_color = profileOutlineColorInput, bgcolor = upVolumeColorInput)
+                        array.push(profileBoxArray, upBox)
+
+    if showPreviousProfileInput and hasPreviousProfile and array.size(previousProfileVolumeArray) > 0
+        int previousProfileBinCount = array.size(previousProfileVolumeArray)
+        int previousBarsSinceAnchor = math.max(1, bar_index - previousAnchorBarIndex + 1)
+        int previousAvailableWidth = math.max(1, math.min(profileWidthInput, previousBarsSinceAnchor))
+        float previousMaximumBinVolume = 0.0
+        for binIndex = 0 to previousProfileBinCount - 1
+            previousMaximumBinVolume := math.max(previousMaximumBinVolume, array.get(previousProfileVolumeArray, binIndex))
+        if previousMaximumBinVolume > 0
+            for binIndex = 0 to previousProfileBinCount - 1
+                float previousBinVolume = array.get(previousProfileVolumeArray, binIndex)
+                if previousBinVolume > 0
+                    float previousUpVolume = array.get(previousProfileUpVolumeArray, binIndex)
+                    float previousDownVolume = array.get(previousProfileDownVolumeArray, binIndex)
+                    int previousWidth = math.max(1, int(math.round(previousAvailableWidth * previousBinVolume / previousMaximumBinVolume)))
+                    bool previousInsignificantBin = previousBinVolume < previousMaximumBinVolume * insignificantThresholdInput / 100.0
+                    color previousBinColor = previousInsignificantBin ? insignificantProfileColorInput : previousUpVolume >= previousDownVolume ? color.new(upVolumeColorInput, 55) : color.new(downVolumeColorInput, 55)
+                    float previousRowBottom = previousProfileLow + binIndex * previousBinSize
+                    float previousRowTop = previousRowBottom + previousBinSize
+                    box previousBox = box.new(previousAnchorBarIndex, previousRowTop, previousAnchorBarIndex + previousWidth, previousRowBottom, xloc = xloc.bar_index, border_color = profileOutlineColorInput, bgcolor = previousBinColor)
+                    array.push(profileBoxArray, previousBox)
+
+// -----------------------------------------------------------------------------
+// 21 - Dashboard
+// -----------------------------------------------------------------------------
+// The previous / current split is the point of this table. If one source carries
+// the whole result, the other is not an edge -- it is padding on the trade count.
+var table dashboard = table.new(position.top_right, 4, 9, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 60))
+
+formatRatio(int wins, int total) =>
+    total > 0 ? str.tostring(100.0 * wins / total, "#.#") + "%" : "--"
+
+formatAverage(float total, int count) =>
+    count > 0 ? str.tostring(total / count, "#.##") + "R" : "--"
+
+if showDashboardInput and barstate.islast
+    int prevTrades = array.get(tradeCountBySource, 0)
+    int currTrades = array.get(tradeCountBySource, 1)
+    int prevWins = array.get(winCountBySource, 0)
+    int currWins = array.get(winCountBySource, 1)
+    float prevSumR = array.get(sumRBySource, 0)
+    float currSumR = array.get(sumRBySource, 1)
+    color headerColor = color.new(color.gray, 70)
+    table.cell(dashboard, 0, 0, "VARS-S", text_color = color.white, text_size = size.small, bgcolor = headerColor)
+    table.cell(dashboard, 1, 0, "Prev VA", text_color = color.white, text_size = size.small, bgcolor = headerColor)
+    table.cell(dashboard, 2, 0, "Curr VA", text_color = color.white, text_size = size.small, bgcolor = headerColor)
+    table.cell(dashboard, 3, 0, "Total", text_color = color.white, text_size = size.small, bgcolor = headerColor)
+
+    table.cell(dashboard, 0, 1, "Signals", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 1, str.tostring(array.get(signalsBySource, 0)), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 2, 1, str.tostring(array.get(signalsBySource, 1)), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 3, 1, str.tostring(signalsSeen), text_color = color.white, text_size = size.small)
+
+    table.cell(dashboard, 0, 2, "Filtered out", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 2, str.tostring(array.get(skippedBySource, 0)), text_color = color.orange, text_size = size.small)
+    table.cell(dashboard, 2, 2, str.tostring(array.get(skippedBySource, 1)), text_color = color.orange, text_size = size.small)
+    table.cell(dashboard, 3, 2, str.tostring(signalsSkipped), text_color = color.orange, text_size = size.small)
+
+    table.cell(dashboard, 0, 3, "Trades", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 3, str.tostring(prevTrades), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 2, 3, str.tostring(currTrades), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 3, 3, str.tostring(prevTrades + currTrades), text_color = color.white, text_size = size.small)
+
+    table.cell(dashboard, 0, 4, "Win rate", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 4, formatRatio(prevWins, prevTrades), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 2, 4, formatRatio(currWins, currTrades), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 3, 4, formatRatio(prevWins + currWins, prevTrades + currTrades), text_color = color.white, text_size = size.small)
+
+    table.cell(dashboard, 0, 5, "Avg R", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 5, formatAverage(prevSumR, prevTrades), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 2, 5, formatAverage(currSumR, currTrades), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 3, 5, formatAverage(prevSumR + currSumR, prevTrades + currTrades), text_color = color.white, text_size = size.small)
+
+    table.cell(dashboard, 0, 6, "Total R", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 6, str.tostring(prevSumR, "#.##"), text_color = prevSumR >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(dashboard, 2, 6, str.tostring(currSumR, "#.##"), text_color = currSumR >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(dashboard, 3, 6, str.tostring(prevSumR + currSumR, "#.##"), text_color = prevSumR + currSumR >= 0 ? color.lime : color.red, text_size = size.small)
+
+    table.cell(dashboard, 0, 7, "Net profit", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 7, "", text_size = size.small)
+    table.cell(dashboard, 2, 7, "", text_size = size.small)
+    table.cell(dashboard, 3, 7, str.tostring(strategy.netprofit, "#.##"), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+
+    table.cell(dashboard, 0, 8, "Position", text_color = color.silver, text_size = size.small)
+    table.cell(dashboard, 1, 8, tradeSourceId == 1 ? "active" : "", text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 2, 8, tradeSourceId == 2 ? "active" : "", text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 3, 8, str.tostring(strategy.position_size), text_color = color.white, text_size = size.small)
+
+// -----------------------------------------------------------------------------
+// 22 - Alerts
+// -----------------------------------------------------------------------------
+alertcondition(prevLongSignal, "Previous VA bullish reclaim", "Bullish volume reclaimed the previous session's value area after a bearish breakout.")
+alertcondition(prevShortSignal, "Previous VA bearish reclaim", "Bearish volume reclaimed the previous session's value area after a bullish breakout.")
+alertcondition(currLongSignal, "Current VA bullish reclaim", "Bullish volume reclaimed the current session's developing value area after a bearish breakout.")
+alertcondition(currShortSignal, "Current VA bearish reclaim", "Bearish volume reclaimed the current session's developing value area after a bullish breakout.")
+
+if tradeAllowed
+    alert(str.format("VARS-S {0} {1} @ {2} stop {3} target {4} ({5}R)", signalDirection == 1 ? "LONG" : "SHORT", syminfo.ticker, str.tostring(close, format.mintick), str.tostring(rawStop, format.mintick), str.tostring(finalTarget, format.mintick), str.tostring(rewardRisk, "#.##")), alert.freq_once_per_bar_close)
