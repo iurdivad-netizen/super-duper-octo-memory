@@ -327,7 +327,367 @@ limit entry on a pullback into the run is a different conditioning event and is
 not covered by any of this. That is a new hypothesis, not a variation of this
 one, and it needs its own signal, its own script and its own pre-commitment.
 
-## 7. Known gaps
+## 7. Test 3 — does the instrument matter? (NQ and gold)
+
+Two reasons this was worth testing rather than assuming. First, gold is a
+different asset class with different participants. Second — the substantive one
+— **NQ has a structurally better cost ratio than ES**, and cost is the only
+thing that has actually varied across every result so far:
+
+| | Median 15m range | Round-trip friction | Cost as % of R | Net break-even @1.5R |
+|---|---|---|---|---|
+| ES 15m | 25 ticks | ~3 ticks | 12.0% | ~44.8% |
+| **NQ 15m** | **~211 ticks** (52.7 pts @ 25,000) | ~2.5 ticks | **1.2%** | **~40.5%** |
+| XAUUSD 15m | — | ~30 ticks | ~10.6% | ~44% |
+
+NQ's tick is $5 against ES's $12.50 while its bar range is roughly 8× larger in
+ticks, so friction nearly vanishes as a fraction of R. If the ES result were a
+good signal buried under costs, NQ is exactly where it would surface.
+
+### NQ (QQQ 15m as price proxy, 5,000 bars, Dec 2025 – Sep 2026)
+
+| N | n | Hit rate | Optimistic | Ambiguous | z (cons) | z (opt) | Gross R | Net R |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 840 | 35.7% | 37.1% | 1.4% | −2.59 | −1.71 | −0.107 | −0.124 |
+| 3 | 407 | 35.9% | 36.9% | 1.0% | −1.74 | −1.32 | −0.103 | −0.120 |
+| 4 | 193 | 36.8% | 37.8% | 1.0% | −0.93 | −0.62 | −0.080 | −0.096 |
+
+Ambiguity is ~1%, so unlike the RR sweep this is not a tie-breaking artifact —
+both conventions agree. NQ is **worse than ES**: gross −0.08 to −0.11 against
+ES's 0.00, and the hit rate sits below the null under either convention.
+
+The structural advantage is real and it does not help. Low friction moves net
+*toward* gross; it cannot move net *above* gross. With gross negative, the
+cheapest contract in the complex still loses. This is the cleanest confirmation
+of the §5 ceiling argument: cost was never the binding constraint.
+
+*Caveat:* QQQ is an RTH-only ETF standing in for a 23-hour futures contract, and
+its penny spread is nothing like NQ's tick — which is why costs are modelled
+separately above rather than taken from QQQ. It proxies NQ's price behaviour,
+not its microstructure.
+
+### Gold — and a second brush with the same artifact
+
+XAUUSD ambiguity runs 4.6–6.2%, four to six times ES's, because gold's intrabar
+noise is large relative to the stop distance. The two conventions therefore
+disagree about the sign:
+
+| Data | N | n | Conservative | Optimistic | z (cons) | z (opt) |
+|---|---|---|---|---|---|---|
+| XAUUSD 15m | 2 | 629 | 36.7% | 41.3% | −1.70 | **+0.68** |
+| XAUUSD 15m | 3 | 304 | 36.5% | 41.8% | −1.26 | **+0.63** |
+| XAUUSD 1h | 2 | 347 | 39.8% | 45.8% | −0.09 | **+2.18** |
+
+A 2.18σ "edge" on gold 1h that exists only under optimistic tie-breaking is the
+RR=0.5 mistake in a new costume. Resolved rather than assumed: 5m data fetched
+for the same window, 15m bars rebuilt from it, every fill and exit walked on the
+5m sub-bars (residual ambiguity 3–4%, not 0% — gold stays noisy even at 5m).
+
+| N | RR | n | BE% | Hit rate | ±1se | z | Gross R | Net R |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 1.0 | 631 | 50.0% | 46.8% | 2.0 | −1.64 | −0.065 | −0.158 |
+| 2 | 1.5 | 631 | 40.0% | 38.2% | 1.9 | −0.93 | −0.043 | −0.136 |
+| 3 | 1.0 | 305 | 50.0% | 49.8% | 2.9 | −0.06 | +0.001 | −0.105 |
+| 3 | 1.5 | 305 | 40.0% | 39.7% | 2.8 | −0.12 | −0.004 | −0.110 |
+| 3 | 2.0 | 305 | 33.3% | 35.7% | 2.7 | +0.88 | +0.070 | −0.036 |
+| 4 | 1.5 | 153 | 40.0% | 43.1% | 4.0 | +0.78 | +0.085 | +0.028 |
+
+The +2.18σ does not survive. Gold tracks `1/(1+RR)` exactly as ES does, gross is
+zero within noise, and net is negative on the cost drag. The single positive net
+cell (N=4) has n=153 and z=+0.78.
+
+### Verdict
+
+**No. Three instruments, three cost structures, one answer.** ES ≈ 0 gross,
+gold ≈ 0 gross, NQ slightly negative gross. The only thing that varies
+meaningfully across markets is net, and net is fully explained by
+cost-as-a-fraction-of-R — a broker fact, not a market edge.
+
+### A note on how much testing has now happened
+
+Across the three tests this file records: 6 instruments × 4 run lengths ×
+8 R multiples × several filter grids. That is several hundred cells. At the
+conventional 5% threshold, dozens of them should look positive by chance alone,
+and dozens have: ES 3m at min-risk 30, BTC at 25k, gold 1h N=2 optimistic, gold
+5m N=4. Every one shares the same three properties — n < 200, no replication at
+neighbouring parameters, and a position at the edge of a grid.
+
+That pattern is the finding. **Further instrument search is no longer a test of
+the strategy; it is a search for the noisiest cell in a large grid.** Any future
+candidate needs to be pre-registered, sized for the effect being claimed, and
+validated out of sample before it means anything.
+
+## 8. Test 4 — stop placement and trailing exits
+
+Two claims under test: (a) a wider stop — the previous candle's low — helps;
+(b) failing that, a tight trail on each candle's low or an ATR distance helps.
+
+Claim (b) deserved a real test rather than an extrapolation. Tests 1–3 all used
+**fixed** brackets, and a fixed bracket is blind to path shape: it only asks
+which of two levels is touched first. A trailing stop is a different functional
+of the same forward distribution, sensitive to the serial correlation of
+increments. Nothing established so far rules it out.
+
+### First, a correction to the framing — the entry does carry information
+
+The exit test needed a benchmark for path-dependent exits, so it uses a
+**random-entry control**: the identical exit logic fired from randomly chosen
+bars in the same data, which absorbs the instrument's drift and volatility and
+leaves only what the signal adds. The control came back at −0.130R gross, not
+zero, which is worth its own table:
+
+| Entry condition | n | Hit rate | Gross (cons) | ±se | Gross (opt) | vs random |
+|---|---|---|---|---|---|---|
+| random bar & direction | 18611 | 34.8% | −0.130 | 0.009 | −0.095 | — |
+| N=1 (any coloured bar) | 13823 | 36.7% | −0.082 | 0.010 | −0.058 | +0.048R (3.6σ) |
+| N=2 | 6572 | 37.5% | −0.062 | 0.015 | −0.036 | +0.068R (3.9σ) |
+| **N=3** | 3048 | 38.9% | −0.028 | 0.022 | **−0.000** | **+0.102R (4.3σ)** |
+| N=4 | 1470 | 36.7% | −0.084 | 0.031 | −0.055 | +0.046R (1.4σ) |
+| N≥5 | 1274 | 37.0% | −0.076 | 0.034 | −0.060 | +0.054R (1.6σ) |
+
+**A generic breakout entry on ES 15m loses about 0.10–0.13R gross.** Buying one
+tick above an arbitrary bar's high with a stop at its low is a losing structure
+before any cost — short-horizon adverse selection at the breakout. The run
+filter is not neutral against that: at N=3 it recovers the whole penalty, at
+4.3σ on 3,048 trades. That is the only statistically solid positive finding in
+this file.
+
+It changes the story of §2 and §6 in one specific way. "The hit rate tracks
+`1/(1+RR)`" is still true, but the correct reading is not "the signal does
+nothing" — it is **"the signal does exactly enough to cancel the breakout
+penalty and no more."** The ceiling is zero gross, and it is reached, not
+approached.
+
+Two cautions. The progression is not monotone: N=4 and N≥5 fall back to −0.08,
+so this is not "more consecutive candles, better conditioning" — N=3 is a peak
+in a five-cell grid, and N=3 vs N=1 is only 2.2σ. And zero gross is still zero:
+recovering a penalty is not the same as generating an edge.
+
+### Claim (a): a wider stop
+
+On 3m-resolved paths, 274 trades:
+
+| Stop | Hit rate | Gross | ±se | Net |
+|---|---|---|---|---|
+| signal candle low | 39.1% | −0.024 | 0.074 | −0.152 |
+| previous candle low | 39.1% | −0.024 | 0.074 | −0.113 |
+| min(both lows) | 38.7% | −0.033 | 0.074 | −0.119 |
+
+Gross is unchanged to three decimals. Net improves by 0.039R — and that is the
+Test 1 confound again, arriving through a different door: a wider stop means a
+larger R, which means friction is a smaller fraction of it. Nothing about the
+signal improved. The stop moved, the target moved with it (both are defined off
+R), and the bracket geometry is scale-invariant.
+
+### Claim (b): trailing
+
+| Exit model | Hit rate | Avg win | Avg loss | Needs | **Gap** | Gross |
+|---|---|---|---|---|---|---|
+| candle low, fixed 1.5R | 39.1% | +1.50R | −1.00R | 1.56R | **−0.06R** | −0.024 |
+| prev candle low, fixed 1.5R | 39.1% | +1.50R | −1.00R | 1.56R | −0.06R | −0.024 |
+| candle low, trail prior low | 32.1% | +0.90R | −0.60R | 1.26R | −0.37R | −0.118 |
+| prev low, trail prior low | 33.2% | +0.62R | −0.43R | 0.87R | −0.25R | −0.082 |
+| trail low, 1.5R cap | 33.6% | +0.94R | −0.61R | 1.20R | −0.26R | −0.088 |
+| ATR trail 1.5× | 31.4% | +1.24R | −0.77R | 1.68R | −0.44R | −0.138 |
+| ATR trail 2.5× | 25.2% | +2.31R | −0.87R | 2.58R | −0.27R | −0.068 |
+| ATR trail 3.5× | 22.3% | +2.83R | −0.94R | 3.28R | −0.45R | −0.101 |
+
+"Needs" is the average win required to break even at that hit rate; "Gap" is how
+far short the actual average win falls. **The fixed bracket is the closest
+structure to break-even in the table, and all six trailing variants are three to
+seven times further away.**
+
+The mechanism is visible in the middle columns, and it is not what intuition
+predicts. Trailing does exactly what it is supposed to: `prev low, trail prior
+low` cuts the average loss from −1.00R to −0.43R, a 57% reduction. It also cuts
+the hit rate from 39.1% to 33.2% and the average win from 1.50R to 0.62R. **The
+saving on losers is real and it is smaller than the cost in winners.**
+
+That is what a trailing stop does to a driftless distribution. Every bar the
+trail advances is another level for noise to touch; without positive serial
+correlation in the increments there is no compensating trend to ride. The wide
+ATR trails show the same thing from the other end — ATR 3.5× correctly finds a
+2.83R average winner, but drags the hit rate to 22.3% when 25.4% is needed.
+
+### Verdict
+
+Both claims rejected. The wider stop is a cost-ratio change, not a signal
+change. Trailing is strictly worse than the fixed bracket at every setting
+tested, by a mechanism the payoff table makes explicit.
+
+The entry claim is **partly upheld and it matters**: the entry is not arbitrary,
+it is worth +0.10R against a generic breakout. But §5's ceiling argument now has
+a sharper form. The entry's demonstrated capability is cancelling the breakout
+penalty exactly. Every exit model is a different way of reading the same forward
+distribution, and that distribution has zero drift. **No exit can extract
+positive expectancy from a driftless path — the exit only decides how the zero
+is divided between hit rate and win size.** The fixed 1.5R bracket happens to
+divide it most efficiently, which is why it sits closest to break-even.
+
+*Sample caveat:* the trailing tests run on 274 magnified trades with ±0.074 on
+gross, so no single row is individually significant. The ranking is uniform
+across all six variants and the payoff decomposition is measured with much
+better precision than the mean, which is what the conclusion rests on.
+
+## 9. Test 5 — session-matched control
+
+§8's control drew bars uniformly, so part of the +0.102R could have been a
+time-of-day effect: N=3 runs may cluster in hours that behave differently from
+the average hour. This replaces it with a control drawn from the **same 15-minute
+slot of the day** as each signal, in the same direction.
+
+| Entry set | n | Hit rate | Gross | ±se | vs signal |
+|---|---|---|---|---|---|
+| **SIGNAL — N=3 run** | 3048 | 38.9% | −0.028 | 0.022 | — |
+| uniform random bar | 17813 | 35.2% | −0.120 | 0.009 | +0.092R (3.9σ) |
+| session-matched, any bar | 18162 | 34.9% | −0.129 | 0.009 | +0.100R (4.2σ) |
+| session-matched, excluding run bars | 18111 | 34.5% | −0.137 | 0.009 | **+0.109R (4.6σ)** |
+
+**The effect is a run effect, not a session effect.** Matching on time of day
+does not shrink it — it grows slightly, and grows again when run bars are
+removed from the control pool (which is the cleanest contrast, since the
+uniform pool was partly contaminated by the signal itself). §8's finding stands
+at 4.6σ against the strictest control available here.
+
+### Where the return sits, by session
+
+| Session (ET) | n | Hit rate | Gross | ±se | Control | Net |
+|---|---|---|---|---|---|---|
+| RTH morning 0930–1200 | 386 | 42.5% | **+0.062** | 0.063 | −0.151 | −0.006 |
+| RTH afternoon 1200–1600 | 557 | 39.3% | −0.017 | 0.052 | −0.125 | −0.104 |
+| Europe 0300–0930 | 887 | 35.2% | **−0.121** | 0.040 | −0.168 | −0.258 |
+| Asia/overnight 1600–0300 | 1218 | 40.2% | +0.006 | 0.035 | −0.085 | −0.180 |
+
+Two things are visible and only one of them is useful.
+
+**The Europe session is where the strategy bleeds.** Gross −0.121 ± 0.040 is
+three standard errors below zero on 887 trades — the only cell in this entire
+file that is significantly *negative* rather than merely not-positive. Net
+−0.258. Whatever the run filter is doing in the US sessions, it is not doing it
+between 03:00 and 09:30 ET.
+
+**RTH morning is the best cell and it is not tradeable.** Gross +0.062 ± 0.063
+is one standard error from zero, and friction eats it exactly: net −0.006.
+Break-even, not profitable, arrived at after several hundred prior cells.
+
+Its stability settles it:
+
+| Half-year | n | Hit rate | Gross | ±se | Net |
+|---|---|---|---|---|---|
+| 2024H2 | 34 | 52.9% | +0.324 | 0.217 | +0.225 |
+| 2025H1 | 102 | 35.3% | −0.118 | 0.119 | −0.180 |
+| 2025H2 | 104 | 54.8% | +0.370 | 0.123 | +0.292 |
+| 2026H1 | 105 | 35.2% | −0.119 | 0.117 | −0.176 |
+| 2026H2 | 41 | 39.0% | −0.024 | 0.193 | −0.082 |
+
+The sign alternates every half-year. 2025H2 at +0.370 is 3σ from zero on its
+own, and means nothing: in a grid of 5 half-years × 4 sessions, sitting on top
+of every test in §§5–8, a 3σ cell is expected rather than surprising.
+
+Dropping the Europe session entirely — the one change the data actually
+supports — moves overall gross from −0.028 to about +0.010 and leaves net near
+−0.13, because the surviving overnight hours carry a small R and therefore a
+large cost drag. Removing the worst cell does not make the rest positive.
+
+### Verdict
+
+The question is answered cleanly and in the strategy's favour: **the entry
+conditioning is real, survives the strictest control, and is worth +0.109R
+against a matched breakout.** The strategy still has no positive-expectancy
+configuration. Those two statements are compatible because the effect's job is
+to cancel a −0.13R penalty, and it cancels it to approximately zero everywhere
+except Europe hours, where it fails outright.
+
+## 10. Test 6 — full sweep with Europe excluded, and an out-of-sample check
+
+Excluding the Europe session was a **data-driven** choice: §9 identified it as
+the worst cell in this same sample. Sweeping parameters on the remaining data
+therefore compounds the selection, and an in-sample result cannot settle
+anything. The sample is split: **in-sample 2024-10 → 2025-12**, **out-of-sample
+2026-01 → 2026-08**, with the out-of-sample half untouched until the in-sample
+winners were fixed.
+
+Grid: N ∈ {2,3,4} × min-risk ∈ {0,15,25,35} ticks × RR ∈ {1.0,1.25,1.5,2.0,2.5}
+= 60 cells. Values are net R/trade after 3-tick friction.
+
+### In-sample
+
+```
+  N=3      RR1.0    RR1.25    RR1.5     RR2.0     RR2.5
+     0    -0.182   -0.161   -0.143    -0.101    -0.119
+    15    -0.108   -0.082   -0.072    -0.005    -0.023
+    25    -0.050   -0.033   -0.017    +0.041*   +0.056*
+    35    -0.035   -0.032   -0.035    +0.016*   +0.033*
+```
+
+**8 of 60 cells net-positive (13%)**, and — this is the part that looks
+convincing — they form a contiguous region rather than isolated spikes: N=3 and
+N=4, min-risk 25–35, RR 2.0–2.5. That is exactly the "plateau, not a peak"
+pattern the standard methodology says to look for. Excluding Europe genuinely
+did move the whole grid up, by roughly 0.05–0.10R against the §5 numbers.
+
+### Out-of-sample
+
+```
+  N=3      RR1.0    RR1.25    RR1.5     RR2.0     RR2.5
+     0    -0.113   -0.082   -0.104    -0.123    -0.150
+    15    -0.059   -0.025   -0.054    -0.088    -0.116
+    25    -0.052   -0.015   -0.049    -0.056    -0.105
+    35    +0.004*  +0.041*  +0.006*   -0.021    -0.058
+```
+
+**3 of 60 (5%)** — and in a different place. The out-of-sample positives sit at
+RR 1.0–1.5 where the in-sample grid was solidly negative, and the in-sample
+region at RR 2.0–2.5 has gone negative.
+
+### The eight winners, carried forward verbatim
+
+| Cell | IS n | IS net | ±se | OOS n | OOS net | ±se |
+|---|---|---|---|---|---|---|
+| N=3 minR 25 RR 2.0 | 654 | +0.041 | 0.057 | 497 | −0.056 | 0.064 |
+| N=3 minR 25 RR 2.5 | 654 | +0.056 | 0.064 | 497 | −0.105 | 0.070 |
+| N=3 minR 35 RR 2.0 | 452 | +0.016 | 0.068 | 351 | −0.021 | 0.076 |
+| N=3 minR 35 RR 2.5 | 452 | +0.033 | 0.076 | 351 | −0.058 | 0.084 |
+| N=4 minR 15 RR 2.0 | 516 | +0.025 | 0.064 | 360 | **−0.244** | 0.071 |
+| N=4 minR 25 RR 2.0 | 338 | +0.027 | 0.079 | 262 | **−0.247** | 0.083 |
+| N=4 minR 35 RR 2.0 | 239 | +0.031 | 0.093 | 175 | −0.182 | 0.103 |
+| N=4 minR 35 RR 2.5 | 239 | +0.040 | 0.105 | 175 | −0.136 | 0.117 |
+
+**0 of 8 survived.** Every one flipped negative. The N=4 cells swung by
+0.2–0.27R between halves.
+
+### What this settles
+
+The in-sample plateau was real as a description of 2024-10 → 2025-12 and carried
+no information about 2026. That is worth stating plainly because "seek plateaus,
+not peaks" is the standard defence against curve-fitting, and here **the plateau
+formed anyway and still meant nothing.** A contiguous positive region is what
+noise looks like when neighbouring cells share most of their trades — the cells
+are not independent draws, so their agreement is not corroboration.
+
+The two positive rates tell the same story: 13% of cells positive in sample,
+5% out of sample. The out-of-sample rate is what a distribution centred slightly
+below zero produces by chance. Nothing is being detected.
+
+Excluding Europe was still the right call on the merits — §9 established that
+cell as significantly negative on 887 trades, and dropping it does lift the
+grid. It lifts it from clearly negative to slightly negative. It does not lift
+it above zero, and no parameter combination within it survives a walk forward.
+
+### Verdict — end of the line for this strategy family
+
+Six tests: filters, exits, instruments, stop placement, sessions, and a full
+parameter sweep with out-of-sample validation. The one durable finding is §8/§9:
+the N=3 entry is worth +0.109R against a session-matched breakout at 4.6σ, which
+cancels the breakout penalty and reaches zero. Everything downstream of that
+confirms the same ceiling from a different angle.
+
+Further parameter search on this signal is not a test. Any future work needs a
+second, independent condition supplying actual drift, benchmarked against the
+N=3 baseline rather than against random entry, with the out-of-sample split
+fixed before the first result is read.
+
+## 11. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).
@@ -340,6 +700,28 @@ one, and it needs its own signal, its own script and its own pre-commitment.
 - The magnifier probe resolves paths at 3m, not tick level. A 3m bar containing
   both levels is still booked as a loss; that is 0.0% of trades in the run
   above, but it would not stay at zero for targets tighter than 0.5R.
-- `backtest_momentum_run.py` is fine at 1.5R and misleading below ~1.25R. Use
-  the magnifier for anything in that range, or at minimum report both
-  tie-breaking conventions and treat the gap as the error bar.
+- `backtest_momentum_run.py` is fine at 1.5R on ES and misleading below ~1.25R.
+  On gold it is unreliable at *every* RR (4.6–6.2% ambiguity). Use the magnifier
+  there, or at minimum report both tie-breaking conventions and treat the gap as
+  the error bar.
+- The gold magnifier resolves at 5m, leaving 3–4% residual ambiguity. Only ES,
+  at 3m resolution, reaches 0.0%.
+- `data/qqq_15m.csv` proxies NQ price behaviour but not its microstructure: it
+  is RTH-only where NQ trades 23 hours, and its spread is pennies where NQ's is
+  a $5 tick. NQ friction in §7 is modelled from tick geometry, not measured.
+- `data/qqq_15m.csv`, `data/xauusd_15m.csv` and `data/xauusd_5m.csv` were pulled
+  from Twelve Data in Sep 2026 and are point-in-time snapshots, not a maintained
+  feed.
+- Resolved in §9: the session-matched control leaves the effect intact at 4.6σ,
+  so it is a run effect rather than a time-of-day effect.
+- The session buckets in §9 are fixed clock windows and ignore DST shifts and
+  half-days; a few trades are in the wrong bucket.
+- The §10 split is a single walk-forward step, not a rolling one, and the
+  out-of-sample half (8 months) is shorter than the in-sample half (14 months).
+  A 0-for-8 failure needs no more resolution than that, but a positive result
+  would have.
+- Cells in the §10 grid share most of their trades, so the 60 tests are far from
+  independent and no multiple-comparison correction is quoted; the out-of-sample
+  split is what does the work instead.
+- Trailing exits in §8 update at 15m close and are checked on 3m sub-bars. A
+  trail that updates intrabar would behave differently and is not tested.
