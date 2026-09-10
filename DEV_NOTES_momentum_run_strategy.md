@@ -327,7 +327,97 @@ limit entry on a pullback into the run is a different conditioning event and is
 not covered by any of this. That is a new hypothesis, not a variation of this
 one, and it needs its own signal, its own script and its own pre-commitment.
 
-## 7. Known gaps
+## 7. Test 3 — does the instrument matter? (NQ and gold)
+
+Two reasons this was worth testing rather than assuming. First, gold is a
+different asset class with different participants. Second — the substantive one
+— **NQ has a structurally better cost ratio than ES**, and cost is the only
+thing that has actually varied across every result so far:
+
+| | Median 15m range | Round-trip friction | Cost as % of R | Net break-even @1.5R |
+|---|---|---|---|---|
+| ES 15m | 25 ticks | ~3 ticks | 12.0% | ~44.8% |
+| **NQ 15m** | **~211 ticks** (52.7 pts @ 25,000) | ~2.5 ticks | **1.2%** | **~40.5%** |
+| XAUUSD 15m | — | ~30 ticks | ~10.6% | ~44% |
+
+NQ's tick is $5 against ES's $12.50 while its bar range is roughly 8× larger in
+ticks, so friction nearly vanishes as a fraction of R. If the ES result were a
+good signal buried under costs, NQ is exactly where it would surface.
+
+### NQ (QQQ 15m as price proxy, 5,000 bars, Dec 2025 – Sep 2026)
+
+| N | n | Hit rate | Optimistic | Ambiguous | z (cons) | z (opt) | Gross R | Net R |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 840 | 35.7% | 37.1% | 1.4% | −2.59 | −1.71 | −0.107 | −0.124 |
+| 3 | 407 | 35.9% | 36.9% | 1.0% | −1.74 | −1.32 | −0.103 | −0.120 |
+| 4 | 193 | 36.8% | 37.8% | 1.0% | −0.93 | −0.62 | −0.080 | −0.096 |
+
+Ambiguity is ~1%, so unlike the RR sweep this is not a tie-breaking artifact —
+both conventions agree. NQ is **worse than ES**: gross −0.08 to −0.11 against
+ES's 0.00, and the hit rate sits below the null under either convention.
+
+The structural advantage is real and it does not help. Low friction moves net
+*toward* gross; it cannot move net *above* gross. With gross negative, the
+cheapest contract in the complex still loses. This is the cleanest confirmation
+of the §5 ceiling argument: cost was never the binding constraint.
+
+*Caveat:* QQQ is an RTH-only ETF standing in for a 23-hour futures contract, and
+its penny spread is nothing like NQ's tick — which is why costs are modelled
+separately above rather than taken from QQQ. It proxies NQ's price behaviour,
+not its microstructure.
+
+### Gold — and a second brush with the same artifact
+
+XAUUSD ambiguity runs 4.6–6.2%, four to six times ES's, because gold's intrabar
+noise is large relative to the stop distance. The two conventions therefore
+disagree about the sign:
+
+| Data | N | n | Conservative | Optimistic | z (cons) | z (opt) |
+|---|---|---|---|---|---|---|
+| XAUUSD 15m | 2 | 629 | 36.7% | 41.3% | −1.70 | **+0.68** |
+| XAUUSD 15m | 3 | 304 | 36.5% | 41.8% | −1.26 | **+0.63** |
+| XAUUSD 1h | 2 | 347 | 39.8% | 45.8% | −0.09 | **+2.18** |
+
+A 2.18σ "edge" on gold 1h that exists only under optimistic tie-breaking is the
+RR=0.5 mistake in a new costume. Resolved rather than assumed: 5m data fetched
+for the same window, 15m bars rebuilt from it, every fill and exit walked on the
+5m sub-bars (residual ambiguity 3–4%, not 0% — gold stays noisy even at 5m).
+
+| N | RR | n | BE% | Hit rate | ±1se | z | Gross R | Net R |
+|---|---|---|---|---|---|---|---|---|
+| 2 | 1.0 | 631 | 50.0% | 46.8% | 2.0 | −1.64 | −0.065 | −0.158 |
+| 2 | 1.5 | 631 | 40.0% | 38.2% | 1.9 | −0.93 | −0.043 | −0.136 |
+| 3 | 1.0 | 305 | 50.0% | 49.8% | 2.9 | −0.06 | +0.001 | −0.105 |
+| 3 | 1.5 | 305 | 40.0% | 39.7% | 2.8 | −0.12 | −0.004 | −0.110 |
+| 3 | 2.0 | 305 | 33.3% | 35.7% | 2.7 | +0.88 | +0.070 | −0.036 |
+| 4 | 1.5 | 153 | 40.0% | 43.1% | 4.0 | +0.78 | +0.085 | +0.028 |
+
+The +2.18σ does not survive. Gold tracks `1/(1+RR)` exactly as ES does, gross is
+zero within noise, and net is negative on the cost drag. The single positive net
+cell (N=4) has n=153 and z=+0.78.
+
+### Verdict
+
+**No. Three instruments, three cost structures, one answer.** ES ≈ 0 gross,
+gold ≈ 0 gross, NQ slightly negative gross. The only thing that varies
+meaningfully across markets is net, and net is fully explained by
+cost-as-a-fraction-of-R — a broker fact, not a market edge.
+
+### A note on how much testing has now happened
+
+Across the three tests this file records: 6 instruments × 4 run lengths ×
+8 R multiples × several filter grids. That is several hundred cells. At the
+conventional 5% threshold, dozens of them should look positive by chance alone,
+and dozens have: ES 3m at min-risk 30, BTC at 25k, gold 1h N=2 optimistic, gold
+5m N=4. Every one shares the same three properties — n < 200, no replication at
+neighbouring parameters, and a position at the edge of a grid.
+
+That pattern is the finding. **Further instrument search is no longer a test of
+the strategy; it is a search for the noisiest cell in a large grid.** Any future
+candidate needs to be pre-registered, sized for the effect being claimed, and
+validated out of sample before it means anything.
+
+## 8. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).
@@ -340,6 +430,15 @@ one, and it needs its own signal, its own script and its own pre-commitment.
 - The magnifier probe resolves paths at 3m, not tick level. A 3m bar containing
   both levels is still booked as a loss; that is 0.0% of trades in the run
   above, but it would not stay at zero for targets tighter than 0.5R.
-- `backtest_momentum_run.py` is fine at 1.5R and misleading below ~1.25R. Use
-  the magnifier for anything in that range, or at minimum report both
-  tie-breaking conventions and treat the gap as the error bar.
+- `backtest_momentum_run.py` is fine at 1.5R on ES and misleading below ~1.25R.
+  On gold it is unreliable at *every* RR (4.6–6.2% ambiguity). Use the magnifier
+  there, or at minimum report both tie-breaking conventions and treat the gap as
+  the error bar.
+- The gold magnifier resolves at 5m, leaving 3–4% residual ambiguity. Only ES,
+  at 3m resolution, reaches 0.0%.
+- `data/qqq_15m.csv` proxies NQ price behaviour but not its microstructure: it
+  is RTH-only where NQ trades 23 hours, and its spread is pennies where NQ's is
+  a $5 tick. NQ friction in §7 is modelled from tick geometry, not measured.
+- `data/qqq_15m.csv`, `data/xauusd_15m.csv` and `data/xauusd_5m.csv` were pulled
+  from Twelve Data in Sep 2026 and are point-in-time snapshots, not a maintained
+  feed.

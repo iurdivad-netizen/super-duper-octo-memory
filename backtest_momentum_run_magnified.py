@@ -29,7 +29,7 @@ COST_TICKS = 3.0
 SUB_PER_BAR = 5  # 3m bars per 15m bar
 
 
-def build_bars(path):
+def build_bars(path, sub_per_bar=None):
     """Rebuild exact 15m bars from 3m data, keeping the sub-bars for each."""
     raw = []
     with open(path) as fh:
@@ -49,7 +49,7 @@ def build_bars(path):
     bars, subs = [], []
     for key in order:
         g = groups[key]
-        if len(g) != SUB_PER_BAR:
+        if len(g) != (sub_per_bar or SUB_PER_BAR):
             continue  # incomplete bucket: the 15m OHLC would be wrong
         bars.append((g[0][0], max(x[1] for x in g), min(x[2] for x in g), g[-1][3]))
         subs.append(g)
@@ -128,15 +128,22 @@ def probe(bars, subs, n, rr, min_risk_ticks=0.0, max_hold=200):
 
 
 def main():
+    global TICK, COST_TICKS
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/es1_3m_tradingview.csv")
+    ap.add_argument("--sub-per-bar", type=int, default=SUB_PER_BAR,
+                    help="sub-bars per 15m bar (5 for 3m data, 3 for 5m data)")
+    ap.add_argument("--tick", type=float, default=TICK)
+    ap.add_argument("--cost", type=float, default=COST_TICKS,
+                    help="round-trip friction in ticks")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--min-risk", type=float, default=0.0)
     ap.add_argument("--rr", type=float, nargs="+",
                     default=[0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0])
     args = ap.parse_args()
 
-    bars, subs = build_bars(args.data)
+    TICK, COST_TICKS = args.tick, args.cost
+    bars, subs = build_bars(args.data, args.sub_per_bar)
     print(f"{len(bars)} complete 15m bars rebuilt from {args.data}")
     print(f"N={args.runs}, min risk {args.min_risk:g} ticks, "
           f"{COST_TICKS:g} ticks round-trip friction\n")
