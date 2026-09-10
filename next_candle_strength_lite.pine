@@ -1,0 +1,354 @@
+//@version=6
+// =============================================================================
+// Next Candle Strength (Lite)
+// -----------------------------------------------------------------------------
+// A corrected, scale-free rebuild of the common "Next Candle Predictor"
+// candle-strength script, with a walk-forward scorecard attached.
+//
+// WHY THE OUTPUT IS ARRANGED THIS WAY
+//
+// The original script's headline output was a next-candle DIRECTION call.
+// Measured on 10 instrument/timeframe files (probe_candle_strength.py), that
+// call is negative in 55 of 66 configurations and never reaches z > +2 against
+// always-predicting-the-running-majority; on the two largest samples it is
+// significantly WORSE than the majority rule (ES 15m z = -5.31, XAU 5m
+// z = -3.84). Inverting it does not help either: gross PnL per trade is ~0 in
+// the training window and every configuration is net negative at an optimistic
+// one-tick round-trip cost.
+//
+// The magnitude of the same signal is informative: |pressure| correlates
+// +0.03..+0.28 with the next bar's range on 9 of 10 files.
+//
+// So the range forecast is the headline here and the direction call is
+// demoted to a scored, self-reporting row. The script measures its own
+// direction skill on YOUR chart and prints a verdict, because that number is
+// instrument-specific and because a display you cannot falsify is a decoration.
+//
+// See candle_forecast_v2.pine for the full 16-feature version of this argument.
+// =============================================================================
+indicator("Next Candle Strength (Lite)", shorttitle="NCS-Lite", overlay=true,
+     max_bars_back=1000, max_boxes_count=20, max_lines_count=20,
+     max_labels_count=20)
+
+// ============================== INPUTS =======================================
+GS = "Signal"
+i_len     = input.int(5, "Lookback (EMA length)", minval=2, maxval=50, group=GS,
+     tooltip="Recency-weighted, not a flat average: the most recent bar should " +
+             "matter more than the one 5 bars ago.")
+i_wickW   = input.float(0.3, "Wick weight", minval=0.0, maxval=2.0, step=0.05, group=GS,
+     tooltip="Applied to (lower wick - upper wick). An upper wick is rejection " +
+             "of higher prices, so it subtracts from bullish pressure. The " +
+             "original script added the whole wick to the body's own direction, " +
+             "which scored a green candle with a long upper wick as MORE bullish.")
+i_useVol  = input.bool(true, "Weight by relative volume", group=GS,
+     tooltip="Auto-disables on feeds with no volume.")
+i_gateATR = input.float(0.10, "Neutral gate (ATR units)", minval=0.0, maxval=2.0,
+     step=0.01, group=GS,
+     tooltip="Threshold in ATR units, NOT price units. The original 0.05 price " +
+             "threshold is 639x typical signal size on EUR/USD (permanently " +
+             "Neutral) and ~0.001x on BTC (never Neutral).")
+
+GR = "Range forecast"
+i_lambda  = input.float(0.94, "Range EWMA lambda", minval=0.50, maxval=0.999,
+     step=0.01, group=GR,
+     tooltip="0.94 measured better than 0.97 against a fixed ATR(14) reference.")
+i_shrink  = input.float(100.0, "Multiplier shrinkage", minval=1.0, maxval=2000.0,
+     step=10.0, group=GR,
+     tooltip="Pseudo-observations. An unseen volatility bucket falls back to " +
+             "the plain EWMA rather than to noise.")
+i_bandWin = input.int(300, "Band window", minval=50, maxval=1000, group=GR)
+i_bandPct = input.int(80, "Band coverage %", options=[50, 68, 80, 90], group=GR)
+i_trueRng = input.bool(true, "Use true range (covers gaps)", group=GR)
+
+GD = "Data quality"
+i_deadOn  = input.bool(true, "Filter dead bars", group=GD,
+     tooltip="Bars whose range is a tiny fraction of the rolling MEDIAN range " +
+             "are synthetic/stale (weekend gold bars, holiday sessions). A " +
+             "documented case of 28.8% such bars manufactured a +7.18pp " +
+             "'edge' at z = 7.63 on XAU/USD 1h. Excluded from scoring.")
+i_deadPct = input.float(5.0, "Dead-bar threshold (% of median range)",
+     minval=0.0, maxval=50.0, step=0.5, group=GD)
+i_deadWin = input.int(100, "Median window", minval=20, maxval=500, group=GD)
+i_burnIn  = input.int(200, "Burn-in bars", minval=20, maxval=2000, group=GD)
+
+GV = "Display"
+i_showHist  = input.bool(true, "Mark historical direction calls", group=GV,
+     tooltip="ON by default on purpose: it is what makes the direction call " +
+             "checkable by eye instead of only on the last bar.")
+i_showProj  = input.bool(true, "Draw projected range box", group=GV)
+i_showPanel = input.bool(true, "Show panel", group=GV)
+i_alertOn   = input.bool(false, "Enable direction alerts", group=GV,
+     tooltip="Gated on the scorecard showing |z| > 2 over >= 200 bars. Leave " +
+             "the gate on.")
+
+// ============================== HELPERS ======================================
+// Pine format strings have no '+' sign specifier, and str.tostring renders na
+// as the literal string "NaN".
+f_signed(float v, string fmt) =>
+    na(v) ? "n/a" : (v >= 0 ? "+" : "") + str.tostring(v, fmt)
+
+f_pct(float v, int digits) =>
+    na(v) ? "n/a" : str.tostring(v * 100.0, digits == 1 ? "#.#" : "#.##") + "%"
+
+// ============================== PRIMITIVES ===================================
+// Every ta.* call is at global scope and unconditional. This is the bug that
+// silently broke the original: it called ta.sma(volume, len) from INSIDE a for
+// loop, so one SMA instance was fed `len` values per bar and its window held
+// the last `len` calls rather than the last `len` bars.
+atrv    = ta.atr(14)
+trv     = i_trueRng ? ta.tr(true) : high - low
+rawRng  = high - low
+volSma  = ta.sma(volume, i_len)
+medRng  = ta.median(rawRng, i_deadWin)
+
+hasVol  = i_useVol and not na(volume) and volume > 0 and not na(volSma) and volSma > 0
+volF    = hasVol ? math.max(volume / volSma, 0.1) : 1.0
+
+deadBar = i_deadOn and not na(medRng) and medRng > 0
+             and rawRng < (i_deadPct / 100.0) * medRng
+warm    = bar_index > i_burnIn and not na(atrv) and atrv > 0
+
+// ---- directional pressure, normalised so one setting works on any symbol ----
+// Body carries its own sign. The wicks are split: an upper wick is rejection of
+// higher prices (bearish), a lower wick rejection of lower prices (bullish).
+safeAtr = na(atrv) or atrv <= 0 ? na : atrv
+bodyN   = (close - open) / safeAtr
+upWick  = (high - math.max(open, close)) / safeAtr
+loWick  = (math.min(open, close) - low) / safeAtr
+pressRaw = (bodyN + i_wickW * (loWick - upWick)) * volF
+press    = nz(pressRaw, 0.0)
+
+// Recency-weighted, one O(1) call. The original averaged bars [1..len] flat and
+// excluded the current bar entirely -- forecasting bar t+1 from data ending at
+// t-1, discarding the most informative bar for no anti-repaint benefit.
+sig  = ta.ema(press, i_len)
+gate = i_gateATR
+
+// ---- range forecast: EWMA of TR x volatility-bucket multiplier --------------
+var float ewR = na
+ewR := na(ewR) ? trv : i_lambda * ewR + (1.0 - i_lambda) * trv
+
+// Bucket the CURRENT bar's range against the EWMA as of the previous bar.
+ewPrev = nz(ewR[1], trv)
+rr     = ewPrev > 0 ? trv / ewPrev : 1.0
+bkt    = rr < 0.75 ? 0 : rr > 1.30 ? 2 : 1
+
+var float mSum0 = 0.0
+var int   mCnt0 = 0
+var float mSum1 = 0.0
+var int   mCnt1 = 0
+var float mSum2 = 0.0
+var int   mCnt2 = 0
+var int   pendBkt = -1
+
+// ---- band: rolling percentiles of realised/predicted, non-parametric --------
+var float lockRange = na
+var float lockDir   = 0.0
+ratio  = not na(lockRange) and lockRange > 0 ? trv / lockRange : na
+pLo    = ta.percentile_nearest_rank(nz(ratio, 1.0), i_bandWin, (100 - i_bandPct) / 2)
+pHi    = ta.percentile_nearest_rank(nz(ratio, 1.0), i_bandWin, 100 - (100 - i_bandPct) / 2)
+
+// ============================== SCORECARD ====================================
+// Ordering inside a confirmed bar is the whole design:
+//   1. score the forecast locked at the previous close against THIS bar
+//   2. fold this bar's outcome into the running state
+//   3. lock the forecast for the next bar
+// A forecast is therefore never scored against a bar that shaped it.
+var int   nScored = 0
+var int   hitMdl  = 0
+var int   hitMaj  = 0
+var int   nUp     = 0
+var int   nDn     = 0
+var float sumD    = 0.0
+var float sumD2   = 0.0
+var float errMdl  = 0.0
+var float errAtr  = 0.0
+var int   nSize   = 0
+var int   nDead   = 0
+var int   nBars   = 0
+
+if barstate.isconfirmed
+    nBars += 1
+    if deadBar
+        nDead += 1
+    else
+        real = close > open ? 1 : close < open ? -1 : 0
+        // ---- 1. score the locked forecast against this bar ----
+        // Range is scored on every live bar; direction only where the bar has
+        // a direction to be right about.
+        if warm and not na(lockRange) and not na(atrv)
+            errMdl += math.abs(trv - lockRange)
+            errAtr += math.abs(trv - nz(atrv[1], atrv))
+            nSize  += 1
+        if warm and real != 0
+            if lockDir != 0
+                maj = nUp >= nDn ? 1 : -1
+                hm  = lockDir == real ? 1 : 0
+                hj  = maj == real ? 1 : 0
+                nScored += 1
+                hitMdl  += hm
+                hitMaj  += hj
+                d = hm - hj
+                sumD  += d
+                sumD2 += d * d
+            // ---- 2. fold the outcome in (AFTER the majority was read) ----
+            if real > 0
+                nUp += 1
+            else
+                nDn += 1
+        // ---- state multiplier: observation keyed on the PREVIOUS bucket ----
+        // rr is this bar's TR over the EWMA that excluded it, which is exactly
+        // the relation the forecast needs.
+        if warm and pendBkt >= 0 and ewPrev > 0
+            if pendBkt == 0
+                mSum0 += rr
+                mCnt0 += 1
+            else if pendBkt == 1
+                mSum1 += rr
+                mCnt1 += 1
+            else
+                mSum2 += rr
+                mCnt2 += 1
+        pendBkt := bkt
+        // ---- 3. lock the forecast for the next bar ----
+        s   = bkt == 0 ? mSum0 : bkt == 1 ? mSum1 : mSum2
+        c   = bkt == 0 ? mCnt0 : bkt == 1 ? mCnt1 : mCnt2
+        mlt = (s + i_shrink * 1.0) / (c + i_shrink)
+        lockRange := ewR * mlt
+        lockDir   := sig > gate ? 1.0 : sig < -gate ? -1.0 : 0.0
+
+// ---- derived scorecard figures ----
+accM  = nScored > 0 ? hitMdl / float(nScored) : na
+accJ  = nScored > 0 ? hitMaj / float(nScored) : na
+edge  = na(accM) or na(accJ) ? na : (accM - accJ) * 100.0
+meanD = nScored > 0 ? sumD / nScored : na
+varD  = nScored > 1 ? math.max(sumD2 / nScored - meanD * meanD, 0.0) : na
+zStat = na(varD) or varD <= 0 or nScored < 2 ? na
+             : meanD / (math.sqrt(varD) / math.sqrt(nScored))
+sizeSkill = nSize > 0 and errAtr > 0 ? (errAtr - errMdl) / errAtr * 100.0 : na
+deadShare = nBars > 0 ? nDead / float(nBars) : na
+
+enoughN = nScored >= 200
+hasEdge = enoughN and not na(zStat) and math.abs(zStat) > 2.0
+verdict = not enoughN ? "collecting — need 200 scored bars, have " + str.tostring(nScored)
+     : na(zStat) ? "no score yet"
+     : math.abs(zStat) <= 2.0 ? "NO DIRECTIONAL EDGE (|z| < 2) — use the range row"
+     : zStat > 0 ? "positive edge — confirm out-of-sample before trading"
+     : "SIGNIFICANTLY WORSE than the base rate — do not trade the arrow"
+vColor  = not enoughN ? color.gray
+     : not hasEdge ? color.new(color.orange, 0)
+     : zStat > 0 ? color.new(color.lime, 0) : color.new(color.red, 0)
+
+// ============================== VISUALS ======================================
+// Historical calls, so the direction claim is checkable across the whole chart
+// rather than only on the final bar.
+callUp = i_showHist and warm and not deadBar and sig > gate
+callDn = i_showHist and warm and not deadBar and sig < -gate
+plotshape(callUp ? true : na, title="Bullish call", style=shape.triangleup,
+     location=location.belowbar, color=color.new(color.teal, 30), size=size.tiny)
+plotshape(callDn ? true : na, title="Bearish call", style=shape.triangledown,
+     location=location.abovebar, color=color.new(color.maroon, 30), size=size.tiny)
+
+plot(sig, title="Pressure (ATR units)", display=display.data_window)
+plot(lockRange, title="Forecast range", display=display.data_window)
+plot(zStat, title="Paired z", display=display.data_window)
+
+// Projected range box one bar to the right. Drawing objects can sit forward in
+// time; plotcandle() cannot -- it has no offset parameter.
+var box  projBox = na
+var line projMid = na
+var label projLbl = na
+if barstate.islast and i_showProj and not na(lockRange)
+    box.delete(projBox)
+    line.delete(projMid)
+    label.delete(projLbl)
+    mid = close
+    hiB = mid + lockRange * nz(pHi, 1.0) / 2.0
+    loB = mid - lockRange * nz(pHi, 1.0) / 2.0
+    hiC = mid + lockRange / 2.0
+    loC = mid - lockRange / 2.0
+    projBox := box.new(left=bar_index + 1, top=hiC, right=bar_index + 2, bottom=loC,
+         border_color=color.new(color.blue, 20),
+         bgcolor=color.new(color.blue, 85))
+    projMid := line.new(x1=bar_index + 1, y1=loB, x2=bar_index + 1, y2=hiB,
+         color=color.new(color.blue, 40), width=1, style=line.style_dotted)
+    projLbl := label.new(x=bar_index + 2, y=hiC,
+         text="exp range " + str.tostring(lockRange, format.mintick),
+         style=label.style_label_left, color=color.new(color.blue, 80),
+         textcolor=color.new(color.blue, 0), size=size.small)
+
+// ============================== PANEL ========================================
+var table tb = table.new(position.top_right, 2, 15,
+     bgcolor=color.new(color.black, 82), border_width=1, border_color=color.new(color.gray, 60))
+
+if barstate.islast and i_showPanel
+    hdr = color.new(color.gray, 30)
+    txt = color.new(color.white, 0)
+    dim = color.new(color.silver, 20)
+
+    table.cell(tb, 0, 0, "NEXT BAR — RANGE", text_color=txt, text_size=size.small, bgcolor=hdr)
+    table.cell(tb, 1, 0, "the part with skill", text_color=dim, text_size=size.tiny, bgcolor=hdr)
+
+    table.cell(tb, 0, 1, "Expected range", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 1, na(lockRange) ? "n/a" : str.tostring(lockRange, format.mintick),
+         text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 2, str.tostring(i_bandPct) + "% band", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 2, na(lockRange) or na(pLo) ? "n/a"
+         : str.tostring(lockRange * pLo, format.mintick) + " – " +
+           str.tostring(lockRange * pHi, format.mintick),
+         text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 3, "vs ATR(14)", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 3, na(lockRange) or na(atrv) or atrv <= 0 ? "n/a"
+         : str.tostring(lockRange / atrv, "#.##") + "x", text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 4, "Range MAE vs ATR", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 4, na(sizeSkill) ? "n/a" : f_signed(sizeSkill, "#.#") + "%",
+         text_color=na(sizeSkill) ? dim : (sizeSkill > 0 ? color.lime : color.red),
+         text_size=size.small)
+
+    table.cell(tb, 0, 5, "NEXT BAR — DIRECTION", text_color=txt, text_size=size.small, bgcolor=hdr)
+    table.cell(tb, 1, 5, "read the verdict first", text_color=dim, text_size=size.tiny, bgcolor=hdr)
+
+    dirTxt = lockDir > 0 ? "Bullish" : lockDir < 0 ? "Bearish" : "Neutral"
+    table.cell(tb, 0, 6, "Call", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 6, dirTxt, text_size=size.small,
+         text_color=lockDir > 0 ? color.teal : lockDir < 0 ? color.maroon : dim)
+
+    table.cell(tb, 0, 7, "Pressure / gate", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 7, f_signed(sig, "#.###") + " / " + str.tostring(gate, "#.##"),
+         text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 8, "SCORECARD", text_color=txt, text_size=size.small, bgcolor=hdr)
+    table.cell(tb, 1, 8, "walk-forward", text_color=dim, text_size=size.tiny, bgcolor=hdr)
+
+    table.cell(tb, 0, 9, "Scored bars", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 9, str.tostring(nScored), text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 10, "Hit rate", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 10, f_pct(accM, 2), text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 11, "Base rate (majority)", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 11, f_pct(accJ, 2), text_color=txt, text_size=size.small)
+
+    table.cell(tb, 0, 12, "Edge / paired z", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 12, f_signed(edge, "#.##") + "pp / " + f_signed(zStat, "#.##"),
+         text_color=hasEdge ? (zStat > 0 ? color.lime : color.red) : dim, text_size=size.small)
+
+    table.cell(tb, 0, 13, "Dead bars skipped", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 13, f_pct(deadShare, 1), text_size=size.small,
+         text_color=nz(deadShare, 0.0) > 0.03 ? color.orange : dim)
+
+    table.cell(tb, 0, 14, "Verdict", text_color=dim, text_size=size.small)
+    table.cell(tb, 1, 14, verdict, text_color=vColor, text_size=size.tiny)
+
+// ============================== ALERTS =======================================
+// Gated on the scorecard, not on the arrow. An indicator that has measured
+// itself to have no edge should not be able to send a signal.
+alertUp = i_alertOn and hasEdge and zStat > 0 and barstate.isconfirmed
+             and lockDir > 0 and lockDir[1] <= 0
+alertDn = i_alertOn and hasEdge and zStat > 0 and barstate.isconfirmed
+             and lockDir < 0 and lockDir[1] >= 0
+alertcondition(alertUp, "Bullish (edge-gated)", "NCS-Lite: bullish call, scorecard z > 2")
+alertcondition(alertDn, "Bearish (edge-gated)", "NCS-Lite: bearish call, scorecard z > 2")
