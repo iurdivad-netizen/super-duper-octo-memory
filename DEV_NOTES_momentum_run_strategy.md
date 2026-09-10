@@ -598,7 +598,96 @@ configuration. Those two statements are compatible because the effect's job is
 to cancel a −0.13R penalty, and it cancels it to approximately zero everywhere
 except Europe hours, where it fails outright.
 
-## 10. Known gaps
+## 10. Test 6 — full sweep with Europe excluded, and an out-of-sample check
+
+Excluding the Europe session was a **data-driven** choice: §9 identified it as
+the worst cell in this same sample. Sweeping parameters on the remaining data
+therefore compounds the selection, and an in-sample result cannot settle
+anything. The sample is split: **in-sample 2024-10 → 2025-12**, **out-of-sample
+2026-01 → 2026-08**, with the out-of-sample half untouched until the in-sample
+winners were fixed.
+
+Grid: N ∈ {2,3,4} × min-risk ∈ {0,15,25,35} ticks × RR ∈ {1.0,1.25,1.5,2.0,2.5}
+= 60 cells. Values are net R/trade after 3-tick friction.
+
+### In-sample
+
+```
+  N=3      RR1.0    RR1.25    RR1.5     RR2.0     RR2.5
+     0    -0.182   -0.161   -0.143    -0.101    -0.119
+    15    -0.108   -0.082   -0.072    -0.005    -0.023
+    25    -0.050   -0.033   -0.017    +0.041*   +0.056*
+    35    -0.035   -0.032   -0.035    +0.016*   +0.033*
+```
+
+**8 of 60 cells net-positive (13%)**, and — this is the part that looks
+convincing — they form a contiguous region rather than isolated spikes: N=3 and
+N=4, min-risk 25–35, RR 2.0–2.5. That is exactly the "plateau, not a peak"
+pattern the standard methodology says to look for. Excluding Europe genuinely
+did move the whole grid up, by roughly 0.05–0.10R against the §5 numbers.
+
+### Out-of-sample
+
+```
+  N=3      RR1.0    RR1.25    RR1.5     RR2.0     RR2.5
+     0    -0.113   -0.082   -0.104    -0.123    -0.150
+    15    -0.059   -0.025   -0.054    -0.088    -0.116
+    25    -0.052   -0.015   -0.049    -0.056    -0.105
+    35    +0.004*  +0.041*  +0.006*   -0.021    -0.058
+```
+
+**3 of 60 (5%)** — and in a different place. The out-of-sample positives sit at
+RR 1.0–1.5 where the in-sample grid was solidly negative, and the in-sample
+region at RR 2.0–2.5 has gone negative.
+
+### The eight winners, carried forward verbatim
+
+| Cell | IS n | IS net | ±se | OOS n | OOS net | ±se |
+|---|---|---|---|---|---|---|
+| N=3 minR 25 RR 2.0 | 654 | +0.041 | 0.057 | 497 | −0.056 | 0.064 |
+| N=3 minR 25 RR 2.5 | 654 | +0.056 | 0.064 | 497 | −0.105 | 0.070 |
+| N=3 minR 35 RR 2.0 | 452 | +0.016 | 0.068 | 351 | −0.021 | 0.076 |
+| N=3 minR 35 RR 2.5 | 452 | +0.033 | 0.076 | 351 | −0.058 | 0.084 |
+| N=4 minR 15 RR 2.0 | 516 | +0.025 | 0.064 | 360 | **−0.244** | 0.071 |
+| N=4 minR 25 RR 2.0 | 338 | +0.027 | 0.079 | 262 | **−0.247** | 0.083 |
+| N=4 minR 35 RR 2.0 | 239 | +0.031 | 0.093 | 175 | −0.182 | 0.103 |
+| N=4 minR 35 RR 2.5 | 239 | +0.040 | 0.105 | 175 | −0.136 | 0.117 |
+
+**0 of 8 survived.** Every one flipped negative. The N=4 cells swung by
+0.2–0.27R between halves.
+
+### What this settles
+
+The in-sample plateau was real as a description of 2024-10 → 2025-12 and carried
+no information about 2026. That is worth stating plainly because "seek plateaus,
+not peaks" is the standard defence against curve-fitting, and here **the plateau
+formed anyway and still meant nothing.** A contiguous positive region is what
+noise looks like when neighbouring cells share most of their trades — the cells
+are not independent draws, so their agreement is not corroboration.
+
+The two positive rates tell the same story: 13% of cells positive in sample,
+5% out of sample. The out-of-sample rate is what a distribution centred slightly
+below zero produces by chance. Nothing is being detected.
+
+Excluding Europe was still the right call on the merits — §9 established that
+cell as significantly negative on 887 trades, and dropping it does lift the
+grid. It lifts it from clearly negative to slightly negative. It does not lift
+it above zero, and no parameter combination within it survives a walk forward.
+
+### Verdict — end of the line for this strategy family
+
+Six tests: filters, exits, instruments, stop placement, sessions, and a full
+parameter sweep with out-of-sample validation. The one durable finding is §8/§9:
+the N=3 entry is worth +0.109R against a session-matched breakout at 4.6σ, which
+cancels the breakout penalty and reaches zero. Everything downstream of that
+confirms the same ceiling from a different angle.
+
+Further parameter search on this signal is not a test. Any future work needs a
+second, independent condition supplying actual drift, benchmarked against the
+N=3 baseline rather than against random entry, with the out-of-sample split
+fixed before the first result is read.
+
+## 11. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).
@@ -627,5 +716,12 @@ except Europe hours, where it fails outright.
   so it is a run effect rather than a time-of-day effect.
 - The session buckets in §9 are fixed clock windows and ignore DST shifts and
   half-days; a few trades are in the wrong bucket.
+- The §10 split is a single walk-forward step, not a rolling one, and the
+  out-of-sample half (8 months) is shorter than the in-sample half (14 months).
+  A 0-for-8 failure needs no more resolution than that, but a positive result
+  would have.
+- Cells in the §10 grid share most of their trades, so the 60 tests are far from
+  independent and no multiple-comparison correction is quoted; the out-of-sample
+  split is what does the work instead.
 - Trailing exits in §8 update at 15m close and are checked on 3m sub-bars. A
   trail that updates intrabar would behave differently and is not tested.
