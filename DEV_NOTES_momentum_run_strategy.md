@@ -67,8 +67,12 @@ Target 1.5R, break-even 40.0%, entry order valid for one bar:
 Read that as three separate findings.
 
 **a) Intraday, the raw pattern has no continuation edge.** ES 15m sits 1–3
-points *below* the driftless null across every N, on 12,000 filled trades. This
-is not a marginal edge being eaten by costs; there is no edge to eat. N is
+points below the driftless null across every N, on 12,000 filled trades. Under
+optimistic tie-breaking it sits *at* the null (40.0% at N=3), and the 3m
+bar-magnifier run in §6 puts it at 39.1% — so read this as "no edge", not as
+"negative edge"; the earlier reading of these cells as meaningfully below the
+null was leaning on the conservative assumption. Either way there is no edge to
+eat. N is
 irrelevant — 2, 3, 4 and 5 are indistinguishable, which is itself the tell. A
 real momentum effect would strengthen or decay monotonically with run length.
 A flat line across N means the conditioning variable carries no information.
@@ -247,7 +251,83 @@ returns 0.00R per trade on 3,000 ES 15m trades. Filters that select *which*
 setups to take cannot fix a signal whose cost-free expectancy is zero. Only a
 different signal can.
 
-## 6. Known gaps
+## 6. Test 2 — the RR sweep (result: rejected, and one artifact corrected)
+
+Pre-committed hypothesis: *the 1.5R bracket is the binding constraint. ES 15m
+fade at 29–31% vs continuation at 37–39% says the directional persistence is
+real but small, so a lower target — needing only 50% at 1R — should clear its
+own break-even where 1.5R does not.*
+
+### The artifact
+
+The first pass, on 15m OHLC with conservative tie-breaking, appeared to reject
+that hypothesis violently and in the opposite direction:
+
+| RR | BE% | Hit rate (cons.) | z | Hit rate (opt.) | z | Ambiguous |
+|---|---|---|---|---|---|---|
+| 0.50 | 66.7% | 61.7% | **−5.67** | 66.0% | −0.77 | 4.3% |
+| 0.75 | 57.1% | 53.2% | −4.31 | 56.0% | −1.30 | 2.7% |
+| 1.00 | 50.0% | 47.3% | −2.96 | 49.3% | −0.82 | 1.9% |
+| 1.50 | 40.0% | 38.9% | −1.29 | 40.0% | −0.02 | 1.1% |
+| 2.00 | 33.3% | 32.8% | −0.66 | 33.6% | +0.27 | 0.8% |
+| 3.00 | 25.0% | 24.0% | −1.26 | 24.4% | −0.75 | 0.4% |
+
+A 5.7σ result is not a finding, it is a bug hunt. The tell is the last column:
+the tighter the target, the more often a single 15m bar contains both the stop
+and the target, and every one of those is booked as a loss by assumption. At
+1.5R that assumption touches 1.1% of trades and does not matter. At 0.5R it
+touches 4.3% and moves the hit rate 4.3 points. **The apparent gradient in z is
+the assumption, not the market.** §2's claim that the conservative assumption is
+"not what produces the result" holds at 1.5R and fails below it.
+
+### Removing the assumption
+
+`backtest_momentum_run_magnified.py` rebuilds 15m bars from `es1_3m` (so the
+OHLC is exact) and resolves every fill, stop and target on the 3m sub-bars.
+Residual ambiguity: 0.0% of trades.
+
+| RR | BE% | Hit rate | ±1se | z | Gross R | Net R |
+|---|---|---|---|---|---|---|
+| 0.50 | 66.7% | 67.5% | 2.8 | +0.30 | +0.013 | −0.116 |
+| 0.75 | 57.1% | 59.8% | 3.0 | +0.88 | +0.046 | −0.083 |
+| 1.00 | 50.0% | 49.1% | 3.0 | −0.30 | −0.018 | −0.147 |
+| 1.25 | 44.4% | 45.0% | 3.0 | +0.19 | +0.013 | −0.116 |
+| 1.50 | 40.0% | 39.1% | 3.0 | −0.30 | −0.022 | −0.151 |
+| 2.00 | 33.3% | 32.8% | 2.9 | −0.17 | −0.015 | −0.144 |
+| 3.00 | 25.0% | 22.1% | 2.5 | −1.13 | −0.114 | −0.243 |
+
+**The hit rate tracks `1/(1+RR)` at every target.** |z| ≤ 1.13 across the whole
+sweep, gross expectancy is zero within noise, and net is negative everywhere.
+The RR curve has no shape: there is no target distance at which this entry beats
+a coin. n = 271 over two months, so this cannot *establish* anything — but it is
+the only measurement here with no path assumption, and it agrees with the
+midpoint of the conservative/optimistic bracket on the full 15m sample.
+
+### The full 15m sweep, for completeness
+
+All 27 cells (N ∈ {2,3}, min-risk ∈ {0,30}, RR 0.5→3.0) are net-negative. The
+one panel that drifts positive on gross — N=3 with min-risk 30, reaching z=+1.06
+and gross +0.050 at RR=3.0 — does not replicate at N=2, where the same filter
+gives z between −1.15 and −4.68 across the same RR grid. Failing the
+neighbouring-parameter check is the standard disqualifier.
+
+### Verdict
+
+**The exit is not the problem either.** Test 1 closed the filter path: selection
+cannot fix a signal whose cost-free expectancy is zero. Test 2 closes the exit
+path: no R multiple from 0.5 to 3.0 changes that, because the hit rate simply
+tracks the geometry of the bracket. Together they say the entry carries no
+information about the forward distribution at any horizon this trade model can
+reach — which is the definition of no edge, and is not fixable by tuning either
+end of the trade.
+
+What remains untested is the *entry mechanism* rather than its parameters. Every
+result here conditions on a stop order filled one tick beyond the extreme. A
+limit entry on a pullback into the run is a different conditioning event and is
+not covered by any of this. That is a new hypothesis, not a variation of this
+one, and it needs its own signal, its own script and its own pre-commitment.
+
+## 7. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).
@@ -255,5 +335,11 @@ different signal can.
   affected, and only on instruments where that is common.
 - The Python probe has no session filter, so ES results include the overnight
   session where the pattern and the liquidity are both different.
-- Fill assumptions in the probe are ideal: the stop order fills at the trigger
+- Fill assumptions in both probes are ideal: the stop order fills at the trigger
   price exactly. Slippage is charged as a flat tick cost rather than modelled.
+- The magnifier probe resolves paths at 3m, not tick level. A 3m bar containing
+  both levels is still booked as a loss; that is 0.0% of trades in the run
+  above, but it would not stay at zero for targets tighter than 0.5R.
+- `backtest_momentum_run.py` is fine at 1.5R and misleading below ~1.25R. Use
+  the magnifier for anything in that range, or at minimum report both
+  tie-breaking conventions and treat the gap as the error bar.

@@ -78,7 +78,7 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
           min_risk_ticks=0.0, max_risk_ticks=0.0,
           optimistic=False, fade=False, max_hold=200):
     runs = run_lengths(bars, min_body)
-    setups = filled = wins = ambiguous = 0
+    setups = filled = wins = ambiguous = unresolved = 0
     net_r = gross_r = 0.0
     widths = []
 
@@ -127,6 +127,7 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
                 result = rr
                 break
         if result is None:  # still open at the horizon: mark to market
+            unresolved += 1
             last = bars[min(fill_bar + max_hold, len(bars) - 1)][3]
             result = d * (last - entry) / r
 
@@ -145,6 +146,7 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
         "cost_drag": (net_r - gross_r) / filled if filled else 0.0,
         "median_r_ticks": sorted(widths)[len(widths) // 2] if widths else 0.0,
         "amb_rate": ambiguous / filled if filled else 0.0,
+        "unresolved_rate": unresolved / filled if filled else 0.0,
     }
 
 
