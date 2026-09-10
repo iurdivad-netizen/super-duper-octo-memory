@@ -154,7 +154,100 @@ stop-and-target bars in your favour. Enable the bar magnifier, and treat the
 Python probe (which books the stop on ambiguous bars) as the floor and the
 strategy tester as the ceiling.
 
-## 5. Known gaps
+## 5. Test 1 — the min-risk filter (result: rejected)
+
+Pre-committed hypothesis: *min risk in ticks lifts ES 15m past the ~45% net
+break-even, and the improvement holds on ES 3m and a non-equity instrument with
+neighbouring parameter values also positive.*
+
+The confound to control for is mechanical. Raising the minimum stop distance
+selects for larger candles, which shrinks friction as a fraction of R whether or
+not the signal improves. So `net R` will improve under this filter even if the
+pattern is pure noise. The test therefore has to be run on **gross** expectancy
+(cost-free), with net reported only to size the drag.
+
+### ES 15m, N=3, sweep over min risk
+
+| Min risk (ticks) | Filled | Hit rate | ±1se | Gross R/trade | Net R/trade |
+|---|---|---|---|---|---|
+| 0 | 3049 | 38.9% | 0.9 | −0.028 | −0.166 |
+| 15 | 2462 | 39.4% | 1.0 | −0.015 | −0.118 |
+| 20 | 1999 | 39.4% | 1.1 | −0.016 | −0.102 |
+| 25 | 1583 | 40.1% | 1.2 | +0.001 | −0.071 |
+| **30** | **1279** | **40.5%** | **1.4** | **+0.012** | **−0.050** |
+| 40 | 862 | 39.2% | 1.7 | −0.020 | −0.070 |
+| 50 | 592 | 39.9% | 2.0 | −0.004 | −0.045 |
+| 60 | 424 | 38.7% | 2.4 | −0.034 | −0.070 |
+| 80 | 226 | 35.8% | 3.2 | −0.106 | −0.134 |
+
+**The filter works on net and does nothing on gross.** Net improves
+monotonically from −0.166 to about −0.05 — a 0.12R gain — while the hit rate
+moves 38.9% → 40.5%, which at n = 1279 is 0.36 standard errors from the null.
+Essentially the entire net improvement is cost drag being removed, exactly as
+the confound predicts.
+
+That also fixes the ceiling. Net expectancy can never exceed gross expectancy,
+and gross sits at 0.00 ± 0.01 across the whole usable range of the filter. Even
+a hypothetical zero-cost version of this strategy is a break-even coin flip. The
+filter cannot rescue it, because there is nothing to rescue: **it removes the
+losing part of the bet without making the remaining part winning.**
+
+N = 2 and N = 4 behave the same way or worse (N = 4 degrades past min risk 50,
+reaching 30.8% at 60+). There is no peak to find and no plateau above zero.
+
+### Cross-market
+
+| Market | Best gross cell | n | Hit rate | Gross R | Verdict |
+|---|---|---|---|---|---|
+| ES 15m | minR 30 | 1279 | 40.5% ±1.4 | +0.012 | flat, not significant |
+| ES 3m | minR 30 | 95 | 45.3% ±5.1 | +0.132 | n too small, 1.0σ |
+| EURUSD 1h | minR 110 | 112 | 34.8% ±4.5 | −0.129 | never crosses zero |
+| XAUUSD 1h | minR 1600 | 68 | 38.2% ±5.9 | −0.044 | never crosses zero |
+| BTC 1h | minR 25000 | 70 | 44.3% ±5.9 | +0.107 | non-monotone, noise |
+
+Every market's gross expectancy climbs toward zero as min risk rises, and the
+only cells that cross above it have n < 150 and standard errors of 4–6 points.
+The two that look best sit on the shortest datasets in the repo: `es1_3m` covers
+2026-06-28 to 2026-08-28 (two months) and `btcusd_1h` covers three months. One
+regime, one window, sub-significant. BTC's sequence is also non-monotone
+(37.0 → 44.3 → 40.8 → 46.7), which is what noise looks like and what an edge
+does not.
+
+### Stability of the best cell
+
+ES 15m N=3 minR 30, by quarter:
+
+| Quarter | n | Hit rate | Gross R | Net R |
+|---|---|---|---|---|
+| 2024Q4 | 57 | 52.6% | +0.316 | +0.244 |
+| 2025Q1 | 178 | 39.3% | −0.024 | −0.085 |
+| 2025Q2 | 226 | 35.4% | −0.129 | −0.185 |
+| 2025Q3 | 85 | 48.2% | +0.215 | +0.145 |
+| 2025Q4 | 153 | 46.4% | +0.160 | +0.101 |
+| 2026Q1 | 234 | 39.7% | −0.013 | −0.075 |
+| 2026Q2 | 217 | 39.6% | −0.009 | −0.073 |
+| 2026Q3 | 116 | 37.1% | −0.073 | −0.139 |
+| **pooled** | **1266** | | **+0.011** | **−0.051** |
+
+Three positive quarters out of eight, and they are the three smallest samples
+(n = 57, 85, 153). The four largest quarters (n = 178–234) are all negative and
+all cluster at 35–40%. Hit rate swings 35.4% to 52.6% with no persistence.
+
+**Verdict: abandon the min-risk filter as a rescue for this strategy on ES.**
+It is a genuine improvement to the trade model — it should stay on, since paying
+25% of R in friction is never right — but it addresses cost, not edge, and the
+edge is what is missing.
+
+### What this rules out
+
+The hypothesis under test was not only "min risk helps" but the broader claim
+that the intraday continuation edge exists and is being hidden by friction. The
+gross column answers that directly: with friction set to zero, the pattern still
+returns 0.00R per trade on 3,000 ES 15m trades. Filters that select *which*
+setups to take cannot fix a signal whose cost-free expectancy is zero. Only a
+different signal can.
+
+## 6. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).

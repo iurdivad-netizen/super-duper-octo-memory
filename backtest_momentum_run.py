@@ -75,10 +75,11 @@ def run_lengths(bars, min_body):
 
 
 def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
+          min_risk_ticks=0.0, max_risk_ticks=0.0,
           optimistic=False, fade=False, max_hold=200):
     runs = run_lengths(bars, min_body)
     setups = filled = wins = ambiguous = 0
-    net_r = 0.0
+    net_r = gross_r = 0.0
     widths = []
 
     for i in range(len(bars) - max_hold - 2):
@@ -86,7 +87,6 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
         d0 = colour(o, c, h, l, min_body)
         if d0 == 0 or runs[i] != n:
             continue
-        setups += 1
         d = -d0 if fade else d0
 
         entry = h + tick if d > 0 else l - tick
@@ -94,6 +94,11 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
         r = abs(entry - stop)
         if r <= 0:
             continue
+        if min_risk_ticks and r < min_risk_ticks * tick:
+            continue
+        if max_risk_ticks and r > max_risk_ticks * tick:
+            continue
+        setups += 1
         target = entry + d * rr * r
 
         fill_bar = None
@@ -127,6 +132,7 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
 
         if result > 0:
             wins += 1
+        gross_r += result
         net_r += result - (cost_ticks * tick) / r
 
     return {
@@ -134,7 +140,9 @@ def probe(bars, n, tick, rr=1.5, cost_ticks=3.0, valid_bars=1, min_body=0.0,
         "fill_rate": filled / setups if setups else 0.0,
         "win_rate": wins / filled if filled else 0.0,
         "net_r": net_r,
+        "gross_per_trade": gross_r / filled if filled else 0.0,
         "r_per_trade": net_r / filled if filled else 0.0,
+        "cost_drag": (net_r - gross_r) / filled if filled else 0.0,
         "median_r_ticks": sorted(widths)[len(widths) // 2] if widths else 0.0,
         "amb_rate": ambiguous / filled if filled else 0.0,
     }
@@ -146,6 +154,10 @@ def main():
     ap.add_argument("--runs", type=int, nargs="+", default=[2, 3, 4, 5])
     ap.add_argument("--valid-bars", type=int, default=1)
     ap.add_argument("--min-body", type=float, default=0.0)
+    ap.add_argument("--min-risk", type=float, default=0.0,
+                    help="skip setups whose stop distance is under N ticks")
+    ap.add_argument("--max-risk", type=float, default=0.0,
+                    help="skip setups whose stop distance is over N ticks")
     ap.add_argument("--optimistic", action="store_true",
                     help="book the target when a bar contains both levels")
     ap.add_argument("--fade", action="store_true",
@@ -166,6 +178,7 @@ def main():
         for n in args.runs:
             s = probe(bars, n, tick, rr=args.rr, cost_ticks=cost,
                       valid_bars=args.valid_bars, min_body=args.min_body,
+                      min_risk_ticks=args.min_risk, max_risk_ticks=args.max_risk,
                       optimistic=args.optimistic, fade=args.fade)
             edge = 100 * s["win_rate"] - breakeven
             print(f"{label:11s} {n:2d} {s['setups']:7d} {s['filled']:7d} "
