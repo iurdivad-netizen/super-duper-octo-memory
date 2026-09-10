@@ -529,7 +529,76 @@ gross, so no single row is individually significant. The ranking is uniform
 across all six variants and the payoff decomposition is measured with much
 better precision than the mean, which is what the conclusion rests on.
 
-## 9. Known gaps
+## 9. Test 5 — session-matched control
+
+§8's control drew bars uniformly, so part of the +0.102R could have been a
+time-of-day effect: N=3 runs may cluster in hours that behave differently from
+the average hour. This replaces it with a control drawn from the **same 15-minute
+slot of the day** as each signal, in the same direction.
+
+| Entry set | n | Hit rate | Gross | ±se | vs signal |
+|---|---|---|---|---|---|
+| **SIGNAL — N=3 run** | 3048 | 38.9% | −0.028 | 0.022 | — |
+| uniform random bar | 17813 | 35.2% | −0.120 | 0.009 | +0.092R (3.9σ) |
+| session-matched, any bar | 18162 | 34.9% | −0.129 | 0.009 | +0.100R (4.2σ) |
+| session-matched, excluding run bars | 18111 | 34.5% | −0.137 | 0.009 | **+0.109R (4.6σ)** |
+
+**The effect is a run effect, not a session effect.** Matching on time of day
+does not shrink it — it grows slightly, and grows again when run bars are
+removed from the control pool (which is the cleanest contrast, since the
+uniform pool was partly contaminated by the signal itself). §8's finding stands
+at 4.6σ against the strictest control available here.
+
+### Where the return sits, by session
+
+| Session (ET) | n | Hit rate | Gross | ±se | Control | Net |
+|---|---|---|---|---|---|---|
+| RTH morning 0930–1200 | 386 | 42.5% | **+0.062** | 0.063 | −0.151 | −0.006 |
+| RTH afternoon 1200–1600 | 557 | 39.3% | −0.017 | 0.052 | −0.125 | −0.104 |
+| Europe 0300–0930 | 887 | 35.2% | **−0.121** | 0.040 | −0.168 | −0.258 |
+| Asia/overnight 1600–0300 | 1218 | 40.2% | +0.006 | 0.035 | −0.085 | −0.180 |
+
+Two things are visible and only one of them is useful.
+
+**The Europe session is where the strategy bleeds.** Gross −0.121 ± 0.040 is
+three standard errors below zero on 887 trades — the only cell in this entire
+file that is significantly *negative* rather than merely not-positive. Net
+−0.258. Whatever the run filter is doing in the US sessions, it is not doing it
+between 03:00 and 09:30 ET.
+
+**RTH morning is the best cell and it is not tradeable.** Gross +0.062 ± 0.063
+is one standard error from zero, and friction eats it exactly: net −0.006.
+Break-even, not profitable, arrived at after several hundred prior cells.
+
+Its stability settles it:
+
+| Half-year | n | Hit rate | Gross | ±se | Net |
+|---|---|---|---|---|---|
+| 2024H2 | 34 | 52.9% | +0.324 | 0.217 | +0.225 |
+| 2025H1 | 102 | 35.3% | −0.118 | 0.119 | −0.180 |
+| 2025H2 | 104 | 54.8% | +0.370 | 0.123 | +0.292 |
+| 2026H1 | 105 | 35.2% | −0.119 | 0.117 | −0.176 |
+| 2026H2 | 41 | 39.0% | −0.024 | 0.193 | −0.082 |
+
+The sign alternates every half-year. 2025H2 at +0.370 is 3σ from zero on its
+own, and means nothing: in a grid of 5 half-years × 4 sessions, sitting on top
+of every test in §§5–8, a 3σ cell is expected rather than surprising.
+
+Dropping the Europe session entirely — the one change the data actually
+supports — moves overall gross from −0.028 to about +0.010 and leaves net near
+−0.13, because the surviving overnight hours carry a small R and therefore a
+large cost drag. Removing the worst cell does not make the rest positive.
+
+### Verdict
+
+The question is answered cleanly and in the strategy's favour: **the entry
+conditioning is real, survives the strictest control, and is worth +0.109R
+against a matched breakout.** The strategy still has no positive-expectancy
+configuration. Those two statements are compatible because the effect's job is
+to cancel a −0.13R penalty, and it cancels it to approximately zero everywhere
+except Europe hours, where it fails outright.
+
+## 10. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).
@@ -554,9 +623,9 @@ better precision than the mean, which is what the conclusion rests on.
 - `data/qqq_15m.csv`, `data/xauusd_15m.csv` and `data/xauusd_5m.csv` were pulled
   from Twelve Data in Sep 2026 and are point-in-time snapshots, not a maintained
   feed.
-- The §8 random-entry control draws bars uniformly, so it samples the overnight
-  session at its true frequency but does not match the signal's time-of-day
-  distribution. Some of the +0.10R could be a session effect rather than a run
-  effect; separating them needs a session-matched control.
+- Resolved in §9: the session-matched control leaves the effect intact at 4.6σ,
+  so it is a run effect rather than a time-of-day effect.
+- The session buckets in §9 are fixed clock windows and ignore DST shifts and
+  half-days; a few trades are in the wrong bucket.
 - Trailing exits in §8 update at 15m close and are checked on 3m sub-bars. A
   trail that updates intrabar would behave differently and is not tested.
