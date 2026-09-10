@@ -1,0 +1,440 @@
+// =============================================================================
+// Momentum Run — consecutive same-colour candles, stop-entry continuation
+// =============================================================================
+// Signal   : N consecutive same-colour candles (body filter optional).
+// Entry    : stop order 1 tick beyond the signal candle's extreme
+//            (high + offset for longs, low - offset for shorts).
+// Stop     : signal-candle extreme, run extreme, or an ATR distance —
+//            whichever the stop model selects.
+// Target   : a fixed multiple of the realised risk R (default 1.5R).
+//
+// READ THIS BEFORE TRADING IT
+// ---------------------------
+// A bracket of +1.5R / -1R on a driftless random walk fills the target first
+// 1/(1+1.5) = 40.0% of the time. That is the null hypothesis this script has
+// to beat, and it has to beat it by enough to cover costs: at a 25-tick R on
+// ES with ~3 ticks of round-trip friction, break-even sits near 45%, not 40%.
+//
+// Measured on the repo's own data with this exact trade model (conservative
+// intrabar resolution, stop wins ambiguous bars), the raw pattern does NOT
+// clear that bar intraday — see DEV_NOTES_momentum_run_strategy.md for the
+// table. The script is therefore built as a research instrument: every filter
+// below exists so a specific hypothesis about *when* the continuation works
+// can be tested and rejected, not so the defaults can be curve-fitted until
+// the equity curve points up.
+//
+// Pine Script v6.
+// =============================================================================
+
+//@version=6
+strategy("Momentum Run — Continuation",
+     shorttitle       = "MOM RUN",
+     overlay          = true,
+     initial_capital  = 25000,
+     default_qty_type = strategy.fixed,
+     default_qty_value= 1,
+     commission_type  = strategy.commission.cash_per_contract,
+     commission_value = 1.24,
+     slippage         = 1,
+     calc_on_every_tick    = false,
+     process_orders_on_close = false,
+     max_labels_count = 500,
+     max_boxes_count  = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs — signal
+// -----------------------------------------------------------------------------
+G_SIG = "1 · Signal"
+
+i_runLen   = input.int(3, "Consecutive candles (N)", minval=2, maxval=10, group=G_SIG,
+     tooltip="How many same-colour candles must close before the setup is armed.")
+i_minBody  = input.float(0.0, "Min body / range", minval=0.0, maxval=1.0, step=0.05, group=G_SIG,
+     tooltip="A candle only counts toward the run if its body is at least this " +
+             "fraction of its range. 0 = any close above/below the open counts. " +
+             "Raising this is the cheapest way to stop counting indecision bars " +
+             "as momentum.")
+i_extend   = input.bool(false, "Re-arm on every bar past N", group=G_SIG,
+     tooltip="Off (default): the setup fires once, on the bar that completes the " +
+             "run. On: bar N+1, N+2 … each re-arm the entry. On multiplies trade " +
+             "count without adding information — it is here to be tested, not used.")
+i_dir      = input.string("Both", "Direction", options=["Both", "Long only", "Short only"], group=G_SIG)
+
+// -----------------------------------------------------------------------------
+// Inputs — entry
+// -----------------------------------------------------------------------------
+G_ENT = "2 · Entry"
+
+i_entryTicks = input.int(1, "Trigger offset (ticks beyond extreme)", minval=0, maxval=100, group=G_ENT,
+     tooltip="Longs enter at signal high + this many ticks; shorts at signal low " +
+             "minus it. Kept as ticks so it scales with the instrument.")
+i_validBars  = input.int(1, "Order valid for (bars)", minval=1, maxval=20, group=G_ENT,
+     tooltip="Unfilled stop orders are cancelled after this many bars. 1 = the " +
+             "next bar only. Widening this changes what the strategy is: the " +
+             "further from the run the fill happens, the less it is a continuation " +
+             "trade.")
+
+// -----------------------------------------------------------------------------
+// Inputs — stop
+// -----------------------------------------------------------------------------
+G_STP = "3 · Stop"
+
+i_stopMode = input.string("Signal candle extreme", "Stop placement",
+     options=["Signal candle extreme", "Run extreme", "ATR distance", "Tightest of the three"],
+     group=G_STP,
+     tooltip="Signal candle extreme: the low (longs) of the bar that completed the " +
+             "run — your original spec. Run extreme: the low of the whole run, a " +
+             "wider and structurally safer stop. ATR distance: decouples risk from " +
+             "candle geometry entirely.")
+i_stopTicks = input.int(1, "Stop buffer (ticks beyond extreme)", minval=0, maxval=100, group=G_STP)
+i_atrLen    = input.int(14, "ATR length", minval=1, group=G_STP)
+i_atrStop   = input.float(1.0, "ATR stop multiple", minval=0.1, step=0.1, group=G_STP)
+
+i_minRTicks = input.int(0, "Min risk (ticks, 0 = off)", minval=0, group=G_STP,
+     tooltip="Skips setups whose stop is so tight that spread and noise decide the " +
+             "outcome. This is the single most important filter in the script.")
+i_maxRAtr   = input.float(0.0, "Max risk (ATR multiples, 0 = off)", minval=0.0, step=0.25, group=G_STP,
+     tooltip="Skips setups after an outsized candle, where the stop is wide, the " +
+             "entry is late, and 1.5R is a long way away.")
+
+// -----------------------------------------------------------------------------
+// Inputs — target and trade management
+// -----------------------------------------------------------------------------
+G_TGT = "4 · Target & management"
+
+i_rr        = input.float(1.5, "Target (R multiple)", minval=0.25, step=0.25, group=G_TGT,
+     tooltip="Break-even hit rate on a driftless walk is 1/(1+RR): 40.0% at 1.5R, " +
+             "50% at 1R, 33.3% at 2R. The stats table compares your realised hit " +
+             "rate against this number.")
+i_useBE     = input.bool(false, "Move stop to break-even", group=G_TGT)
+i_beTrigger = input.float(1.0, "  … after price reaches (R)", minval=0.1, step=0.1, group=G_TGT)
+i_beOffset  = input.int(0, "  … locking in (ticks)", minval=0, group=G_TGT)
+i_timeStop  = input.int(0, "Time stop (bars, 0 = off)", minval=0, group=G_TGT,
+     tooltip="Closes a trade that has gone nowhere. Momentum that stalls is no " +
+             "longer the thing you entered on.")
+
+// -----------------------------------------------------------------------------
+// Inputs — context filters
+// -----------------------------------------------------------------------------
+G_FLT = "5 · Filters"
+
+i_useTrend  = input.bool(false, "Trend filter (EMA)", group=G_FLT,
+     tooltip="Longs only above the EMA, shorts only below. Tests whether the run " +
+             "only continues when it is aligned with the larger move.")
+i_trendLen  = input.int(50, "  EMA length", minval=2, group=G_FLT)
+
+i_useExp    = input.bool(false, "Require range expansion", group=G_FLT,
+     tooltip="The signal candle's range must be at least this multiple of ATR. " +
+             "Separates a run of real bars from a run of inside-range noise.")
+i_expMult   = input.float(1.0, "  Range / ATR ≥", minval=0.1, step=0.1, group=G_FLT)
+
+i_useSess   = input.bool(false, "Session filter", group=G_FLT)
+i_sess      = input.session("0930-1600", "  Session", group=G_FLT)
+i_tz        = input.string("America/New_York", "  Timezone", group=G_FLT)
+i_flatEOD   = input.bool(false, "Flatten at session end", group=G_FLT)
+
+// -----------------------------------------------------------------------------
+// Inputs — sizing
+// -----------------------------------------------------------------------------
+G_RSK = "6 · Sizing"
+
+i_sizeMode = input.string("Fixed", "Position sizing", options=["Fixed", "Risk % of equity"], group=G_RSK,
+     tooltip="Fixed contracts make the equity curve a function of stop width: " +
+             "wide-stop trades dominate P&L. Risk %% is the honest way to read the " +
+             "backtest, because it is the only mode where every trade is 1R.")
+i_fixedQty = input.float(1, "  Fixed qty", minval=0.000001, group=G_RSK)
+i_riskPct  = input.float(0.5, "  Risk per trade (% of equity)", minval=0.01, step=0.05, group=G_RSK)
+
+// -----------------------------------------------------------------------------
+// Inputs — display
+// -----------------------------------------------------------------------------
+G_DSP = "7 · Display"
+
+i_showRun   = input.bool(true, "Highlight completed runs", group=G_DSP)
+i_showLvls  = input.bool(true, "Draw entry / stop / target", group=G_DSP)
+i_showTable = input.bool(true, "Show stats table", group=G_DSP)
+
+// -----------------------------------------------------------------------------
+// Helpers  (top level — Pine forbids nested function definitions)
+// -----------------------------------------------------------------------------
+f_dirOf(float o, float c, float h, float l, float minBody) =>
+    rng  = h - l
+    body = math.abs(c - o)
+    ok   = rng > 0 ? (body / rng) >= minBody : false
+    ok and c > o ? 1 : ok and c < o ? -1 : 0
+
+// Number of contracts/shares for a given stop distance in price points.
+f_qty(string mode, float fixedQty, float riskPct, float stopDist) =>
+    float q = fixedQty
+    if mode == "Risk % of equity"
+        riskCash    = strategy.equity * (riskPct / 100.0)
+        riskPerUnit = stopDist * syminfo.pointvalue
+        q := riskPerUnit > 0 ? math.floor(riskCash / riskPerUnit) : 0
+    q
+
+// -----------------------------------------------------------------------------
+// Core calculations — every ta.* call is unconditional, on every bar
+// -----------------------------------------------------------------------------
+tick = syminfo.mintick
+atr  = ta.atr(i_atrLen)
+ema  = ta.ema(close, i_trendLen)
+
+inSess    = i_useSess ? not na(time(timeframe.period, i_sess, i_tz)) : true
+sessEnd   = i_useSess and inSess[1] and not inSess
+
+// --- run state machine -------------------------------------------------------
+// runHi / runLo are tracked here rather than with ta.highest/ta.lowest so the
+// lookback never has to be a series length.
+barDir = f_dirOf(open, close, high, low, i_minBody)
+
+var int   runDir = 0
+var int   runLen = 0
+var float runHi  = na
+var float runLo  = na
+
+if barDir == 0
+    runDir := 0
+    runLen := 0
+    runHi  := na
+    runLo  := na
+else if barDir == runDir
+    runLen := runLen + 1
+    runHi  := math.max(nz(runHi, high), high)
+    runLo  := math.min(nz(runLo, low),  low)
+else
+    runDir := barDir
+    runLen := 1
+    runHi  := high
+    runLo  := low
+
+runComplete = i_extend ? runLen >= i_runLen : runLen == i_runLen
+
+// -----------------------------------------------------------------------------
+// Setup construction
+// -----------------------------------------------------------------------------
+dirAllowed = runDir > 0 ? i_dir != "Short only" : runDir < 0 ? i_dir != "Long only" : false
+trendOK    = not i_useTrend ? true : runDir > 0 ? close > ema : close < ema
+expOK      = not i_useExp   ? true : (high - low) >= i_expMult * atr
+
+// Entry trigger: one tick (or i_entryTicks) beyond the signal candle's extreme.
+trigger = runDir > 0 ? high + i_entryTicks * tick :
+          runDir < 0 ? low  - i_entryTicks * tick : na
+
+// Candidate stops. Each is expressed as a distance so "tightest" is comparable.
+stopCandle = runDir > 0 ? low   - i_stopTicks * tick : high  + i_stopTicks * tick
+stopRun    = runDir > 0 ? runLo - i_stopTicks * tick : runHi + i_stopTicks * tick
+stopAtr    = runDir > 0 ? trigger - i_atrStop * atr  : trigger + i_atrStop * atr
+
+float stopPrice = switch i_stopMode
+    "Signal candle extreme" => stopCandle
+    "Run extreme"           => stopRun
+    "ATR distance"          => stopAtr
+    => runDir > 0 ? math.max(math.max(stopCandle, stopRun), stopAtr)
+                  : math.min(math.min(stopCandle, stopRun), stopAtr)
+
+riskDist = na(trigger) or na(stopPrice) ? na : math.abs(trigger - stopPrice)
+target   = na(riskDist) ? na : runDir > 0 ? trigger + i_rr * riskDist
+                                          : trigger - i_rr * riskDist
+
+riskOK = not na(riskDist) and riskDist > 0
+     and (i_minRTicks == 0 or riskDist >= i_minRTicks * tick)
+     and (i_maxRAtr   == 0 or riskDist <= i_maxRAtr * atr)
+
+setupValid = runComplete and dirAllowed and trendOK and expOK and riskOK
+     and inSess and barstate.isconfirmed and strategy.position_size == 0
+
+// -----------------------------------------------------------------------------
+// Trade state
+// -----------------------------------------------------------------------------
+var int   pendingDir  = 0        // direction of a resting entry order
+var int   pendingAge  = 0        // bars since it was placed
+var float pEntry      = na       // levels carried from setup to fill
+var float pStop       = na
+var float pTarget     = na
+var float pRisk       = na
+
+var int   tradeDir    = 0        // direction of the open position
+var float entryPrice  = na
+var float activeStop  = na
+var float activeTgt   = na
+var float tradeRisk   = na
+var int   barsInTrade = 0
+var bool  beDone      = false
+
+// Diagnostics
+var int   nSetups   = 0
+var int   nFilled   = 0
+var int   nWins     = 0
+var int   nLosses   = 0
+var float sumR      = 0.0
+
+// --- age out an unfilled order ----------------------------------------------
+if pendingDir != 0 and strategy.position_size == 0
+    pendingAge := pendingAge + 1
+    if pendingAge >= i_validBars
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+        pendingDir := 0
+        pendingAge := 0
+
+// --- detect a fill -----------------------------------------------------------
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+if justFilled
+    tradeDir    := strategy.position_size > 0 ? 1 : -1
+    entryPrice  := strategy.position_avg_price
+    tradeRisk   := pRisk
+    activeStop  := pStop
+    activeTgt   := pTarget
+    barsInTrade := 0
+    beDone      := false
+    pendingDir  := 0
+    pendingAge  := 0
+    nFilled     := nFilled + 1
+
+// --- flat reset (and book the result) ---------------------------------------
+justClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if justClosed and strategy.closedtrades > 0
+    idx = strategy.closedtrades - 1
+    pnl = strategy.closedtrades.profit(idx)
+    if not na(tradeRisk) and tradeRisk > 0
+        rMult = pnl / (tradeRisk * syminfo.pointvalue * math.abs(strategy.closedtrades.size(idx)))
+        sumR := sumR + rMult
+        if pnl > 0
+            nWins := nWins + 1
+        else
+            nLosses := nLosses + 1
+    tradeDir    := 0
+    entryPrice  := na
+    activeStop  := na
+    activeTgt   := na
+    tradeRisk   := na
+    barsInTrade := 0
+    beDone      := false
+
+// -----------------------------------------------------------------------------
+// Entries
+// -----------------------------------------------------------------------------
+qty = f_qty(i_sizeMode, i_fixedQty, i_riskPct, nz(riskDist, 0))
+
+if setupValid and qty > 0
+    nSetups    := nSetups + 1
+    pEntry     := trigger
+    pStop      := stopPrice
+    pTarget    := target
+    pRisk      := riskDist
+    pendingDir := runDir
+    pendingAge := 0
+    if runDir > 0
+        strategy.entry("Long", strategy.long, qty=qty, stop=trigger,
+             comment="RUN " + str.tostring(runLen))
+        // Bracket goes in with the entry, not after it: an entry that fills
+        // intrabar is otherwise naked until the next bar's open.
+        strategy.exit("X-Long", "Long", stop=stopPrice, limit=target)
+    else
+        strategy.entry("Short", strategy.short, qty=qty, stop=trigger,
+             comment="RUN " + str.tostring(runLen))
+        strategy.exit("X-Short", "Short", stop=stopPrice, limit=target)
+
+// -----------------------------------------------------------------------------
+// Exits
+// -----------------------------------------------------------------------------
+if strategy.position_size != 0
+    barsInTrade := barsInTrade + 1
+
+    // break-even upgrade
+    if i_useBE and not beDone and not na(entryPrice) and not na(tradeRisk)
+        reached = tradeDir > 0 ? high >= entryPrice + i_beTrigger * tradeRisk
+                               : low  <= entryPrice - i_beTrigger * tradeRisk
+        if reached
+            activeStop := tradeDir > 0 ? entryPrice + i_beOffset * tick
+                                       : entryPrice - i_beOffset * tick
+            beDone     := true
+
+    if tradeDir > 0
+        strategy.exit("X-Long", "Long", stop=activeStop, limit=activeTgt)
+    else if tradeDir < 0
+        strategy.exit("X-Short", "Short", stop=activeStop, limit=activeTgt)
+
+    if i_timeStop > 0 and barsInTrade >= i_timeStop
+        strategy.close_all(comment="TIME")
+
+if i_flatEOD and sessEnd and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+
+if i_flatEOD and sessEnd
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+
+// -----------------------------------------------------------------------------
+// Visuals
+// -----------------------------------------------------------------------------
+runColor = runComplete and dirAllowed ? (runDir > 0 ? color.new(color.teal, 70)
+                                                    : color.new(color.maroon, 70)) : na
+bgcolor(i_showRun ? runColor : na, title="Completed run")
+
+plotEntry = i_showLvls and strategy.position_size != 0 ? entryPrice : na
+plotStop  = i_showLvls and strategy.position_size != 0 ? activeStop : na
+plotTgt   = i_showLvls and strategy.position_size != 0 ? activeTgt  : na
+
+plot(plotEntry, "Entry",  color=color.new(color.gray, 0),  style=plot.style_linebr, linewidth=1)
+plot(plotStop,  "Stop",   color=color.new(color.red, 0),   style=plot.style_linebr, linewidth=1)
+plot(plotTgt,   "Target", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=1)
+
+plotshape(i_showLvls and setupValid and runDir > 0, title="Long setup",
+     style=shape.triangleup, location=location.belowbar, color=color.teal, size=size.tiny)
+plotshape(i_showLvls and setupValid and runDir < 0, title="Short setup",
+     style=shape.triangledown, location=location.abovebar, color=color.maroon, size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// Stats table — the point of this script is the comparison in the last two rows
+// -----------------------------------------------------------------------------
+var table tb = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 50))
+
+if i_showTable and barstate.islast
+    breakeven = 100.0 / (1.0 + i_rr)
+    realised  = nFilled > 0 ? 100.0 * nWins / nFilled : 0.0
+    edge      = realised - breakeven
+    edgeCol   = edge > 0 ? color.lime : color.red
+
+    table.cell(tb, 0, 0, "Momentum Run", text_color=color.white, text_size=size.small)
+    table.cell(tb, 1, 0, str.format("N={0}  {1}R", i_runLen, i_rr),
+         text_color=color.white, text_size=size.small)
+
+    table.cell(tb, 0, 1, "Setups",  text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 1, str.tostring(nSetups), text_color=color.white, text_size=size.tiny)
+
+    table.cell(tb, 0, 2, "Filled",  text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 2, str.format("{0}  ({1,number,#.#}%)", nFilled,
+         nSetups > 0 ? 100.0 * nFilled / nSetups : 0.0),
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(tb, 0, 3, "Wins / Losses", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 3, str.format("{0} / {1}", nWins, nLosses),
+         text_color=color.white, text_size=size.tiny)
+
+    table.cell(tb, 0, 4, "Total R", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 4, str.tostring(sumR, "#.#"),
+         text_color=sumR >= 0 ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(tb, 0, 5, "R / trade", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 5, str.tostring(nFilled > 0 ? sumR / nFilled : 0.0, "#.###"),
+         text_color=sumR >= 0 ? color.lime : color.red, text_size=size.tiny)
+
+    table.cell(tb, 0, 6, "Break-even hit rate", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 6, str.tostring(breakeven, "#.#") + "%",
+         text_color=color.orange, text_size=size.tiny)
+
+    table.cell(tb, 0, 7, "Realised hit rate", text_color=color.silver, text_size=size.tiny)
+    table.cell(tb, 1, 7, str.format("{0,number,#.#}%  ({1,number,+#.#;-#.#})", realised, edge),
+         text_color=edgeCol, text_size=size.tiny)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+if setupValid
+    alert(str.format("{0} run of {1} on {2} — {3} stop @ {4}, trigger {5}, target {6}",
+         runDir > 0 ? "Bullish" : "Bearish", runLen, syminfo.ticker,
+         runDir > 0 ? "long" : "short",
+         str.tostring(stopPrice, format.mintick),
+         str.tostring(trigger, format.mintick),
+         str.tostring(target, format.mintick)), alert.freq_once_per_bar_close)
