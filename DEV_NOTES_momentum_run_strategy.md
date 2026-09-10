@@ -417,7 +417,119 @@ the strategy; it is a search for the noisiest cell in a large grid.** Any future
 candidate needs to be pre-registered, sized for the effect being claimed, and
 validated out of sample before it means anything.
 
-## 8. Known gaps
+## 8. Test 4 — stop placement and trailing exits
+
+Two claims under test: (a) a wider stop — the previous candle's low — helps;
+(b) failing that, a tight trail on each candle's low or an ATR distance helps.
+
+Claim (b) deserved a real test rather than an extrapolation. Tests 1–3 all used
+**fixed** brackets, and a fixed bracket is blind to path shape: it only asks
+which of two levels is touched first. A trailing stop is a different functional
+of the same forward distribution, sensitive to the serial correlation of
+increments. Nothing established so far rules it out.
+
+### First, a correction to the framing — the entry does carry information
+
+The exit test needed a benchmark for path-dependent exits, so it uses a
+**random-entry control**: the identical exit logic fired from randomly chosen
+bars in the same data, which absorbs the instrument's drift and volatility and
+leaves only what the signal adds. The control came back at −0.130R gross, not
+zero, which is worth its own table:
+
+| Entry condition | n | Hit rate | Gross (cons) | ±se | Gross (opt) | vs random |
+|---|---|---|---|---|---|---|
+| random bar & direction | 18611 | 34.8% | −0.130 | 0.009 | −0.095 | — |
+| N=1 (any coloured bar) | 13823 | 36.7% | −0.082 | 0.010 | −0.058 | +0.048R (3.6σ) |
+| N=2 | 6572 | 37.5% | −0.062 | 0.015 | −0.036 | +0.068R (3.9σ) |
+| **N=3** | 3048 | 38.9% | −0.028 | 0.022 | **−0.000** | **+0.102R (4.3σ)** |
+| N=4 | 1470 | 36.7% | −0.084 | 0.031 | −0.055 | +0.046R (1.4σ) |
+| N≥5 | 1274 | 37.0% | −0.076 | 0.034 | −0.060 | +0.054R (1.6σ) |
+
+**A generic breakout entry on ES 15m loses about 0.10–0.13R gross.** Buying one
+tick above an arbitrary bar's high with a stop at its low is a losing structure
+before any cost — short-horizon adverse selection at the breakout. The run
+filter is not neutral against that: at N=3 it recovers the whole penalty, at
+4.3σ on 3,048 trades. That is the only statistically solid positive finding in
+this file.
+
+It changes the story of §2 and §6 in one specific way. "The hit rate tracks
+`1/(1+RR)`" is still true, but the correct reading is not "the signal does
+nothing" — it is **"the signal does exactly enough to cancel the breakout
+penalty and no more."** The ceiling is zero gross, and it is reached, not
+approached.
+
+Two cautions. The progression is not monotone: N=4 and N≥5 fall back to −0.08,
+so this is not "more consecutive candles, better conditioning" — N=3 is a peak
+in a five-cell grid, and N=3 vs N=1 is only 2.2σ. And zero gross is still zero:
+recovering a penalty is not the same as generating an edge.
+
+### Claim (a): a wider stop
+
+On 3m-resolved paths, 274 trades:
+
+| Stop | Hit rate | Gross | ±se | Net |
+|---|---|---|---|---|
+| signal candle low | 39.1% | −0.024 | 0.074 | −0.152 |
+| previous candle low | 39.1% | −0.024 | 0.074 | −0.113 |
+| min(both lows) | 38.7% | −0.033 | 0.074 | −0.119 |
+
+Gross is unchanged to three decimals. Net improves by 0.039R — and that is the
+Test 1 confound again, arriving through a different door: a wider stop means a
+larger R, which means friction is a smaller fraction of it. Nothing about the
+signal improved. The stop moved, the target moved with it (both are defined off
+R), and the bracket geometry is scale-invariant.
+
+### Claim (b): trailing
+
+| Exit model | Hit rate | Avg win | Avg loss | Needs | **Gap** | Gross |
+|---|---|---|---|---|---|---|
+| candle low, fixed 1.5R | 39.1% | +1.50R | −1.00R | 1.56R | **−0.06R** | −0.024 |
+| prev candle low, fixed 1.5R | 39.1% | +1.50R | −1.00R | 1.56R | −0.06R | −0.024 |
+| candle low, trail prior low | 32.1% | +0.90R | −0.60R | 1.26R | −0.37R | −0.118 |
+| prev low, trail prior low | 33.2% | +0.62R | −0.43R | 0.87R | −0.25R | −0.082 |
+| trail low, 1.5R cap | 33.6% | +0.94R | −0.61R | 1.20R | −0.26R | −0.088 |
+| ATR trail 1.5× | 31.4% | +1.24R | −0.77R | 1.68R | −0.44R | −0.138 |
+| ATR trail 2.5× | 25.2% | +2.31R | −0.87R | 2.58R | −0.27R | −0.068 |
+| ATR trail 3.5× | 22.3% | +2.83R | −0.94R | 3.28R | −0.45R | −0.101 |
+
+"Needs" is the average win required to break even at that hit rate; "Gap" is how
+far short the actual average win falls. **The fixed bracket is the closest
+structure to break-even in the table, and all six trailing variants are three to
+seven times further away.**
+
+The mechanism is visible in the middle columns, and it is not what intuition
+predicts. Trailing does exactly what it is supposed to: `prev low, trail prior
+low` cuts the average loss from −1.00R to −0.43R, a 57% reduction. It also cuts
+the hit rate from 39.1% to 33.2% and the average win from 1.50R to 0.62R. **The
+saving on losers is real and it is smaller than the cost in winners.**
+
+That is what a trailing stop does to a driftless distribution. Every bar the
+trail advances is another level for noise to touch; without positive serial
+correlation in the increments there is no compensating trend to ride. The wide
+ATR trails show the same thing from the other end — ATR 3.5× correctly finds a
+2.83R average winner, but drags the hit rate to 22.3% when 25.4% is needed.
+
+### Verdict
+
+Both claims rejected. The wider stop is a cost-ratio change, not a signal
+change. Trailing is strictly worse than the fixed bracket at every setting
+tested, by a mechanism the payoff table makes explicit.
+
+The entry claim is **partly upheld and it matters**: the entry is not arbitrary,
+it is worth +0.10R against a generic breakout. But §5's ceiling argument now has
+a sharper form. The entry's demonstrated capability is cancelling the breakout
+penalty exactly. Every exit model is a different way of reading the same forward
+distribution, and that distribution has zero drift. **No exit can extract
+positive expectancy from a driftless path — the exit only decides how the zero
+is divided between hit rate and win size.** The fixed 1.5R bracket happens to
+divide it most efficiently, which is why it sits closest to break-even.
+
+*Sample caveat:* the trailing tests run on 274 magnified trades with ±0.074 on
+gross, so no single row is individually significant. The ranking is uniform
+across all six variants and the payoff decomposition is measured with much
+better precision than the mean, which is what the conclusion rests on.
+
+## 9. Known gaps
 
 - The diagnostic counters miss a trade that fills and exits within the same bar
   (`justFilled` and `justClosed` both test against the previous bar's position).
@@ -442,3 +554,9 @@ validated out of sample before it means anything.
 - `data/qqq_15m.csv`, `data/xauusd_15m.csv` and `data/xauusd_5m.csv` were pulled
   from Twelve Data in Sep 2026 and are point-in-time snapshots, not a maintained
   feed.
+- The §8 random-entry control draws bars uniformly, so it samples the overnight
+  session at its true frequency but does not match the signal's time-of-day
+  distribution. Some of the +0.10R could be a session effect rather than a run
+  effect; separating them needs a session-matched control.
+- Trailing exits in §8 update at 15m close and are checked on 3m sub-bars. A
+  trail that updates intrabar would behave differently and is not tested.
