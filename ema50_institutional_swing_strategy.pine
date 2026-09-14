@@ -1,0 +1,760 @@
+// =============================================================================
+// Institutional 50 EMA Mechanical Swing — 50 EMA body cross, two-bar pullback,
+// stop entry, Chandelier trailing stop, 2R target
+// =============================================================================
+// Signal   : a candle body closes entirely across the 50 EMA (not a spike).
+// Pullback : two consecutive opposite-colour bodies; pin bars do not count.
+// Entry    : stop order one tick beyond the previous extreme.
+// Invalid  : any close back through the 50 EMA cancels the setup.
+// Stop     : the Chandelier level at entry, then trailed by it.
+// Target   : a fixed 2R limit, with the stop moved to break-even at 1R.
+//
+// READ THIS BEFORE TRADING IT
+// ---------------------------
+// The source manual claims a 65-67% win rate at 1:2 R:R from roughly 7 trades
+// over 5 months on US100. Three things about that number:
+//
+// 1. A 1:2 bracket on a driftless random walk fills the target 1/(1+2) = 33.3%
+//    of the time. That is the null hypothesis. 65% is not a small edge over it;
+//    it is twice the null, worth +0.95R per trade before costs. Claims that
+//    large need evidence in proportion.
+// 2. Seven trades cannot produce a 65-67% win rate. With n = 7 the only
+//    attainable rates are 0, 14.3, 28.6, 42.9, 57.1, 71.4, 85.7 and 100%.
+//    The two statistics in the manual are mutually inconsistent as written.
+//    The charitable reading is ~7 trades per market across 6-7 markets, i.e.
+//    n ~ 45-50, which would be a real sample. Establish which before believing
+//    either figure.
+// 3. At n = 7, an observed 5/7 carries a 95% confidence interval of roughly
+//    [36%, 92%], and a truly random 33.3% system throws 5-or-better wins out
+//    of 7 about 4.5% of the time. A 4/7 result is [25%, 84%] and happens 17%
+//    of the time by chance alone. Neither settles anything.
+//
+// So the dashboard in this script reports the win rate with its 95% Wilson
+// interval and the 33.3% break-even line beside it. If the interval still
+// straddles break-even, the sample has not yet said anything, however good the
+// equity curve looks. The script is a measuring instrument, not a signal
+// service: defaults follow the manual where it is specific and are flagged as
+// MINE where it is not.
+//
+// Quantities the manual leaves undefined, and which are therefore inputs here
+// rather than hidden constants: what counts as a "spike", what counts as a
+// "huge wick", what counts as a "pin bar", which high the stop order sits
+// beyond, how long a pending order stays live, and the Chandelier's period and
+// multiplier.
+//
+// On the Chandelier: the manual specifies "Pip Charlie 1". pipCharlie's
+// TradingView "Chandelier Stop" is open source and is described as a modified
+// Chande & Kroll stop, which is NOT the same formula as LeBeau's Chandelier
+// Exit. The exact source could not be read from this environment, so both
+// engines are implemented and selectable. Match the one you actually run on
+// your chart before trusting any backtest from this script.
+//
+// Pine Script v6.
+// =============================================================================
+
+//@version=6
+strategy("Institutional 50 EMA Mechanical Swing",
+     shorttitle              = "EMA50 SWING",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.0,
+     slippage                = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false,
+     pyramiding              = 0,
+     max_labels_count        = 500,
+     max_lines_count         = 500,
+     max_boxes_count         = 500)
+
+// -----------------------------------------------------------------------------
+// Inputs — 1 · Regime
+// -----------------------------------------------------------------------------
+G_REG = "1 · Regime and direction"
+
+i_dir = input.string("Both", "Trade direction", options = ["Both", "Long only", "Short only"],
+     group = G_REG)
+i_minTfMins = input.int(60, "Minimum chart timeframe (minutes)", minval = 0, group = G_REG,
+     tooltip = "The manual calls 4h the sweet spot and 1h the absolute floor. " +
+               "0 disables the check. The dashboard warns when the chart is below this; " +
+               "the switch below decides whether it also refuses to trade.")
+i_blockBelowTf = input.bool(false, "Refuse entries below the minimum timeframe", group = G_REG,
+     tooltip = "Off by default so you can see for yourself how the edge degrades on 15m " +
+               "instead of taking the claim on faith.")
+i_useDates = input.bool(false, "Restrict to a date window", group = G_REG)
+i_from = input.time(timestamp("01 Jan 2018 00:00 +0000"), "From", group = G_REG)
+i_to = input.time(timestamp("01 Jan 2030 00:00 +0000"), "To", group = G_REG)
+
+// -----------------------------------------------------------------------------
+// Inputs — 2 · The crossover
+// -----------------------------------------------------------------------------
+G_SIG = "2 · Crossover (the arming event)"
+
+i_emaLen = input.int(50, "EMA length", minval = 2, maxval = 500, group = G_SIG)
+i_emaSrc = input.source(close, "EMA source", group = G_SIG)
+i_needBull = input.bool(true, "Breakout candle must close in the breakout direction", group = G_SIG,
+     tooltip = "A body can sit entirely above the 50 EMA on a bar that closed DOWN. " +
+               "On (default) requires close > open for longs, close < open for shorts, " +
+               "which is what the manual plainly means by a bullish breakout.")
+i_needPriorSide = input.bool(false, "Require the previous body to be entirely on the other side", group = G_SIG,
+     tooltip = "Off (default): any first bar whose body clears the EMA arms the setup, " +
+               "including one that emerges from a body straddling the EMA. " +
+               "On: a strict body-to-body cross. On produces fewer, cleaner signals.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 3 · Spike / exhaustion filter
+// -----------------------------------------------------------------------------
+G_SPK = "3 · Spike filter (institutional exhaustion)"
+
+i_useRangeSpike = input.bool(true, "Reject oversized breakout candles", group = G_SPK)
+i_spikeLookback = input.int(8, "Compare against the previous N bars", minval = 2, maxval = 50, group = G_SPK,
+     tooltip = "The manual says 5-10 bars. MINE: 8, the midpoint. The average excludes " +
+               "the breakout candle itself.")
+i_spikeMult = input.float(2.0, "Reject if range > N x that average", minval = 1.0, maxval = 10.0, step = 0.1,
+     group = G_SPK,
+     tooltip = "MINE. 'Significantly larger' is not a number, so this is the knob that " +
+               "turns the manual's most subjective rule into something testable. " +
+               "Sweep it from 1.5 to 3.0 and watch the trade count as well as the win rate.")
+i_useWickSpike = input.bool(true, "Reject breakout candles with a huge wick", group = G_SPK)
+i_wickMax = input.float(0.5, "Max wick as a fraction of range", minval = 0.05, maxval = 0.95, step = 0.05,
+     group = G_SPK,
+     tooltip = "MINE. 0.5 = the disqualifying wick may not exceed half the candle's range.")
+i_wickSide = input.string("Breakout direction only", "Which wick disqualifies",
+     options = ["Breakout direction only", "Either wick"], group = G_SPK,
+     tooltip = "Breakout direction only: for a long, the upper wick is the exhaustion tell. " +
+               "Either: also rejects a long breakout with a long lower wick.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 4 · Retracement
+// -----------------------------------------------------------------------------
+G_RET = "4 · Retracement (the two-bar rule)"
+
+i_retraceBars = input.int(2, "Opposite-colour bodies required", minval = 1, maxval = 6, group = G_RET)
+i_pinMax = input.float(0.25, "Pin bar: body / range below this is ignored", minval = 0.0, maxval = 0.9,
+     step = 0.05, group = G_RET,
+     tooltip = "MINE. The manual's pin-bar exception says to wait for a bar with a clearly " +
+               "defined body. A bar under this threshold neither counts toward the two nor " +
+               "resets the count — the setup simply waits. 0 disables the exception.")
+i_resetOnSame = input.bool(true, "A same-colour body resets the count", group = G_RET,
+     tooltip = "On (default): a green bar during a long's pullback restarts the count at zero, " +
+               "so the two bars must be CONSECUTIVE as written. Off: the count is cumulative, " +
+               "which is a materially looser system — test it, do not assume it.")
+i_maxRetraceBars = input.int(0, "Abandon the setup after N bars without a trigger", minval = 0, maxval = 200,
+     group = G_RET,
+     tooltip = "0 = never (manual-faithful: only a close back through the EMA cancels). " +
+               "A non-zero value stops a stale setup from firing weeks later.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 5 · Entry order
+// -----------------------------------------------------------------------------
+G_ENT = "5 · Entry order"
+
+i_trigRef = input.string("Last retracement bar", "Place the stop beyond",
+     options = ["Last retracement bar", "Highest high / lowest low since arming", "Breakout candle"],
+     group = G_ENT,
+     tooltip = "The manual says 'the previous high', which is ambiguous. Default is the " +
+               "tightest and most common reading: the extreme of the bar that completed " +
+               "the two-bar count.")
+i_trigTicks = input.int(1, "Trigger offset (ticks beyond the extreme)", minval = 0, maxval = 1000,
+     group = G_ENT,
+     tooltip = "The manual says one pip. Ticks are used so this travels across instruments. " +
+               "On a 5-decimal FX feed one pip is 10 ticks; on most index CFDs one tick is " +
+               "already about one point. Check syminfo.mintick for your symbol.")
+i_reprice = input.bool(false, "Re-price the pending order as the pullback extends", group = G_ENT,
+     tooltip = "Off (default) is manual-faithful: the order is placed once and left. " +
+               "On: each further pullback bar drags the trigger to the new extreme, which " +
+               "is what a discretionary trader does by hand and a different system to test.")
+i_minStopTicks = input.int(0, "Skip the trade if the stop is nearer than N ticks", minval = 0, group = G_ENT,
+     tooltip = "A Chandelier stop sitting almost on the entry is a coin flip against the spread.")
+i_maxStopAtr = input.float(0.0, "Skip the trade if the stop is wider than N x ATR", minval = 0.0, step = 0.25,
+     group = G_ENT,
+     tooltip = "0 = off. A very wide stop makes the 2R target a price the market may never " +
+               "reach inside the setup's life.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 6 · Chandelier stop engine
+// -----------------------------------------------------------------------------
+G_CH = "6 · Chandelier stop"
+
+i_chEngine = input.string("Chande & Kroll (pipCharlie lineage)", "Formula",
+     options = ["Chande & Kroll (pipCharlie lineage)", "Chandelier Exit (LeBeau)"], group = G_CH,
+     tooltip = "pipCharlie's 'Chandelier Stop' is described as a modified Chande & Kroll " +
+               "stop, so that is the default here. LeBeau's Chandelier Exit " +
+               "(highest high - mult x ATR) is the other indicator that goes by this name. " +
+               "They give different levels. Confirm which one is on your chart.")
+i_ckP = input.int(10, "C&K: ATR and extreme period (p)", minval = 1, maxval = 200, group = G_CH)
+i_ckX = input.float(1.0, "C&K: ATR multiplier (x)", minval = 0.1, maxval = 10.0, step = 0.1, group = G_CH)
+i_ckQ = input.int(9, "C&K: stop smoothing period (q)", minval = 1, maxval = 200, group = G_CH)
+i_ceLen = input.int(22, "LeBeau: period", minval = 1, maxval = 200, group = G_CH)
+i_ceMult = input.float(3.0, "LeBeau: ATR multiplier", minval = 0.1, maxval = 10.0, step = 0.1, group = G_CH)
+i_ceRatchet = input.bool(true, "LeBeau: ratchet the level (never loosens)", group = G_CH)
+i_stopRefBar = input.string("Bar before the fill", "Read the stop from",
+     options = ["Bar before the fill", "Fill bar"], group = G_CH,
+     tooltip = "Default reads the last Chandelier value that was knowable BEFORE the stop " +
+               "order filled. 'Fill bar' uses the completed fill bar, which includes the " +
+               "extreme the fill itself helped make — flattering, and not available live.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 7 · Exits
+// -----------------------------------------------------------------------------
+G_EXT = "7 · Exits"
+
+i_rr = input.float(2.0, "Target (R multiple)", minval = 0.5, maxval = 10.0, step = 0.1, group = G_EXT,
+     tooltip = "2.0 as specified. Break-even win rate at 2R is 33.3% before costs.")
+i_useTrail = input.bool(true, "Trail the stop with the Chandelier", group = G_EXT,
+     tooltip = "This is what produces the manual's part-loss outcomes: the Chandelier can " +
+               "climb above the initial stop before the trade ever reaches 1R, so a reversal " +
+               "costs a fraction of R rather than a full R.")
+i_useBe = input.bool(true, "Move the stop to break-even at 1R", group = G_EXT,
+     tooltip = "The manual calls this non-negotiable. It is not a law, it is a trade-off, " +
+               "and it is the single highest-leverage switch in this script. It converts " +
+               "some full losses into scratches AND some full winners into scratches. " +
+               "Which effect dominates is an empirical question about YOUR data. Run the " +
+               "same period with this off before accepting it.")
+i_beAt = input.float(1.0, "Break-even trigger (R)", minval = 0.1, maxval = 5.0, step = 0.1, group = G_EXT)
+i_beOffset = input.float(0.0, "Break-even offset (ticks, + locks in)", minval = -500, maxval = 500,
+     step = 1, group = G_EXT,
+     tooltip = "A stop exactly at entry is a scratch MINUS costs. A few ticks of positive " +
+               "offset is what actually makes it free.")
+i_exitOnCross = input.bool(false, "Also exit on a close back through the 50 EMA", group = G_EXT,
+     tooltip = "Not in the manual. Off by default.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 8 · Sizing
+// -----------------------------------------------------------------------------
+G_SZ = "8 · Position sizing"
+
+i_sizeMode = input.string("Fixed quantity", "Sizing", options = ["Fixed quantity", "Risk % of equity"],
+     group = G_SZ)
+i_fixedQty = input.float(1.0, "Fixed quantity", minval = 0.000001, group = G_SZ)
+i_riskPct = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, maxval = 100.0, step = 0.1,
+     group = G_SZ,
+     tooltip = "The manual's 1% risk / 2% per winner arithmetic. Size is derived from the " +
+               "ESTIMATED stop distance at order placement, not the filled one — a stop " +
+               "entry that gaps through its trigger risks more than the intended percentage. " +
+               "Verify syminfo.pointvalue matches your contract before believing the currency column.")
+
+// -----------------------------------------------------------------------------
+// Inputs — 9 · Display
+// -----------------------------------------------------------------------------
+G_VIS = "9 · Display"
+
+i_showEma = input.bool(true, "Plot the 50 EMA", group = G_VIS)
+i_showCh = input.bool(true, "Plot the Chandelier stop", group = G_VIS)
+i_showLevels = input.bool(true, "Plot live entry / stop / target", group = G_VIS)
+i_showMarks = input.bool(true, "Mark crossovers, spikes and pullback bars", group = G_VIS)
+i_showDash = input.bool(true, "Show the dashboard", group = G_VIS)
+i_dashPos = input.string("Top right", "Dashboard position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = G_VIS)
+
+// -----------------------------------------------------------------------------
+// Helper functions (top level, before first use)
+// -----------------------------------------------------------------------------
+
+// Wilson score interval for a binomial proportion. Returns [low, high].
+// Used instead of the naive sqrt(p(1-p)/n) interval because n is small here by
+// construction and the normal approximation is worst exactly where this script
+// lives.
+f_wilson(float k, float n, float z) =>
+    float lo = na
+    float hi = na
+    if n > 0
+        p = k / n
+        d = 1.0 + z * z / n
+        centre = (p + z * z / (2.0 * n)) / d
+        half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / d
+        lo := math.max(0.0, centre - half)
+        hi := math.min(1.0, centre + half)
+    [lo, hi]
+
+f_pct(float v) =>
+    na(v) ? "n/a" : str.tostring(v * 100.0, "#.0") + "%"
+
+f_px(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// -----------------------------------------------------------------------------
+// Core series — every ta.* call is unconditional, on every bar
+// -----------------------------------------------------------------------------
+ema50 = ta.ema(i_emaSrc, i_emaLen)
+atr14 = ta.atr(14)
+
+rng = high - low
+bodyHi = math.max(open, close)
+bodyLo = math.min(open, close)
+bodySz = math.abs(close - open)
+bodyFrac = rng > 0 ? bodySz / rng : 0.0
+upWickFrac = rng > 0 ? (high - bodyHi) / rng : 0.0
+dnWickFrac = rng > 0 ? (bodyLo - low) / rng : 0.0
+
+// Average range of the PREVIOUS N bars — the breakout candle is not allowed to
+// inflate the yardstick it is measured against.
+avgRngPrev = nz(ta.sma(rng, i_spikeLookback)[1], rng)
+
+// --- Chandelier engine A: Chande & Kroll --------------------------------------
+ckAtr = ta.atr(i_ckP)
+ckHiStop = ta.highest(high, i_ckP) - i_ckX * ckAtr
+ckLoStop = ta.lowest(low, i_ckP) + i_ckX * ckAtr
+ckLong = ta.lowest(ckHiStop, i_ckQ)
+ckShort = ta.highest(ckLoStop, i_ckQ)
+
+// --- Chandelier engine B: LeBeau Chandelier Exit ------------------------------
+ceAtr = ta.atr(i_ceLen)
+ceLongRaw = ta.highest(high, i_ceLen) - i_ceMult * ceAtr
+ceShortRaw = ta.lowest(low, i_ceLen) + i_ceMult * ceAtr
+
+var float ceLong = na
+var float ceShort = na
+ceLongPrev = nz(ceLong[1], ceLongRaw)
+ceShortPrev = nz(ceShort[1], ceShortRaw)
+ceLong := i_ceRatchet and close[1] > ceLongPrev ? math.max(ceLongRaw, ceLongPrev) : ceLongRaw
+ceShort := i_ceRatchet and close[1] < ceShortPrev ? math.min(ceShortRaw, ceShortPrev) : ceShortRaw
+
+useCk = i_chEngine == "Chande & Kroll (pipCharlie lineage)"
+chLong = useCk ? ckLong : ceLong
+chShort = useCk ? ckShort : ceShort
+
+// -----------------------------------------------------------------------------
+// Gates
+// -----------------------------------------------------------------------------
+tfMins = timeframe.in_seconds(timeframe.period) / 60.0
+tfTooLow = i_minTfMins > 0 and tfMins < i_minTfMins
+tfOk = not (tfTooLow and i_blockBelowTf)
+dateOk = not i_useDates or (time >= i_from and time <= i_to)
+warmed = bar_index > math.max(i_emaLen, math.max(i_ckP + i_ckQ, i_ceLen)) + 5
+longsOk = i_dir != "Short only"
+shortsOk = i_dir != "Long only"
+
+// -----------------------------------------------------------------------------
+// The crossover
+// -----------------------------------------------------------------------------
+bodyAbove = bodyLo > ema50
+bodyBelow = bodyHi < ema50
+prevAbove = bar_index > 0 and bodyLo[1] > ema50[1]
+prevBelow = bar_index > 0 and bodyHi[1] < ema50[1]
+
+rawCrossUp = warmed and bodyAbove and not prevAbove and (not i_needPriorSide or prevBelow)
+rawCrossDn = warmed and bodyBelow and not prevBelow and (not i_needPriorSide or prevAbove)
+rawCrossUp := rawCrossUp and (not i_needBull or close > open)
+rawCrossDn := rawCrossDn and (not i_needBull or close < open)
+
+// --- spike / exhaustion test on the breakout candle ---------------------------
+rangeSpike = i_useRangeSpike and rng > i_spikeMult * avgRngPrev
+eitherWick = i_wickSide == "Either wick"
+wickSpikeUp = i_useWickSpike and (upWickFrac > i_wickMax or (eitherWick and dnWickFrac > i_wickMax))
+wickSpikeDn = i_useWickSpike and (dnWickFrac > i_wickMax or (eitherWick and upWickFrac > i_wickMax))
+
+spikeUp = rangeSpike or wickSpikeUp
+spikeDn = rangeSpike or wickSpikeDn
+
+crossUp = rawCrossUp and not spikeUp
+crossDn = rawCrossDn and not spikeDn
+rejectedUp = rawCrossUp and spikeUp
+rejectedDn = rawCrossDn and spikeDn
+
+// -----------------------------------------------------------------------------
+// Setup state machine
+//   stage 0 = idle · 1 = armed, counting the pullback · 2 = order working
+// -----------------------------------------------------------------------------
+var int setupDir = 0
+var int stage = 0
+var int retraceN = 0
+var int armBar = na
+var float trigPx = na
+var float legHi = na
+var float legLo = na
+var float brkHi = na
+var float brkLo = na
+
+isOppUp = close < open      // a red body retraces a long setup
+isOppDn = close > open
+isPin = i_pinMax > 0.0 and bodyFrac < i_pinMax
+
+// A close back through the 50 EMA kills the setup outright — this is the
+// manual's own invalidation rule and it is the only thing, by default, that
+// cancels a working order.
+emaKillLong = close < ema50
+emaKillShort = close > ema50
+
+setupAged = i_maxRetraceBars > 0 and not na(armBar) and (bar_index - armBar) > i_maxRetraceBars
+
+// --- invalidate before anything else is considered ----------------------------
+invalidated = false
+if stage != 0
+    if (setupDir == 1 and emaKillLong) or (setupDir == -1 and emaKillShort) or setupAged
+        invalidated := true
+        setupDir := 0
+        stage := 0
+        retraceN := 0
+        trigPx := na
+        armBar := na
+
+// --- arm on a clean crossover -------------------------------------------------
+armedNow = false
+if crossUp and longsOk
+    setupDir := 1
+    stage := 1
+    retraceN := 0
+    armBar := bar_index
+    trigPx := na
+    legHi := high
+    legLo := low
+    brkHi := high
+    brkLo := low
+    armedNow := true
+else if crossDn and shortsOk
+    setupDir := -1
+    stage := 1
+    retraceN := 0
+    armBar := bar_index
+    trigPx := na
+    legHi := high
+    legLo := low
+    brkHi := high
+    brkLo := low
+    armedNow := true
+
+// --- count the pullback -------------------------------------------------------
+counted = false
+if stage >= 1 and not armedNow and not invalidated
+    legHi := math.max(nz(legHi, high), high)
+    legLo := math.min(nz(legLo, low), low)
+    if not isPin
+        opp = setupDir == 1 ? isOppUp : isOppDn
+        if opp
+            retraceN := retraceN + 1
+            counted := true
+        else if i_resetOnSame
+            retraceN := 0
+
+// --- arm the stop order once the count is met ---------------------------------
+refHi = i_trigRef == "Last retracement bar" ? high : i_trigRef == "Breakout candle" ? nz(brkHi, high) : nz(legHi, high)
+refLo = i_trigRef == "Last retracement bar" ? low : i_trigRef == "Breakout candle" ? nz(brkLo, low) : nz(legLo, low)
+offset = i_trigTicks * syminfo.mintick
+
+if stage >= 1 and retraceN >= i_retraceBars and (stage == 1 or (i_reprice and counted))
+    stage := 2
+    trigPx := setupDir == 1 ? refHi + offset : refLo - offset
+
+// -----------------------------------------------------------------------------
+// Sizing and pre-trade sanity checks
+// -----------------------------------------------------------------------------
+estStop = setupDir == 1 ? chLong : chShort
+estRisk = na(trigPx) or na(estStop) ? na : math.abs(trigPx - estStop)
+stopOnRightSide = na(estRisk) ? false : (setupDir == 1 ? estStop < trigPx : estStop > trigPx)
+wideOk = i_maxStopAtr <= 0.0 or (not na(estRisk) and estRisk <= i_maxStopAtr * atr14)
+tightOk = na(estRisk) ? false : estRisk >= i_minStopTicks * syminfo.mintick
+
+qtyRisk = na(estRisk) or estRisk <= 0 or syminfo.pointvalue <= 0 ? na :
+     (strategy.equity * i_riskPct / 100.0) / (estRisk * syminfo.pointvalue)
+orderQty = i_sizeMode == "Fixed quantity" ? i_fixedQty : nz(qtyRisk, 0.0)
+
+canWork = stage == 2 and not na(trigPx) and strategy.position_size == 0 and
+     stopOnRightSide and wideOk and tightOk and orderQty > 0 and tfOk and dateOk
+
+// -----------------------------------------------------------------------------
+// Orders
+// -----------------------------------------------------------------------------
+ID_LONG = "L"
+ID_SHORT = "S"
+ID_LEX = "L exit"
+ID_SEX = "S exit"
+
+if canWork and setupDir == 1
+    strategy.entry(ID_LONG, strategy.long, qty = orderQty, stop = trigPx, comment = "BuyStop")
+else
+    strategy.cancel(ID_LONG)
+
+if canWork and setupDir == -1
+    strategy.entry(ID_SHORT, strategy.short, qty = orderQty, stop = trigPx, comment = "SellStop")
+else
+    strategy.cancel(ID_SHORT)
+
+// -----------------------------------------------------------------------------
+// Open-trade management
+// -----------------------------------------------------------------------------
+var int tradeDir = 0
+var float entryPx = na
+var float initStop = na
+var float activeStop = na
+var float tpLevel = na
+var float rValue = na
+var bool beDone = false
+var float openR = na
+
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+flatNow = strategy.position_size == 0
+
+if justFilled
+    tradeDir := strategy.position_size > 0 ? 1 : -1
+    entryPx := strategy.position_avg_price
+    refLong = i_stopRefBar == "Fill bar" ? chLong : nz(chLong[1], chLong)
+    refShort = i_stopRefBar == "Fill bar" ? chShort : nz(chShort[1], chShort)
+    initStop := tradeDir == 1 ? refLong : refShort
+    activeStop := initStop
+    rValue := math.abs(entryPx - initStop)
+    tpLevel := tradeDir == 1 ? entryPx + i_rr * rValue : entryPx - i_rr * rValue
+    beDone := false
+    // the setup is spent
+    setupDir := 0
+    stage := 0
+    retraceN := 0
+    trigPx := na
+    armBar := na
+
+inTrade = strategy.position_size != 0 and tradeDir != 0
+
+// A fill that lands on the wrong side of its own stop (a gap straight through
+// the trigger) would run an inverted bracket. Flatten instead of pretending.
+badFill = inTrade and not na(initStop) and
+     (tradeDir == 1 ? initStop >= entryPx : initStop <= entryPx)
+
+// --- trail with the Chandelier, then break-even, both one-way only ------------
+if inTrade and not badFill
+    if i_useTrail
+        if tradeDir == 1
+            activeStop := math.max(nz(activeStop, initStop), nz(chLong, initStop))
+        else
+            activeStop := math.min(nz(activeStop, initStop), nz(chShort, initStop))
+    if i_useBe and not beDone and not justFilled and nz(rValue, 0) > 0
+        beOff = i_beOffset * syminfo.mintick
+        if tradeDir == 1 and high >= entryPx + i_beAt * rValue
+            activeStop := math.max(nz(activeStop, initStop), entryPx + beOff)
+            beDone := true
+        if tradeDir == -1 and low <= entryPx - i_beAt * rValue
+            activeStop := math.min(nz(activeStop, initStop), entryPx - beOff)
+            beDone := true
+
+openR := inTrade and nz(rValue, 0) > 0 ?
+     (tradeDir == 1 ? (close - entryPx) : (entryPx - close)) / rValue : na
+
+// --- live bracket, re-issued every bar ----------------------------------------
+if inTrade and not badFill
+    if tradeDir == 1
+        strategy.exit(ID_LEX, ID_LONG, stop = activeStop, limit = tpLevel,
+             comment_profit = "TP", comment_loss = "SL")
+    else
+        strategy.exit(ID_SEX, ID_SHORT, stop = activeStop, limit = tpLevel,
+             comment_profit = "TP", comment_loss = "SL")
+
+if badFill
+    strategy.close_all(comment = "BAD FILL")
+
+// The bracket is placed first and unconditionally, so the stop still covers the
+// bar while this market order is in flight to the next open.
+if i_exitOnCross and inTrade and not badFill
+    if (tradeDir == 1 and close < ema50) or (tradeDir == -1 and close > ema50)
+        strategy.close_all(comment = "EMA EXIT")
+
+if flatNow and tradeDir != 0
+    tradeDir := 0
+    entryPx := na
+    initStop := na
+    activeStop := na
+    tpLevel := na
+    rValue := na
+    openR := na
+    beDone := false
+
+// -----------------------------------------------------------------------------
+// Closed-trade bookkeeping — R multiples, not just currency
+// -----------------------------------------------------------------------------
+var array<float> rQueue = array.new<float>()
+var int procd = 0
+var int nWin = 0
+var int nLoss = 0
+var int nScratch = 0
+var int nTarget = 0
+var float sumR = 0.0
+
+// Pushed on EVERY fill, including a degenerate one where rValue is na. The
+// queue has to stay in lockstep with strategy.closedtrades or every R multiple
+// after the first bad trade is attributed to the wrong trade.
+if justFilled
+    array.push(rQueue, rValue)
+
+if strategy.closedtrades > procd
+    for k = procd to strategy.closedtrades - 1
+        p = strategy.closedtrades.profit(k)
+        sz = math.abs(strategy.closedtrades.size(k))
+        rp = array.size(rQueue) > 0 ? array.shift(rQueue) : na
+        denom = na(rp) or rp <= 0 or sz <= 0 ? na : rp * sz * syminfo.pointvalue
+        rm = na(denom) or denom <= 0 ? na : p / denom
+        sumR := sumR + nz(rm, 0.0)
+        if not na(rm) and rm >= i_rr - 0.05
+            nTarget := nTarget + 1
+        if p > 0
+            nWin := nWin + 1
+        else if p < 0
+            nLoss := nLoss + 1
+        else
+            nScratch := nScratch + 1
+    procd := strategy.closedtrades
+
+nClosed = nWin + nLoss + nScratch
+winRate = nClosed > 0 ? nWin / nClosed : na
+[wrLo, wrHi] = f_wilson(nWin, nClosed, 1.96)
+beWr = 1.0 / (1.0 + i_rr)
+expR = nClosed > 0 ? sumR / nClosed : na
+// The interval still covering the break-even rate means the sample has not
+// separated this system from a coin toss on the same bracket.
+inconclusive = nClosed > 0 and not na(wrLo) and wrLo <= beWr
+
+// -----------------------------------------------------------------------------
+// Plots
+// -----------------------------------------------------------------------------
+emaPlot = i_showEma ? ema50 : na
+plot(emaPlot, "50 EMA", color = color.new(color.orange, 0), linewidth = 2)
+
+chLongPlot = i_showCh ? chLong : na
+chShortPlot = i_showCh ? chShort : na
+plot(chLongPlot, "Chandelier long stop", color = color.new(color.teal, 40), linewidth = 1)
+plot(chShortPlot, "Chandelier short stop", color = color.new(color.maroon, 40), linewidth = 1)
+
+entryPlot = i_showLevels and inTrade ? entryPx : na
+stopPlot = i_showLevels and inTrade ? activeStop : na
+tpPlot = i_showLevels and inTrade ? tpLevel : na
+plot(entryPlot, "Entry", color = color.new(color.gray, 0), style = plot.style_linebr, linewidth = 1)
+plot(stopPlot, "Active stop", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(tpPlot, "Target", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+
+pendPlot = i_showLevels and stage == 2 and strategy.position_size == 0 ? trigPx : na
+plot(pendPlot, "Pending trigger", color = color.new(color.blue, 0), style = plot.style_circles, linewidth = 2)
+
+plotshape(i_showMarks and crossUp, "Cross up", shape.triangleup, location.belowbar,
+     color.new(color.green, 0), size = size.tiny)
+plotshape(i_showMarks and crossDn, "Cross down", shape.triangledown, location.abovebar,
+     color.new(color.red, 0), size = size.tiny)
+plotshape(i_showMarks and (rejectedUp or rejectedDn), "Spike rejected", shape.xcross, location.absolute,
+     color.new(color.orange, 0), size = size.tiny)
+plotchar(i_showMarks and counted and stage >= 1, "Pullback bar", "•", location.absolute,
+     color.new(color.blue, 0), size = size.tiny)
+
+bgcolor(i_showMarks and stage == 2 and strategy.position_size == 0 ?
+     color.new(setupDir == 1 ? color.green : color.red, 92) : na, title = "Order working")
+
+// -----------------------------------------------------------------------------
+// Dashboard
+// -----------------------------------------------------------------------------
+dashPos = i_dashPos == "Top right" ? position.top_right : i_dashPos == "Top left" ? position.top_left :
+     i_dashPos == "Bottom right" ? position.bottom_right : position.bottom_left
+
+var table dash = table.new(dashPos, 2, 21, bgcolor = color.new(color.black, 20), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+stateTxt = strategy.position_size != 0 ? (tradeDir == 1 ? "LONG open" : "SHORT open") :
+     stage == 2 ? (setupDir == 1 ? "Buy stop working" : "Sell stop working") :
+     stage == 1 ? (setupDir == 1 ? "Armed long — " + str.tostring(retraceN) + "/" + str.tostring(i_retraceBars) + " pullback" :
+                                   "Armed short — " + str.tostring(retraceN) + "/" + str.tostring(i_retraceBars) + " pullback") :
+     "Flat — waiting for a cross"
+
+C_HD = color.new(color.white, 0)
+C_TX = color.new(color.silver, 0)
+C_OK = color.new(color.lime, 0)
+C_BAD = color.new(color.red, 0)
+C_WARN = color.new(color.orange, 0)
+
+if barstate.islast and i_showDash
+    table.clear(dash, 0, 0, 1, 20)
+    table.cell(dash, 0, 0, "50 EMA Mechanical Swing", text_color = C_HD, text_size = size.small)
+    table.cell(dash, 1, 0, useCk ? "C&K stop" : "LeBeau stop", text_color = C_HD, text_size = size.small)
+
+    table.cell(dash, 0, 1, "Chart TF", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 1, str.tostring(tfMins, "#") + "m" + (tfTooLow ? " — BELOW FLOOR" : ""),
+         text_color = tfTooLow ? C_WARN : C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "State", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 2, stateTxt, text_color = C_HD, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "50 EMA", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 3, f_px(ema50), text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 4, "Chandelier L / S", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 4, f_px(chLong) + " / " + f_px(chShort), text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 5, "— open trade —", text_color = C_HD, text_size = size.tiny)
+    table.cell(dash, 1, 5, "", text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 6, "Entry", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 6, f_px(entryPx), text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 0, 7, "Stop", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 7, f_px(activeStop) + (beDone ? "  (BE)" : ""), text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 0, 8, "Target", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 8, f_px(tpLevel), text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 0, 9, "R (price)", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 9, f_px(rValue), text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 0, 10, "Open R", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 10, na(openR) ? "—" : str.tostring(openR, "#.00") + "R",
+         text_color = nz(openR, 0) >= 0 ? C_OK : C_BAD, text_size = size.tiny)
+
+    table.cell(dash, 0, 11, "— closed trades —", text_color = C_HD, text_size = size.tiny)
+    table.cell(dash, 1, 11, "", text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 12, "Sample (n)", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 12, str.tostring(nClosed) + (nClosed < 30 ? "  — TOO SMALL" : ""),
+         text_color = nClosed < 30 ? C_WARN : C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 13, "Win / scratch / loss", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 13, str.tostring(nWin) + " / " + str.tostring(nScratch) + " / " + str.tostring(nLoss),
+         text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 14, "Reached full target", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 14, str.tostring(nTarget) + " of " + str.tostring(nClosed),
+         text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 15, "Win rate", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 15, f_pct(winRate), text_color = C_HD, text_size = size.tiny)
+
+    table.cell(dash, 0, 16, "95% CI (Wilson)", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 16, nClosed > 0 ? f_pct(wrLo) + " … " + f_pct(wrHi) : "—",
+         text_color = inconclusive ? C_WARN : C_OK, text_size = size.tiny)
+
+    table.cell(dash, 0, 17, "Break-even WR @ " + str.tostring(i_rr, "#.#") + "R",
+         text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 17, f_pct(beWr) + (inconclusive ? "  — CI STRADDLES IT" : ""),
+         text_color = inconclusive ? C_WARN : C_OK, text_size = size.tiny)
+
+    table.cell(dash, 0, 18, "Expectancy", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 18, na(expR) ? "—" : str.tostring(expR, "#.00") + "R / trade",
+         text_color = nz(expR, 0) > 0 ? C_OK : C_BAD, text_size = size.tiny)
+
+    table.cell(dash, 0, 19, "Profit factor", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 19, strategy.grossloss > 0 ?
+         str.tostring(strategy.grossprofit / strategy.grossloss, "#.00") : "—",
+         text_color = C_TX, text_size = size.tiny)
+
+    table.cell(dash, 0, 20, "Net P&L", text_color = C_TX, text_size = size.tiny)
+    table.cell(dash, 1, 20, str.tostring(strategy.netprofit, format.mintick),
+         text_color = strategy.netprofit > 0 ? C_OK : C_BAD, text_size = size.tiny)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+// JSON is built by concatenation, not str.format(): a literal brace in a format
+// string is a placeholder delimiter and would have to be doubled. Concatenation
+// keeps the payload readable and impossible to get subtly wrong.
+Q = "\""
+
+if crossUp or crossDn
+    alert(syminfo.ticker + " 50 EMA body cross " + (crossUp ? "UP" : "DOWN") +
+         " — waiting for the two-bar pullback", alert.freq_once_per_bar_close)
+
+if canWork and stage == 2
+    alert("{" + Q + "action" + Q + ":" + Q + (setupDir == 1 ? "buy_stop" : "sell_stop") + Q +
+         "," + Q + "symbol" + Q + ":" + Q + syminfo.ticker + Q +
+         "," + Q + "trigger" + Q + ":" + str.tostring(trigPx, format.mintick) +
+         "," + Q + "est_stop" + Q + ":" + str.tostring(estStop, format.mintick) +
+         "," + Q + "qty" + Q + ":" + str.tostring(orderQty) + "}",
+         alert.freq_once_per_bar_close)
+
+if justFilled
+    alert("{" + Q + "action" + Q + ":" + Q + "filled" + Q +
+         "," + Q + "symbol" + Q + ":" + Q + syminfo.ticker + Q +
+         "," + Q + "side" + Q + ":" + Q + (tradeDir == 1 ? "long" : "short") + Q +
+         "," + Q + "entry" + Q + ":" + str.tostring(entryPx, format.mintick) +
+         "," + Q + "stop" + Q + ":" + str.tostring(initStop, format.mintick) +
+         "," + Q + "target" + Q + ":" + str.tostring(tpLevel, format.mintick) +
+         "," + Q + "rr" + Q + ":" + str.tostring(i_rr) + "}",
+         alert.freq_once_per_bar_close)
