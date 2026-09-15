@@ -13,9 +13,10 @@
 //      `i_fvgMode` selects which reading; the slide-11 reading is the default.
 //   4. Enter on a mechanical CLOSE back through the imbalance.
 //   5. Target reversion to the VWAP centreline; require >= 1:4 R/R or skip.
-//   6. Execute only inside the 08:30 ET data-release window.
+//   6. Execute inside the session the deck calls "8:30 AM EST (Open)" -- which
+//      is 08:30 CHICAGO, i.e. the 09:30 ET cash open (see i_sess tooltip).
 //
-// Slide 10 pins the chart to 1-MINUTE NQ. Slides 1-9 and 12-14 describe a
+// Slide 10 pins the chart to 1-MINUTE NQ and the window to the cash open. Slides 1-9 and 12-14 describe a
 // MULTI-ACCOUNT portfolio
 // (evaluation cost, account rotation, payout scheduling) and a coaching offer.
 // Pine has no concept of more than one account, so none of that is testable
@@ -61,9 +62,15 @@ i_tz       = input.string("America/New_York", "Timezone",
      tooltip = "The source says 'EST'. New York is the correct choice: it tracks "
              + "the EST/EDT switch, so the 08:30 window stays aligned with the US "
              + "data releases all year. A fixed EST offset would drift by an hour.")
-i_sess     = input.session("0830-0930", "Execution window", group = G_SESS,
-     tooltip = "08:30 ET US economic-release window. Signals outside this are "
-             + "counted but never traded.")
+i_sess     = input.session("0930-1600", "Execution window", group = G_SESS,
+     tooltip = "The source says '8:30 AM EST (Open)'. It means 08:30 CHICAGO = "
+             + "09:30 ET, the cash open: it calls the time '(Open)', and the "
+             + "creator's own exported VWAP column resets at 01:00 ET = midnight "
+             + "CT, so their chart clock is CT mislabelled as EST.\n\n"
+             + "A strict 0930-1030 almost never clears the 1:4 filter (opening "
+             + "displacement makes the stop 30-41pt against a ~1 SD target), so "
+             + "the default is the full RTH session. Use 0830-0930 to reproduce "
+             + "the literal-EST reading.")
 i_anchorHr = input.int(0, "VWAP anchor hour", minval = 0, maxval = 23, group = G_SESS,
      tooltip = "0 = midnight New York, per the source. The anchor resets the VWAP "
              + "accumulators, so this is NOT the CME 18:00 session VWAP.")

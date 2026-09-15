@@ -376,6 +376,69 @@ measured 0.76 qualifying trades/day that is ~263 trading days; n=400 is
 That is the concrete ask. Anything less cannot separate this setup from noise,
 and the deck presents no evidence approaching it.
 
+## Part 3d — The window is Chicago time, and that changes the answer
+
+Slide 10 reads *"Step to the market at 8:30 AM EST **(Open)**"*. Two things
+say that "8:30" is **Chicago** time, i.e. the 09:30 ET cash open:
+
+1. The deck calls it **"(Open)"**. The NASDAQ open is 09:30 ET = 08:30 CT.
+   (Earlier notes framed 08:30 as the US data-release window — that was an
+   inference added here, not something the deck says.)
+2. `data/mnq1_1m_tradingview.csv` carries the creator's own `New York VWAP`
+   column, and it **resets at 01:00 ET** = midnight CT. The charting
+   environment is on Chicago time, so both the deck's "Midnight EST" anchor
+   and its "8:30 AM EST" window are CT labelled as EST — and they are
+   mutually consistent under that reading.
+
+So the deck's intended window is **09:30–10:30 ET**. Re-running there:
+
+| Window (ET) | n | tgt | hit | 95% CI (hit) | avg R | 95% CI (avg R) | net |
+|---|---|---|---|---|---|---|---|
+| 0830–0930 premarket | 13 | 3 | 23.1% | [8.2, 50.3] | +0.578 | [−0.38, +1.63] | +$7,510 |
+| **0930–1030 the open** | **1** | **0** | — | — | −0.239 | — | −$239 |
+| 0930–1100 open +90m | 2 | 0 | 0.0% | [0.0, 65.8] | −0.818 | [−0.99, −0.65] | −$1,636 |
+| **0930–1600 full RTH** | **29** | **10** | **34.5%** | [19.9, 52.7] | **+0.691** | [−0.03, +1.43] | +$20,030 |
+| 1800–1700 all session | 72 | 22 | 30.6% | [21.1, 42.0] | +0.302 | [−0.14, +0.77] | +$21,723 |
+
+**Under the deck's own window, correctly interpreted, the setup fires once in
+17 days.** Twenty bullets would take ~340 trading days.
+
+### Why: the 1:4 filter and the opening bell are incompatible
+
+This is structural, and the per-hour geometry stats rest on 60–90 triggers an
+hour, so they are far more robust than the trade counts:
+
+| Hour ET | triggers | median stop | median R:R | share ≥ 1:4 |
+|---|---|---|---|---|
+| 08:00 (premarket) | 88 | 18.2 pt | 4.38 | **55.2%** |
+| 09:00 | 84 | 24.5 pt | 3.74 | 46.4% |
+| **10:00 (post-bell)** | **69** | **30.2 pt** | **2.14** | **7.7%** |
+| 13:00 | 74 | 20.2 pt | 6.84 | 81.8% |
+| 15:00 | 76 | 23.0 pt | 5.94 | 100.0% |
+
+1:4 requires the stop to sit within 25% of the distance to VWAP. The stop
+spans the displacement candle, and opening displacement is the largest of the
+day — 30–41 pt against a target only ~1 SD away. So **the geometry objection
+retracted in Part 3b for 08:30 ET turns out to be valid at the open.** The
+1:4 filter wants a small displacement far from value, which is a quiet-hours
+characteristic, not an opening-bell one.
+
+### Three readings, three different answers
+
+| Reading | Support | Result |
+|---|---|---|
+| A — 08:30 ET premarket | none textually; contradicts "(Open)" | n=13, hit 23.1%, avg R +0.578 |
+| B — 08:30 CT = 09:30–10:30 ET | **strongest**: "(Open)" + the 01:00 ET VWAP reset | **n=1 — cannot run** |
+| C — arrive at the open, trade the session (09:30–16:00) | consistent with B's timezone, looser on duration | n=29, hit 34.5%, **avg R +0.691** |
+
+Reading C performs best and is the only one that is both timezone-consistent
+and operable. Its avg R CI still has a lower bound of −0.03, so no edge is
+established — but it is the version worth testing on a longer series.
+
+The deck is therefore ambiguous on its single most consequential parameter,
+and the interpretation that matches its own wording most literally (B) is the
+one that cannot produce the 20 bullets its payoff model requires.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
