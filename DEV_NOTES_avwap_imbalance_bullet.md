@@ -308,6 +308,74 @@ drawdown for twice as long as budgeted, and raises the real Cost of
 Acquisition — which is exactly the variable that moves break-even from 7.4%
 to 19.8% and erases the margin.
 
+## Part 3c — Could not extend the sample; what the 17 days do say
+
+**More NQ 1m data is not obtainable from this environment.** Twelve Data does
+not carry futures and gates pre/post-market behind a paid plan; Alpha
+Vantage's historical-month intraday endpoint is premium-only; Yahoo and every
+other host probed (stooq, Databento, Polygon) are refused by the egress
+policy. QQQ without premarket is useless here because RTH starts at 09:30,
+*after* the deck's window.
+
+So the sample stays at 17 trading days. To get more out of it, the same setup
+mechanics were run across wider windows — which separates two questions the
+deck conflates.
+
+### Widening the window (fixed 4R target, 1 pt/side slippage)
+
+| Window (ET) | n | tgt | hit | 95% CI (hit) | avg R | 95% CI (avg R) |
+|---|---|---|---|---|---|---|
+| 0830–0930 (the deck) | 13 | 3 | 23.1% | [8.2, 50.3] | +0.578 | [−0.39, +1.60] |
+| 0930–1600 RTH | 29 | 10 | 34.5% | [19.9, 52.7] | +0.691 | [−0.03, +1.44] |
+| **1800–1700 all session** | **72** | **22** | **30.6%** | **[21.1, 42.0]** | +0.302 | [−0.13, +0.77] |
+
+At n=72 the hit-rate CI lower bound (21.1%) finally clears the worst-case
+break-even (19.8%, Part 3g). That is the first result in this whole exercise
+to clear a statistical bar — but note the two metrics disagree: **avg R's CI
+still spans zero**, because realised payoffs are not a clean 4:1 once
+slippage and forced exits are counted. Avg R is the decision-relevant figure,
+and it remains indistinguishable from no edge.
+
+### The 08:30 window is the worst hour in the sample
+
+The deck's entire execution premise is that 08:30 ET is the window
+("Step to the market at 8:30 AM EST"). Ranked by total R:
+
+| Hour ET | n | hit | avg R | sum R |
+|---|---|---|---|---|
+| 11:00 | 5 | 20.0% | +0.901 | +4.51 |
+| 09:00 | 8 | 12.5% | +0.207 | +1.66 |
+| 14:00 | 10 | 10.0% | +0.154 | +1.54 |
+| … | | | | |
+| **08:00 (the deck)** | **10** | **10.0%** | **−0.205** | **−2.05** |
+| 04:00 | 5 | 0.0% | −0.586 | −2.93 |
+| 06:00 | 8 | 0.0% | −0.496 | −3.97 |
+
+10th of 12 hours. Per-hour n is far too small to be conclusive, but it points
+the **opposite way** to the deck's claim, and the deck offers no evidence for
+08:30 beyond assertion. If the release window carried the edge the deck
+attributes to it, this is not what it would look like.
+
+Split-half stability (all session, n=36 each): avg R +0.474 → **+0.129**, hit
+33.3% → 27.8%. Weakening, though within noise at that size.
+
+### How much data would actually settle it
+
+| n | 95% CI on a true 20% hit rate | width |
+|---|---|---|
+| 13 | [8.2%, 50.3%] | 42.1 pp |
+| 72 | [11.7%, 30.4%] | 18.7 pp |
+| **200** | **[15.0%, 26.1%]** | **11.0 pp** |
+| 400 | [16.4%, 24.2%] | 7.8 pp |
+
+The decision range is 12.4 pp wide (7.4%–19.8%), so **n ≈ 200 is the minimum**
+for the test to distinguish profitable from break-even. At the 08:30 window's
+measured 0.76 qualifying trades/day that is ~263 trading days; n=400 is
+**~2.1 years** of NQ 1m.
+
+That is the concrete ask. Anything less cannot separate this setup from noise,
+and the deck presents no evidence approaching it.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
