@@ -439,6 +439,86 @@ The deck is therefore ambiguous on its single most consequential parameter,
 and the interpretation that matches its own wording most literally (B) is the
 one that cannot produce the 20 bullets its payoff model requires.
 
+## Part 3e — Sample doubled to 32 days: the edge does not replicate
+
+`data/mnq1_1m_tradingview.csv` now merges two contiguous MNQ1! 1-minute
+exports, **2026-08-02 → 2026-09-15, 43,920 bars, 32 trading days**. Parts
+3b–3d were formed on the later block only (Aug 23 – Sep 15), so **Aug 2–21 is
+a genuine out-of-sample period.**
+
+### Out-of-sample result (fixed 4R target, 1 pt/side slippage)
+
+| Window | period | n | hit | avg R | 95% CI (avg R) | net |
+|---|---|---|---|---|---|---|
+| 0830–0930 premkt | **NEW Aug 2–21** | 10 | 20.0% | **+0.103** | [−1.03, +1.29] | +$1,033 |
+| | prior Aug 23+ | 13 | 23.1% | +0.578 | [−0.37, +1.61] | +$7,510 |
+| | combined | 23 | 21.7% | +0.371 | [−0.36, +1.14] | +$8,543 |
+| 0930–1600 RTH | **NEW Aug 2–21** | 34 | 11.8% | **−0.029** | [−0.52, +0.54] | −$987 |
+| | prior Aug 23+ | 29 | 34.5% | +0.691 | [−0.02, +1.43] | +$20,030 |
+| | combined | 63 | 22.2% | +0.302 | [−0.13, +0.77] | +$19,043 |
+| all session | **NEW Aug 2–21** | 64 | 23.4% | **−0.050** | [−0.45, +0.40] | −$3,180 |
+| | prior Aug 23+ | 72 | 30.6% | +0.302 | [−0.14, +0.75] | +$21,723 |
+| | combined | **136** | 27.2% | **+0.136** | **[−0.17, +0.46]** | +$18,543 |
+
+**On data not used to form the earlier conclusions, avg R is +0.10, −0.03 and
+−0.05.** The apparent edge was confined to Aug 23 – Sep 15 and did not carry.
+
+Every estimate fell as the sample grew: premarket +0.578 → +0.371, RTH +0.691
+→ +0.302, all-session +0.302 → +0.136. That monotone decay across three
+independent windows is the signature of small-sample luck, not of an edge
+being measured more precisely.
+
+At n=136 the all-session result is **avg R +0.136, CI [−0.17, +0.46],
+P(avg R ≤ 0) = 19.9%** — no edge established. Quartiles by date:
+
+| quartile | dates | n | avg R | sum R |
+|---|---|---|---|---|
+| 1 | Aug 3 – Aug 12 | 34 | −0.231 | −7.86 |
+| 2 | Aug 12 – Aug 25 | 34 | +0.277 | +9.43 |
+| **3** | **Aug 26 – Sep 7** | 34 | **+0.561** | **+19.06** |
+| 4 | Sep 8 – Sep 15 | 34 | −0.061 | −2.08 |
+
+All of the profit is one fortnight. Q1 and Q4 are negative.
+
+Note the two metrics still disagree and the money one wins: the combined hit
+rate is 27.2%, CI [20.4%, 35.2%], nominally above the 19.8% worst-case
+break-even — but avg R is ~0 because realised payoffs are not a clean 4:1
+once slippage and forced exits are counted. Hit rate flatters it; P&L does not.
+
+### The geometry finding is now solid, and it indicts the deck's window
+
+Per-hour geometry rests on 116–159 triggers an hour, so this is structural:
+
+| Hour ET | triggers | median stop | share ≥ 1:4 | n | avg R |
+|---|---|---|---|---|---|
+| 08:00 premarket | 159 | 20.2 pt | 50.9% | 20 | +0.034 |
+| **09:00 (open)** | 156 | 27.2 pt | 32.7% | 11 | −0.149 |
+| **10:00 (post-bell)** | 116 | **32.5 pt** | **21.1%** | 3 | −0.280 |
+| 13:00 | 149 | 19.2 pt | **86.4%** | 20 | −0.145 |
+| 14:00 | 148 | 16.0 pt | **85.0%** | 21 | +0.038 |
+| 15:00 | 159 | 18.5 pt | **86.2%** | 14 | +0.197 |
+
+A strict 09:30–10:30 gives **n=2 in 32 days**, median stop 48.2 pt, 7.1% of
+triggers clearing 1:4 — 20 bullets would take ~320 trading days. The deck's
+own window, read correctly as Chicago time (Part 3d), cannot produce its own
+payoff model.
+
+And the 1:4 filter points where the deck never looks: the quiet 13:00–15:00
+ET hours offer 1:4 on 85–86% of triggers versus 21% after the bell. Even
+there, avg R is ≈ 0.
+
+### Verdict on the execution layer
+
+Across 32 trading days, 136 trades and every window tested, **no edge is
+demonstrated.** The setup is mechanically well-defined and the 1:4 geometry
+exists in the quiet hours, but realised expectancy is indistinguishable from
+zero out of sample. Combined with Parts 3a–3d — the slide-8 double count, the
+non-independent bullets, the best-day consistency caps, and a stated window
+that cannot fire — nothing in the deck survives contact with its own data.
+
+Getting to a defensible answer needs n ≈ 200–400 *per window* (Part 3c), i.e.
+roughly 1–2 years of 1-minute data, not 32 days.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
