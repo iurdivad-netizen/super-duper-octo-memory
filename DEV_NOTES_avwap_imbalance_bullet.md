@@ -240,16 +240,87 @@ Verification: Claude + TradingView" is not verification — summarising exported
 trade data cannot detect look-ahead bias, unachievable fills, or survivorship
 in the account sample.
 
+## Part 3b — Backtest result (real MNQ 1m, corrects an earlier error)
+
+`backtest_avwap_imbalance.py` ports the Pine logic. Data:
+`data/mnq1_1m_tradingview.csv`, MNQ1! 1-minute, 2026-08-23 → 2026-09-15,
+23,220 bars, **17 trading days**. The export carries TradingView's own
+`New York VWAP` and ±1 SD columns, so the VWAP is validated rather than
+assumed (it resets at **01:00 ET** = midnight Chicago, not midnight NY; the
+geometry result is identical under either anchor).
+
+**An earlier run used ES 3m/15m as a proxy and found the 1:4 geometry
+literally unavailable (0 of 23 eligible triggers, max R:R 2.61). That was
+wrong.** ES is not NQ, and 3m/15m is not 1m: both changes widen the
+FVG-spanning stop relative to the SD band width. On the correct instrument
+and timeframe the geometry is readily available:
+
+| | ES 3m (wrong proxy) | **MNQ 1m (correct)** |
+|---|---|---|
+| eligible triggers | 23 | 37 |
+| median available R:R | 1.15 | **4.64** |
+| max available R:R | 2.61 | **16.46** |
+| share offering ≥ 1:4 | **0.0%** | **54.1%** |
+| median stop width | 5.5 pt | 20.5 pt |
+
+So Part 3f's geometry objection does **not** hold on NQ 1m. Setups exist.
+
+### What the 17-day sample does and does not show
+
+| Variant | n | target | stop | hit | avg R |
+|---|---|---|---|---|---|
+| target = VWAP, flat at 09:30 | 13 | 2 | 7 | 15.4% | +0.77 |
+| **fixed 4R target, flat at 09:30** | 13 | 3 | 7 | **23.1%** | +0.58 |
+| fixed 4R target, no EOD flatten | 13 | 6 | 7 | 46.2% | +0.95 |
+
+Three reasons this cannot be used to accept the framework:
+
+1. **The sample is too small to decide anything.** Wilson 95% CI on the
+   23.1% hit rate is **[8.2%, 50.3%]**. The decision range is 7.4%–19.8%
+   (Part 3g). The confidence interval *contains the entire decision range*,
+   so the test cannot separate "profitable" from "break-even" from "losing".
+   Bootstrap on avg R: 95% CI **[−0.38, +1.61]**, with P(avg R ≤ 0) = 12.9%.
+2. **The result hinges on a rule the deck never states.** Flatten at the
+   window close → 23.1% hit. Hold to stop-or-target → 46.2%. That single
+   unspecified choice swings the answer by more than the margin being
+   tested. In the target=VWAP variant, **82% of total R came from forced
+   window-close exits**, not from targets.
+3. **Slippage flips it.** Fixed 4R target: avg R +0.65 at 0 slip, +0.58 at 1
+   pt/side, +0.31 at 5 pt/side, **−0.03 at 10 pt/side**. Ten points a side on
+   an 08:30 CPI print is ordinary.
+
+### The finding that does survive the small sample: throughput
+
+Signal frequency is far less sensitive to a short window than win rate is.
+
+- 13 qualifying trades in 17 trading days = **0.76 per day**.
+- Only **8 of 17 days (47%)** produced any qualifying trade at all.
+- Firing **20 bullets** sequentially therefore takes **~26 trading days
+  (~5 weeks)**, not the 2–3 weeks slide 8 claims. The deck needs ~1.4
+  qualifying signals a day; the setup delivers 0.76.
+- Firing one signal into all 10 accounts would fix the throughput — but that
+  *is* copy-trading, which slides 1, 3 and 4 explicitly forbid as the thing
+  that destroys the edge.
+
+This is a structural contradiction in the deck, not a statistical one, and it
+compounds Part 3d: a 5-week cycle keeps each account exposed to the trailing
+drawdown for twice as long as budgeted, and raises the real Cost of
+Acquisition — which is exactly the variable that moves break-even from 7.4%
+to 19.8% and erases the margin.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
    `i_simDeath` off. Collect ≥ 100 closed trades; the dashboard greys the hit
    rate below 30.
-2. Check `rejected · no 1:4 geometry` first. With the reclaim reading's wide
-   sequence-extreme stop this should dominate. If it does, there is no sample
-   and the 20% claim is unmeasurable — stop there.
+2. Check `rejected · no 1:4 geometry`. On NQ 1m roughly 46% of eligible
+   triggers are rejected for this and 54% pass (Part 3b) — so expect setups,
+   not a famine. On any other instrument or timeframe re-measure: on ES 3m
+   the pass rate is 0%.
 3. Compare the measured rate to **7.4%** and **19.8%** (Part 3g), not to the
-   asserted 20%.
+   asserted 20%. You need on the order of 300-400 trades before the
+   confidence interval is narrower than that range; 13 trades is nowhere
+   close (Part 3b).
 4. Flip `i_fvgMode` to `Continuation` and compare. If continuation tests better,
    that is evidence the deck's own slide-11 geometry is not the edge.
 5. Re-run at `slippage` 20 and 40 ticks. $1,000 on NQ ($20/pt) is a 50-point
