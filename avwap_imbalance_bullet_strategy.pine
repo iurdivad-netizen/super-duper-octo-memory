@@ -1,0 +1,478 @@
+//@version=6
+// =============================================================================
+// Anchored VWAP + Imbalance ("Bullet") Strategy
+// -----------------------------------------------------------------------------
+// Encodes Section 4 of the "Mathematical Risk Framework" source:
+//   1. Anchor VWAP at 00:00 New York.
+//   2. Bias gate: longs only below the -1 SD band, shorts only above +1 SD.
+//   3. Detect a 3-candle Fair Value Gap (wick of candle 1 vs wick of candle 3).
+//   4. Enter on a mechanical CLOSE back through the imbalance after price taps it.
+//   5. Target reversion to the VWAP centreline; require >= 1:4 R/R or skip.
+//   6. Execute only inside the 08:30 ET data-release window.
+//
+// Sections 1, 2, 3, 5 and 6 of the source describe a MULTI-ACCOUNT portfolio
+// (evaluation cost, account rotation, payout scheduling). Pine has no concept of
+// more than one account, so none of that is testable here. What this script
+// isolates is the single load-bearing empirical claim the whole framework rests
+// on: that the 1:4 setup hits ~20% of the time. Read the "1:4 hit rate" row of
+// the dashboard -- that number alone decides whether the portfolio maths works.
+//
+// The "Bullet account" block is a single-account survival model, not a portfolio
+// model. It shows how fast one funded account dies, which is the cost side the
+// source omits.
+// =============================================================================
+
+strategy("AVWAP Imbalance 1:4 (Bullet Model)",
+     shorttitle       = "AVWAP-FVG 1:4",
+     overlay          = true,
+     initial_capital  = 50000,
+     currency         = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value= 1,
+     pyramiding       = 0,
+     commission_type  = strategy.commission.cash_per_contract,
+     commission_value = 2.04,
+     slippage         = 4,
+     process_orders_on_close = false,
+     calc_on_every_tick      = false,
+     max_boxes_count  = 500,
+     max_labels_count = 500,
+     max_lines_count  = 500)
+
+// -----------------------------------------------------------------------------
+// 1. Inputs
+// -----------------------------------------------------------------------------
+G_SESS = "1 · Session & VWAP anchor"
+G_FVG  = "2 · Imbalance detection"
+G_TRD  = "3 · Entry, stop & target"
+G_ACCT = "4 · Bullet account model"
+G_VIS  = "5 · Display"
+
+i_tz       = input.string("America/New_York", "Timezone",
+     options = ["America/New_York", "America/Chicago", "Europe/London", "UTC"],
+     group = G_SESS,
+     tooltip = "The source says 'EST'. New York is the correct choice: it tracks "
+             + "the EST/EDT switch, so the 08:30 window stays aligned with the US "
+             + "data releases all year. A fixed EST offset would drift by an hour.")
+i_sess     = input.session("0830-0930", "Execution window", group = G_SESS,
+     tooltip = "08:30 ET US economic-release window. Signals outside this are "
+             + "counted but never traded.")
+i_anchorHr = input.int(0, "VWAP anchor hour", minval = 0, maxval = 23, group = G_SESS,
+     tooltip = "0 = midnight New York, per the source. The anchor resets the VWAP "
+             + "accumulators, so this is NOT the CME 18:00 session VWAP.")
+i_sdMult   = input.float(1.0, "SD band multiple (bias gate)", minval = 0.1, step = 0.1,
+     group = G_SESS)
+i_flatEOD  = input.bool(true, "Flatten at window close", group = G_SESS,
+     tooltip = "Prop risk desks do not let an intraday model hold overnight.")
+
+i_dispMult = input.float(1.0, "Displacement: middle candle range >= x ATR(14)",
+     minval = 0.0, step = 0.1, group = G_FVG,
+     tooltip = "The source says an 'aggressive candle creates a price "
+             + "displacement' but never quantifies it. Set 0 to disable.")
+i_needBody = input.bool(true, "Middle candle must close in gap direction", group = G_FVG)
+i_reclaim  = input.string("Far edge", "Reclaim level",
+     options = ["Far edge", "Midpoint"], group = G_FVG,
+     tooltip = "'Far edge' = a close fully back through the imbalance (strict "
+             + "reading of the source). 'Midpoint' = the 50% consequent "
+             + "encroachment, which triggers more often and earlier.")
+i_maxWait  = input.int(20, "Discard imbalance after N bars", minval = 1, maxval = 500,
+     group = G_FVG)
+
+i_minRR    = input.float(4.0, "Minimum reward:risk", minval = 0.5, step = 0.25,
+     group = G_TRD,
+     tooltip = "The source's whole payoff model needs 1:4. Setups that cannot "
+             + "reach it are rejected and counted, not taken at worse odds.")
+i_stopBuf  = input.float(2.0, "Stop buffer beyond imbalance (ticks)", minval = 0,
+     group = G_TRD)
+i_fixTgt   = input.bool(true, "Freeze VWAP target at entry", group = G_TRD,
+     tooltip = "ON  = fixed target, so the 1:4 payoff is exactly the modelled one.\n"
+             + "OFF = target chases the live VWAP, which is the literal reading of "
+             + "'reversion to the central VWAP line' but destroys the fixed R "
+             + "multiple the portfolio maths assumes.")
+i_dirMode  = input.string("Both", "Direction", options = ["Both", "Long only", "Short only"],
+     group = G_TRD)
+
+i_bulletUSD= input.float(1000.0, "Bullet size (risk per trade, $)", minval = 1,
+     group = G_ACCT)
+i_bullets  = input.int(2, "Bullets per account", minval = 1, maxval = 20, group = G_ACCT,
+     tooltip = "$2,000 drawdown / $1,000 bullet = 2, per the source.")
+i_maxQty   = input.int(50, "Contract cap", minval = 1, group = G_ACCT)
+i_simDeath = input.bool(false, "Halt permanently when bullets are spent", group = G_ACCT,
+     tooltip = "OFF (default): keep trading past the drawdown limit so the backtest "
+             + "collects a full sample and the 1:4 hit rate is statistically usable.\n"
+             + "ON: the account is dead the moment the buffer is gone -- this is what "
+             + "actually happens to a funded account, and it is the fact the source's "
+             + "$498,000 figure leaves out.")
+i_trailDD  = input.bool(true, "Drawdown trails equity peak", group = G_ACCT,
+     tooltip = "ON = trailing high-water drawdown (common futures-prop rule). "
+             + "OFF = static, measured from starting balance.")
+
+i_showVW   = input.bool(true,  "VWAP & bands", group = G_VIS)
+i_showFVG  = input.bool(true,  "Imbalance boxes", group = G_VIS)
+i_showLvl  = input.bool(true,  "Stop / target lines", group = G_VIS)
+i_showTbl  = input.bool(true,  "Dashboard", group = G_VIS)
+
+// -----------------------------------------------------------------------------
+// 2. Guards
+// -----------------------------------------------------------------------------
+if timeframe.isdwm
+    runtime.error("Intraday timeframe required. A midnight-anchored VWAP and an "
+         + "08:30 execution window cannot be evaluated on daily or higher bars. "
+         + "Use 1m-15m; the source implies 1m-5m on NQ.")
+
+// -----------------------------------------------------------------------------
+// 3. Session & anchor detection
+// -----------------------------------------------------------------------------
+inWindow  = not na(time(timeframe.period, i_sess, i_tz))
+winClose  = inWindow[1] and not inWindow
+
+curHour   = hour(time, i_tz)
+isAnchor  = curHour == i_anchorHr and curHour[1] != i_anchorHr
+
+// -----------------------------------------------------------------------------
+// 4. Anchored VWAP with volume-weighted standard deviation bands
+// -----------------------------------------------------------------------------
+srcP = (high + low + close) / 3.0
+vol  = nz(volume, 0.0)
+
+var float sumPV  = 0.0
+var float sumV   = 0.0
+var float sumP2V = 0.0
+var int   anchBar = na
+
+if isAnchor or na(anchBar)
+    sumPV   := 0.0
+    sumV    := 0.0
+    sumP2V  := 0.0
+    anchBar := bar_index
+
+sumPV  += srcP * vol
+sumV   += vol
+sumP2V += srcP * srcP * vol
+
+avwapV = sumV > 0 ? sumPV / sumV : na
+vwVar  = sumV > 0 ? math.max(sumP2V / sumV - avwapV * avwapV, 0.0) : na
+vwSD   = math.sqrt(vwVar)
+
+bandUp = avwapV + i_sdMult * vwSD
+bandDn = avwapV - i_sdMult * vwSD
+
+hasVol = sumV > 0
+
+// -----------------------------------------------------------------------------
+// 5. Fair Value Gap detection  ([2] = first, [1] = displacement, [0] = third)
+// -----------------------------------------------------------------------------
+atrV     = ta.atr(14)
+midRange = high[1] - low[1]
+dispOK   = i_dispMult <= 0 or na(atrV[1]) or midRange >= i_dispMult * atrV[1]
+
+bullBody = not i_needBody or close[1] > open[1]
+bearBody = not i_needBody or close[1] < open[1]
+
+newBull = high[2] < low[0]  and dispOK and bullBody
+newBear = low[2]  > high[0] and dispOK and bearBody
+
+// -----------------------------------------------------------------------------
+// 6. Imbalance state (most recent unresolved zone per direction)
+// -----------------------------------------------------------------------------
+var float bullTop = na      // upper edge of the bullish gap  = low[0]
+var float bullBot = na      // lower edge                     = high[2]
+var bool  bullTap = false
+var int   bullAge = 0
+
+var float bearTop = na      // upper edge of the bearish gap  = low[2]
+var float bearBot = na      // lower edge                     = high[0]
+var bool  bearTap = false
+var int   bearAge = 0
+
+tickSz = syminfo.mintick
+
+if newBull
+    bullTop := low[0]
+    bullBot := high[2]
+    bullTap := false
+    bullAge := 0
+
+if newBear
+    bearTop := low[2]
+    bearBot := high[0]
+    bearTap := false
+    bearAge := 0
+
+if not na(bullTop) and not newBull
+    bullAge += 1
+if not na(bearTop) and not newBear
+    bearAge += 1
+
+// Invalidate: a close through the far side means the imbalance failed, not held.
+if not na(bullBot) and close < bullBot
+    bullTop := na
+    bullBot := na
+    bullTap := false
+if not na(bearTop) and close > bearTop
+    bearTop := na
+    bearBot := na
+    bearTap := false
+
+if not na(bullTop) and bullAge > i_maxWait
+    bullTop := na
+    bullBot := na
+    bullTap := false
+if not na(bearTop) and bearAge > i_maxWait
+    bearTop := na
+    bearBot := na
+    bearTap := false
+
+// Tap = price traded into the gap
+if not na(bullTop) and low <= bullTop
+    bullTap := true
+if not na(bearBot) and high >= bearBot
+    bearTap := true
+
+bullRec = i_reclaim == "Midpoint" and not na(bullTop) ? (bullTop + bullBot) / 2.0 : bullTop
+bearRec = i_reclaim == "Midpoint" and not na(bearTop) ? (bearTop + bearBot) / 2.0 : bearBot
+
+// -----------------------------------------------------------------------------
+// 7. Bullet account state
+// -----------------------------------------------------------------------------
+var float peakEq = na
+peakEq := na(peakEq) ? strategy.initial_capital : math.max(peakEq, strategy.equity)
+
+refEq   = i_trailDD ? peakEq : strategy.initial_capital
+ddNow   = math.max(refEq - strategy.equity, 0.0)
+bulUsed = i_bulletUSD > 0 ? ddNow / i_bulletUSD : 0.0
+
+var bool acctDead = false
+if i_simDeath and bulUsed >= i_bullets
+    acctDead := true
+
+// -----------------------------------------------------------------------------
+// 8. Signal assembly
+// -----------------------------------------------------------------------------
+allowLong  = i_dirMode != "Short only"
+allowShort = i_dirMode != "Long only"
+
+// Bias gate: the source permits longs only in the discount zone (below -1 SD)
+// and shorts only in the premium zone (above +1 SD).
+longBias  = not na(bandDn) and bullRec < bandDn
+shortBias = not na(bandUp) and bearRec > bandUp
+
+rawLong  = bullTap and not na(bullRec) and close > bullRec and close[1] <= bullRec
+rawShort = bearTap and not na(bearRec) and close < bearRec and close[1] >= bearRec
+
+lStop = not na(bullBot) ? bullBot - i_stopBuf * tickSz : na
+sStop = not na(bearTop) ? bearTop + i_stopBuf * tickSz : na
+
+lRisk = not na(lStop) ? close - lStop : na
+sRisk = not na(sStop) ? sStop - close : na
+lRew  = not na(avwapV) ? avwapV - close : na
+sRew  = not na(avwapV) ? close - avwapV : na
+
+lRR = not na(lRisk) and lRisk > 0 and not na(lRew) ? lRew / lRisk : 0.0
+sRR = not na(sRisk) and sRisk > 0 and not na(sRew) ? sRew / sRisk : 0.0
+
+canTrade = inWindow and hasVol and barstate.isconfirmed and not acctDead
+             and strategy.position_size == 0
+
+longOK  = canTrade and allowLong  and rawLong  and longBias  and lRR >= i_minRR
+shortOK = canTrade and allowShort and rawShort and shortBias and sRR >= i_minRR
+
+// -----------------------------------------------------------------------------
+// 9. Diagnostic counters -- these are the point of the script
+// -----------------------------------------------------------------------------
+var int cFVG    = 0     // imbalances formed inside the window
+var int cTrig   = 0     // reclaim triggers fired
+var int cRejBia = 0     // rejected: wrong side of the SD band
+var int cRejRR  = 0     // rejected: 1:4 geometry unavailable
+var int cRejQty = 0     // rejected: stop too wide to size even 1 contract
+var int cTaken  = 0
+
+if inWindow and (newBull or newBear)
+    cFVG += 1
+
+trigAny = (rawLong and allowLong) or (rawShort and allowShort)
+if inWindow and trigAny
+    cTrig += 1
+    biasOK = (rawLong and longBias) or (rawShort and shortBias)
+    rrOK   = (rawLong and lRR >= i_minRR) or (rawShort and sRR >= i_minRR)
+    if not biasOK
+        cRejBia += 1
+    else if not rrOK
+        cRejRR += 1
+
+// -----------------------------------------------------------------------------
+// 10. Position sizing from the bullet
+// -----------------------------------------------------------------------------
+ptVal = syminfo.pointvalue
+
+f_qty(float riskPts) =>
+    perContract = riskPts * ptVal
+    perContract > 0 ? math.min(math.floor(i_bulletUSD / perContract), i_maxQty) : 0
+
+qtyL = longOK  ? f_qty(lRisk) : 0
+qtyS = shortOK ? f_qty(sRisk) : 0
+
+// -----------------------------------------------------------------------------
+// 11. Execution
+// -----------------------------------------------------------------------------
+var float pStop  = na
+var float pTgt   = na
+var int   pDir   = 0
+var float pR     = na
+
+if longOK and qtyL >= 1
+    pStop := lStop
+    pTgt  := avwapV
+    pDir  := 1
+    pR    := lRisk
+    cTaken += 1
+    strategy.entry("L", strategy.long, qty = qtyL, comment = "FVG-Long")
+else if longOK
+    cRejQty += 1
+
+if shortOK and qtyS >= 1
+    pStop := sStop
+    pTgt  := avwapV
+    pDir  := -1
+    pR    := sRisk
+    cTaken += 1
+    strategy.entry("S", strategy.short, qty = qtyS, comment = "FVG-Short")
+else if shortOK
+    cRejQty += 1
+
+liveTgt = i_fixTgt ? pTgt : avwapV
+
+if strategy.position_size > 0 and pDir == 1
+    strategy.exit("L-x", "L", stop = pStop, limit = liveTgt,
+         comment_loss = "STOP", comment_profit = "VWAP")
+if strategy.position_size < 0 and pDir == -1
+    strategy.exit("S-x", "S", stop = pStop, limit = liveTgt,
+         comment_loss = "STOP", comment_profit = "VWAP")
+
+if i_flatEOD and winClose and strategy.position_size != 0
+    strategy.close_all(comment = "FLAT-EOD")
+
+if acctDead and strategy.position_size != 0
+    strategy.close_all(comment = "ACCT-DEAD")
+
+if strategy.position_size == 0 and pDir != 0
+    pDir  := 0
+    pStop := na
+    pTgt  := na
+    pR    := na
+
+// -----------------------------------------------------------------------------
+// 12. Outcome tally
+// -----------------------------------------------------------------------------
+var int   nClosed = 0
+var int   nWin    = 0
+var int   nLoss   = 0
+var float sumR    = 0.0
+
+if strategy.closedtrades > nClosed
+    for k = nClosed to strategy.closedtrades - 1
+        pnl = strategy.closedtrades.profit(k)
+        if pnl > 0
+            nWin += 1
+        else
+            nLoss += 1
+        sumR += i_bulletUSD > 0 ? pnl / i_bulletUSD : 0.0
+    nClosed := strategy.closedtrades
+
+hitRate = nClosed > 0 ? 100.0 * nWin / nClosed : 0.0
+avgR    = nClosed > 0 ? sumR / nClosed : 0.0
+
+// Break-even hit rate for the source's own structure: with B bullets that reset
+// on a win, expected wins per account = k/(1-k) where k = p(2-p) for B=2.
+// Solving EV = 0 against acquisition cost is done in the DEV_NOTES; what matters
+// on-chart is the measured rate versus the 20% the source asserts.
+beRate = 100.0 / (1.0 + i_minRR)
+
+// -----------------------------------------------------------------------------
+// 13. Plots
+// -----------------------------------------------------------------------------
+pVW = plot(i_showVW ? avwapV : na, "AVWAP", color = color.new(color.orange, 0), linewidth = 2)
+pUp = plot(i_showVW ? bandUp : na, "+1 SD", color = color.new(color.teal, 40))
+pDn = plot(i_showVW ? bandDn : na, "-1 SD", color = color.new(color.teal, 40))
+fill(pUp, pDn, color = color.new(color.teal, 94), title = "Value band")
+
+plot(i_showLvl and strategy.position_size != 0 ? pStop : na, "Stop",
+     color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(i_showLvl and strategy.position_size != 0 ? liveTgt : na, "Target",
+     color = color.new(color.lime, 0), style = plot.style_linebr, linewidth = 2)
+
+if i_showFVG and newBull
+    box.new(bar_index - 2, low[0], bar_index + i_maxWait, high[2],
+         border_color = color.new(color.green, 30),
+         bgcolor = color.new(color.green, 86))
+if i_showFVG and newBear
+    box.new(bar_index - 2, low[2], bar_index + i_maxWait, high[0],
+         border_color = color.new(color.red, 30),
+         bgcolor = color.new(color.red, 86))
+
+plotshape(longOK  and qtyL >= 1, "Long entry",  shape.triangleup,
+     location.belowbar, color.new(color.lime, 0), size = size.small)
+plotshape(shortOK and qtyS >= 1, "Short entry", shape.triangledown,
+     location.abovebar, color.new(color.red, 0), size = size.small)
+plotshape(inWindow and trigAny and not (longOK or shortOK), "Rejected setup",
+     shape.xcross, location.absolute, color.new(color.gray, 20), size = size.tiny)
+
+bgcolor(inWindow ? color.new(color.blue, 94) : na, title = "Execution window")
+
+// -----------------------------------------------------------------------------
+// 14. Dashboard
+// -----------------------------------------------------------------------------
+var table dash = table.new(position.top_right, 2, 15,
+     bgcolor = color.new(color.black, 12), border_width = 1, border_color = color.new(color.gray, 60))
+
+f_row(int r, string k, string v, color c) =>
+    table.cell(dash, 0, r, k, text_color = color.new(color.silver, 0),
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, r, v, text_color = c,
+         text_size = size.small, text_halign = text.align_right)
+
+if i_showTbl and barstate.islast
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 0, "AVWAP Imbalance 1:" + str.tostring(i_minRR, "#.#"),
+         text_color = color.white, text_size = size.normal, bgcolor = color.new(color.blue, 55))
+
+    hitCol = nClosed < 30 ? color.gray : hitRate >= 20.0 ? color.lime
+               : hitRate >= beRate ? color.orange : color.red
+
+    f_row(1,  "Imbalances in window", str.tostring(cFVG),        color.silver)
+    f_row(2,  "Reclaim triggers",      str.tostring(cTrig),       color.silver)
+    f_row(3,  "  rejected · bias zone",str.tostring(cRejBia),     color.orange)
+    f_row(4,  "  rejected · no 1:" + str.tostring(i_minRR, "#.#") + " geometry",
+                                       str.tostring(cRejRR),      color.orange)
+    f_row(5,  "  rejected · stop too wide", str.tostring(cRejQty),color.orange)
+    f_row(6,  "Trades taken",          str.tostring(cTaken),      color.aqua)
+    f_row(7,  "Closed / wins",         str.tostring(nClosed) + " / " + str.tostring(nWin),
+                                                                  color.silver)
+    f_row(8,  "1:" + str.tostring(i_minRR, "#.#") + " HIT RATE",
+                                       str.tostring(hitRate, "#.#") + " %", hitCol)
+    f_row(9,  "  source asserts",      "20.0 %",                  color.gray)
+    f_row(10, "  gross break-even",    str.tostring(beRate, "#.#") + " %", color.gray)
+    f_row(11, "Avg R per trade",       str.tostring(avgR, "#.##") + " R",
+              avgR > 0 ? color.lime : color.red)
+    f_row(12, "Net P&L",               "$" + str.tostring(strategy.netprofit, "#"),
+              strategy.netprofit > 0 ? color.lime : color.red)
+    f_row(13, "Bullets spent (of " + str.tostring(i_bullets) + ")",
+                                       str.tostring(bulUsed, "#.##"),
+              bulUsed >= i_bullets ? color.red : color.silver)
+    f_row(14, "Account", acctDead ? "DEAD" : hasVol ? "alive" : "NO VOLUME DATA",
+              acctDead ? color.red : hasVol ? color.lime : color.orange)
+
+// -----------------------------------------------------------------------------
+// 15. Alerts
+// -----------------------------------------------------------------------------
+if longOK and qtyL >= 1
+    alert(str.format("LONG {0} @ {1} stop {2} target {3} ({4}R) qty {5}",
+         syminfo.ticker, str.tostring(close, format.mintick),
+         str.tostring(lStop, format.mintick), str.tostring(avwapV, format.mintick),
+         str.tostring(lRR, "#.#"), qtyL), alert.freq_once_per_bar_close)
+
+if shortOK and qtyS >= 1
+    alert(str.format("SHORT {0} @ {1} stop {2} target {3} ({4}R) qty {5}",
+         syminfo.ticker, str.tostring(close, format.mintick),
+         str.tostring(sStop, format.mintick), str.tostring(avwapV, format.mintick),
+         str.tostring(sRR, "#.#"), qtyS), alert.freq_once_per_bar_close)
