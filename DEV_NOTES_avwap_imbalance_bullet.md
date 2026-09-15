@@ -1,203 +1,276 @@
-# AVWAP Imbalance 1:4 — "Mathematical Risk Framework"
+# AVWAP Imbalance 1:4 — "The Prop Firm Loophole"
 
 **File:** `avwap_imbalance_bullet_strategy.pine` (Pine Script v6)
-**Source:** NotebookLM notebook, "Mathematical Risk Framework: Optimizing Capital
-Allocation for Prop Firm Payouts", 6 sections.
-**Intended market:** NQ / MNQ futures, 1m–5m, 08:30 ET release window.
+**Source:** `Prop_Firm_Extraction_Blueprint.pdf` — "The Prop Firm Loophole: A
+Mathematical Framework for Extraction", a 14-slide deck by "Garland Trader",
+generated in Gemini Notebook. Image-only PDF, no text layer.
+**Intended market:** NQ futures, **1-minute** chart (slide 10), 08:30 ET.
+
+> Previously drafted from a NotebookLM text summary of this deck. The PDF
+> changed two substantive things: the imbalance polarity (Part 2a) and the
+> document's purpose (Part 3a). Both are corrected below.
 
 ---
 
-## Part 1 — What is codeable and what is not
+## Part 1 — What is codeable
 
-The source is two documents welded together.
+| Slide | Content | Testable in Pine? |
+|-------|---------|-------------------|
+| 1–4 | Pitch; "variance exhaustion"; old-vs-new comparison table | No |
+| 5 | Zero-edge anchor: 100k-trade MC, 1:1.5 R/R → ~40% WR | No |
+| 6 | Funnel: $3,000 → 30 evals → 30% pass → 10 funded, CoA $300 | No |
+| 7 | Bullets: 1 account = $2,000 DD = 2 × $1,000 risks → "20 independent attempts" | Partly |
+| 8 | The output math: $3K → $9K–$12K in 2–3 weeks | No — and it is wrong (Part 3b) |
+| 9 | Payout ladder: strike day 1, micro-risk days 2–5, withdraw 50% | No |
+| **10–11** | **1-min AVWAP scalp + imbalance entry trigger** | **Yes — the script** |
+| 12 | $498,000 / 1,000 trades / 365 days, "AI Verification: Claude + TradingView" | No |
+| 13 | "A $20,000 Week" across Topstep / Tradeify / Blue Guardian | No |
+| 14 | 12-week coaching programme, "Apply Now" | No |
 
-| Section | Content | Testable in Pine? |
-|---------|---------|-------------------|
-| 1 | Portfolio rotation vs. single-account survival | No — Pine has one account |
-| 2 | Cost of Acquisition, 31% eval pass rate | No — no eval simulation |
-| 3 | The "bullet" system, 2 × $1,000 per account | Partly — single-account survival only |
-| **4** | **Anchored VWAP + FVG execution protocol** | **Yes — this is the script** |
-| 5 | Payout stabilisation, idling, withdrawal schedule | No — firm-side rules |
-| 6 | 1,000-trade / $498,000 backtest claim | No — but see Part 4 |
-
-Only Section 4 is a trading strategy. Sections 1–3 and 5–6 are portfolio
-accounting layered on top of it, and that accounting is where the framework
-breaks (Part 3).
-
-## Part 2 — Mapping Section 4 to code
+## Part 2 — Mapping slides 10–11 to code
 
 | Source rule | Implementation |
 |-------------|----------------|
-| "Define the VWAP Anchor Point at Midnight (00:00) New York Time" | `sumPV/sumV/sumP2V` accumulators reset on the NY-hour transition to `i_anchorHr` (default 0). This is **not** the CME 18:00 session VWAP — the anchor is deliberately mid-session. |
-| Standard deviation bands | Volume-weighted SD: `sqrt(Σp²v/Σv − vwap²)`, bands at `i_sdMult` (default 1.0). |
-| "Only buy below the 1st SD band, only sell above" | Hard gate `longBias` / `shortBias` on the reclaim level, not on `close`. Rejections counted in `rejected · bias zone`. |
-| 3-candle FVG, "gap between the wick of the first candle and the wick of the third" | `high[2] < low[0]` (bullish) / `low[2] > high[0]` (bearish). Wicks, as specified — not body-based. |
-| "an aggressive candle creates a price displacement" | Unquantified in the source. Implemented as middle-candle range ≥ `i_dispMult × ATR(14)`, default 1.0, settable to 0. |
-| "mechanical close back above the imbalance" | Requires (a) price taps the gap, then (b) a confirmed close through the reclaim level with `close[1]` on the other side. `i_reclaim` selects the far edge (strict) or the 50% midpoint. |
-| Target = "reversion to the central VWAP line" | `strategy.exit(limit = VWAP)`. `i_fixTgt` freezes it at entry (default) — see Part 3f. |
-| "minimum 1:4 Risk/Reward" | `i_minRR` = 4.0. Setups that cannot reach it are **rejected and counted**, never taken at worse odds. This counter is the most important output of the script. |
-| 08:30 EST window | `i_sess` default `0830-0930`, timezone `America/New_York` (tracks EST/EDT; a fixed EST offset drifts an hour for eight months of the year). |
-| $1,000 bullet | `qty = floor(1000 / (stopPts × pointvalue))`, capped by `i_maxQty`. Floor means realised risk ≤ $1,000. |
-| 2 bullets = $2,000 drawdown | `i_bullets`, trailing off the equity peak by default. `i_simDeath` halts permanently when spent — **off by default**, so the backtest collects a full sample instead of stopping at the first dead account. |
+| "VWAP (Anchored at Midnight EST)" | Accumulators reset on the NY-hour transition to `i_anchorHr` (default 0). Not the CME 18:00 session VWAP. |
+| Upper / Lower 1st SD | Volume-weighted SD: `sqrt(Σp²v/Σv − vwap²)`, `i_sdMult` default 1.0. |
+| "Buy Zone: bias is strictly LONG back to VWAP" (below lower 1st SD); mirror above upper | Hard gate `longBias` / `shortBias` on the reclaim level. Rejections counted. |
+| **"gap between Candle 1's low and Candle 3's high"** | See Part 2a — this is a **downward** displacement. `dnGap = low[2] > high[0]`. |
+| "Aggressive move creates a gap" | Unquantified. `midRange ≥ i_dispMult × ATR(14)`, default 1.0, settable to 0. |
+| "Wait for a candle to visually CLOSE above the imbalance" | `close > lRecLvl and close[1] <= lRecLvl`, confirmed bars only. |
+| "Ride momentum back to the central VWAP" | `strategy.exit(limit = VWAP)`, frozen at entry by default. |
+| "1:4 R/R (Risk $1K to make $4K)" | `i_minRR = 4.0`. Setups that cannot reach it are **rejected and counted**. |
+| "Step to the market at 8:30 AM EST" | `i_sess` default `0830-0930`, `America/New_York` (tracks EST/EDT; a fixed EST offset drifts an hour for eight months). |
+| 1-minute chart | Dashboard header flags any TF outside 1/3/5m. |
+| $2,000 DD → 2 × $1,000 bullets | `i_bulletUSD`, `i_bullets`, trailing off the equity peak. `i_simDeath` off by default. |
 
-Deliberate departures, all flagged in tooltips: the displacement threshold and
-the reclaim level are invented (the source gives neither), and only the most
-recent unresolved imbalance per direction is tracked rather than a stack.
+### 2a. The imbalance polarity was wrong in the first draft
 
-## Part 3 — Where the framework's arithmetic fails
+Slide 11 draws candle 1 high, candle 2 a large **down** candle, candle 3 low,
+and brackets the imbalance between **candle 1's low and candle 3's high** —
+then labels the setup "Buy Bias" and the trigger "close **above** the
+imbalance".
 
-### a. Expected wins per funded account is 0.56, not 25
+That is a **downward** displacement gap, entered **long** on an upward reclaim:
+an exhaustion reversal. It is *not* the conventional bullish FVG (candle 1's
+high below candle 3's low) held as support, which is what the earlier draft
+implemented and what nearly every published FVG script means. The two are close
+to opposite signals — continuation vs. reversal — and the reversal reading is
+the one that actually fits "ride momentum *back* to the central VWAP" from
+below the −1 SD band.
 
-Two bullets, reset to two on a win (profit restores the buffer), account dead on
-a second consecutive loss. With win probability `p`, `q = 1−p`:
+`i_fvgMode` now selects:
+
+- **`Reclaim (slide 11)`** — default. Long on `low[2] > high[0]`, trigger
+  `close > low[2]`. Price starts *below* the gap, so there is no prior tap to
+  wait for; `needTap = false`. The displacement candle is bearish, i.e. against
+  the trade.
+- **`Continuation (classic FVG)`** — the old behaviour, retained for comparison.
+  Long on `high[2] < low[0]`, tapped then reclaimed; `needTap = true`.
+
+Consequence for the stop, and it is a large one: in reclaim mode the gap's far
+edge (`high[0]`) sits *inside* the displacement candle, above the actual swing
+low, so a stop there would be run first. `i_stopBasis` defaults to the 3-candle
+**sequence extreme** (`min(low[0..2])`) in reclaim mode. That stop spans the
+whole displacement candle, so it is **wide** — which makes the 1:4 requirement
+against a target only ~1 SD away considerably harder to satisfy than it looked
+under the continuation reading. `rejected · no 1:4 geometry` measures it.
+
+## Part 3 — What the deck gets wrong
+
+### a. It is a lead magnet, not analysis
+
+Slide 14: a 12-week paid coaching programme, "Guarantee: Get funded within 2
+months", "Apply Now — click the link in the description". The NotebookLM text
+summary stripped this entirely. Every performance figure in the deck is
+marketing collateral produced by the party selling the course, which sets the
+prior for slides 8, 12 and 13.
+
+And slide 14 undercuts them directly: the **entire student body's** track record
+is "over **$90,000** in personal payouts." Slide 13 claims one operator
+extracted **$20,000 in a single week**; slide 12 claims **$498,000** a year. At
+the advertised rate, one student would exceed the whole cohort's lifetime record
+in about five weeks. Those three numbers cannot all be true.
+
+### b. Slide 8 books the wins and never books the losses
+
+This is the deck's central arithmetic, and the error is plain:
 
 ```
-H(1) = p(1 + H(2))
-H(2) = p(1 + H(2)) + q·H(1)
-     = p(1+q)(1 + H(2))
-=>  H(2) = k/(1−k),   k = p(2−p)
+Slide 8:  20 bullets × 20% = 4 wins
+          4 wins × $3,000 ("after $1K risk is covered") = $12,000 gross
+          − $3,000 funnel cost                          =  $9,000 net
 ```
 
-At the source's own `p = 0.20`: `k = 0.36`, **H = 0.5625 expected wins over the
-entire lifetime of a funded account.** A 64% chance the account dies before its
-first payout.
+20 bullets at a 20% hit rate is 4 wins **and 16 losses**. The 16 losses are
+never subtracted. Account-balance change:
 
-### b. $498,000 requires ~443 funded accounts, not 10
+```
+4 × (+$4,000)  +  16 × (−$1,000)  =  $16,000 − $16,000  =  $0
+```
 
-$498,000 ÷ 10 slots = $49,800 per slot-year. At the source's own $2,000 withdrawn
-per hit, that is **24.9 wins per slot**. At 0.5625 wins per account:
+**Exactly zero** — which is precisely what slide 5 promises when it says the
+baseline strategy "works with NO expected value". Slide 8 then reports $12,000
+of gross profit from it. The two slides contradict each other, and the gap is
+the $16,000 of unbooked losing bullets (net of the $4,000 the slide wrongly
+deducts from the winners — a win does not also cost you its risk).
 
-| Quantity | Source claims | Implied by source's own numbers |
+The fair version is a **cash** account, since losing bullets burn the firm's
+simulated capital, not yours:
+
+| | Slide 8 | Corrected |
 |---|---|---|
-| Funded accounts consumed / year | 10 | ~443 |
-| Evaluations attempted / year | 33 | ~1,460 |
+| Cash out (30 evals) | $3,000 | $3,000 |
+| Wins | 4 | 4 |
+| Withdrawn (slide 9: 50% of $4,000) | — | $8,000 |
+| After a 90% profit split | — | $7,200 |
+| **Net cash** | **$9,000** | **≈ $4,200** |
+| Accounts left alive | (not stated) | **2 of 10** — 16 lost bullets kill 8 |
+
+So the structure does make money, and the mechanism is real: limited liability
+caps your downside at the eval fee while the upside is the full payout. A
+funded account is a call option on your own variance. But the deck's own
+tagline on slide 13 — *"all you need is one trade to hit to completely mitigate
+your acquisition cost"* — is the tell. This is option-premium arbitrage, not a
+trading edge, and it is worth roughly half what slide 8 claims per cycle.
+
+### c. The 20 bullets are not independent
+
+Slide 7 states "we have 20 **independent** attempts to hit this target." They
+are not. Bullet 2 exists only conditional on bullet 1 having lost, and losing
+both destroys the account. Modelling the buffer as resetting on a win:
+
+```
+H(2) = k/(1−k),   k = p(2−p)
+p = 0.20  →  k = 0.36  →  H = 0.5625 expected wins per account, ever
+```
+
+A 64% chance an account dies before its first payout. Carried to slide 12's
+$498,000 (10 slots × $49,800 ÷ $2,000 per withdrawal = 24.9 wins per slot):
+
+| | Slide 12 | Implied |
+|---|---|---|
+| Funded accounts consumed/year | 10 | ~443 |
+| Evaluations/year | 30 | ~1,460 (≈4/day) |
 | Capital outlay | **$3,000** | **~$133,000** |
 
-The capital requirement is understated by roughly **44×**. The error is treating
-"20 bullets" as a one-shot portfolio when it is a consumption rate.
+Slides 1 and 4 also *forbid* copy-trading and mandate individual execution — so
+those ~4 evaluations a day are all hand-traded. Not achievable by one operator.
 
-This also creates an internal contradiction the source cannot resolve: it
-*forbids* copy-trading and mandates individual execution (§1, §6), while the
-throughput its own profit figure demands is ~4 new evaluations started every
-calendar day, each hand-traded through minimum-day requirements. Those two
-requirements are mutually exclusive for one operator.
+### d. Consistency rules block the deck's core instruction — verified
 
-### c. The structure *is* EV-positive — just small
+Slide 4's primary goal is "**Speed to payout; clear the buffer fast**." That is
+the exact behaviour best-day consistency rules exist to prevent, and the deck
+names firms that enforce them:
 
-Credit where it is due. A funded account is a limited-liability call option on
-your own variance: downside capped at the eval fee, upside the full payout. That
-asymmetry is real, and it survives the maths. Per account, at a 90% profit split:
+| Firm | Best-day cap |
+|---|---|
+| Topstep — Trading Combine | **50%** of profit target |
+| Topstep — Express Funded | **40%** |
+| Apex | 30% |
+| MFFU | 40% |
 
-```
-EV = 0.5625 × ($4,000 × 0.90 × 50% withdrawn) − $300 CoA
-   = 0.5625 × $1,800 − $300
-   = +$712
-```
+A $4,000 single-trade hit is **100% of account profit**. Under Topstep's Express
+Funded 40% target you need ~$10,000 total profit before that day is compliant;
+under Apex's 30%, ~$13,300. Topstep does not fail you — it *raises the target*,
+so you keep trading with the drawdown re-exposed. That destroys both the
+"speed to payout" thesis and the CoA model, because every account now occupies
+a slot far longer than slide 8's 2–3 weeks.
 
-A genuine 10-account portfolio is therefore worth about **$7,100**, not $498,000
-— a 70× overstatement, but not zero. The framework's conclusion is directionally
-defensible; its magnitude is fiction.
+Worse, the **Combine itself** carries the 50% rule, so slide 6's 30% pass rate
+from random 1:1.5 entries is overstated for Topstep: a random-entry run that
+clears the target in a few large trades fails the consistency target on the way.
 
-### d. The edge is a bet on evaluation pricing, not on the strategy
+Sources: [TradeDupe](https://tradedupe.com/blog/prop-firm-consistency-rule-guide),
+[PropTradingVibes](https://proptradingvibes.com/blog/topstep-consistency-rule),
+[Funded Futures Family](https://www.fundedfuturesfamily.com/topstep-consistency-rule/),
+[Phidias](https://phidiaspropfirm.com/education/topstep-consistency-rule).
 
-Setting EV = 0 and solving for `p`:
+Separately, slide 9's micro-risk "lock-in" — $150 to make $150 purely to
+satisfy minimum trading days — is at many firms an explicit T&C breach
+(no-purpose / gaming trades) and grounds for payout denial.
+
+### e. Slide 13 counts unrealised balance as extracted
+
+| Firm | Deck's wording | Amount |
+|---|---|---|
+| Topstep | "locked in" ×2 | $9,186 — **still in the account** |
+| Tradeify | "extracted" ×4 | $16,100 |
+| Blue Guardian | "payout" | $2,000 |
+
+Headline: "Over **$20,000 extracted** in a single week." $9,186 of it was not
+extracted; "locked in" means unrealised account balance, still exposed to the
+drawdown and to the consistency rules above.
+
+### f. Two more internal contradictions
+
+- Slide 8 says **2–3 weeks** for the whole $3K→$9K cycle. Slide 3 puts the eval
+  at weeks 1–4 with funding in week 5, and slide 14 guarantees funding "within
+  2 months". The cycle cannot fit in 2–3 weeks by the deck's own timeline.
+- Slide 9 claims the 1:1 micro-risk phase "averages to break-even over 4 days"
+  and "the buffer is completely protected". A zero-edge 1:1 sequence is a
+  driftless random walk with non-zero variance — not protection — and after
+  commissions the drift is negative. Tight-stop micro-trades make the
+  commission drag proportionally worse, not better.
+
+### g. Where the edge actually is, and its sensitivity
+
+Setting EV = 0 per account against acquisition cost:
 
 | Real Cost of Acquisition | Break-even 1:4 hit rate |
 |---|---|
-| $300 (source's figure) | **7.4%** |
+| $300 (slide 6) | **7.4%** |
 | $600 | 13.4% |
 | $1,000 | **19.8%** |
 
-At $300 CoA there is wide cushion below the claimed 20%. At $1,000 CoA the
-break-even is 19.8% and **the entire margin of safety is gone.** So the
-load-bearing number is not the 1:4 hit rate — it is the 31% pass rate, the least
-verified figure in the document. The framework is not a trading edge; it is a
-wager that prop-firm evaluations are underpriced.
+At $300 there is real cushion under the asserted 20%. At $1,000 the break-even
+*is* 20% and the margin is gone. The load-bearing number is therefore slide 6's
+**30% pass rate**, not the trading setup — and Part 3d shows that pass rate is
+optimistic at the one firm the deck names most.
 
-The 31% itself is at least plausible: for a driftless walk, `P(target before
-drawdown) ≈ DD/(DD+Target)` = 2000/5000 = 40%, and commissions plus slippage
-push a zero-gross-expectancy system below that. But it assumes no eval time
-limit, no minimum-day requirement, and no consistency rule during evaluation.
+The 30% is at least plausible in isolation: for a driftless walk,
+`P(target before drawdown) ≈ DD/(DD+Target)` = 2000/5000 = 40%, and costs push
+a zero-gross-expectancy system below that.
 
-### e. Consistency rules can zero the whole thing, and are never mentioned
+### h. Slide 12 is not a validation
 
-A $4,000 hit on a $50k account makes one day equal **100% of total account
-profit**. Firms that run a consistency rule typically cap the best day at 20–50%
-of total profit for payout eligibility. Under a 30% cap, that $4,000 day is not
-payable until total profit reaches ~$13,300 — meaning you must keep trading, with
-the drawdown re-exposed, exactly when the model says to stop and withdraw. A
-single-trade-to-target design is the worst possible shape for a consistency rule.
-
-Separately: the §5 "idling protocol" — risking $150 to make $150 purely to
-satisfy minimum trading days — is at many firms an explicit T&C breach
-(no-purpose / gaming trades) and grounds for payout denial. This is an execution
-risk, not a moral one: it determines whether the money arrives.
-
-**Verify both rules in the specific firm's T&Cs before spending anything.** They
-are cheaper to check than to discover.
-
-### f. The 1:4 geometry may not exist at 08:30
-
-This is what the script is built to measure. A long enters *below* the −1 SD band
-and targets the VWAP centreline, so reward ≈ one SD band width. For 1:4, the stop
-— placed beyond the far edge of the FVG — must be within **25% of the distance to
-VWAP**:
-
-```
-FVG height + buffer  ≤  0.25 × (entry → VWAP distance)
-```
-
-At 08:30 the midnight-anchored VWAP has accumulated only ~8.5 hours of thin
-overnight volume, so the bands are narrow, while news displacement makes FVGs
-large. Narrow target, wide stop — the inequality frequently fails.
-
-**Read `rejected · no 1:4 geometry` against `trades taken` first.** If rejections
-dominate, the setup does not produce a testable sample, and the 20% claim is not
-false so much as unmeasurable.
-
-### g. Slippage lands precisely where the model is most fragile
-
-$1,000 on NQ ($20/point) is a 50-point stop. On a CPI or NFP print, 5–20 points
-of stop slippage is routine. A slipped stop does not cost one bullet, it costs
-~1.4 — and with only two bullets, an account can die on a single bad fill. The
-bullet model assumes losses are exactly $1,000; in the one window it trades,
-they are not. The script ships `slippage = 4` (1 point), which is optimistic —
-**re-run at 20 and 40 ticks.** If the result inverts, that is the answer.
-
-### h. §6 is not a validation
-
-1,000 trades over 365 days is ~4 per day from one setup inside a 60-minute
-window, gated by FVG formation + band location + tap + reclaim + 1:4 geometry.
-That frequency is not achievable under the rules as written, so the backtest
-measured something looser than the document describes. And a summary of exported
-trade data — by any tool — cannot detect look-ahead bias, unachievable fills, or
-survivorship in the account sample. It is a restatement of the input, not
-evidence.
+1,000 trades over 365 days is ~4/day from one setup inside a 60-minute window,
+gated by gap formation + band location + reclaim + 1:4 geometry. Not achievable
+under slides 10–11 as written, so the run measured something looser. "AI
+Verification: Claude + TradingView" is not verification — summarising exported
+trade data cannot detect look-ahead bias, unachievable fills, or survivorship
+in the account sample.
 
 ## Part 4 — How to use the script
 
-1. NQ1! or MNQ1!, 1m or 5m, `i_simDeath` **off**. Collect ≥ 100 closed trades
-   before reading the hit rate at all; the dashboard greys it below 30.
-2. Check `rejected · no 1:4 geometry`. If it is a large multiple of
-   `trades taken`, stop — Part 3f applies and there is nothing to measure.
-3. Compare the measured hit rate to 7.4% (break-even at $300 CoA) and to 19.8%
-   (break-even at $1,000 CoA), not to the asserted 20%.
-4. Re-run at `slippage` 20 and 40 ticks, and with `i_dispMult` at 0 / 0.5 / 1.5
-   and `i_maxWait` at 10 / 20 / 40. A hit rate that only clears break-even at one
-   parameter set is curve-fit, not an edge.
-5. Then turn `i_simDeath` on to see single-account survival — the cost side §3
+1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
+   `i_simDeath` off. Collect ≥ 100 closed trades; the dashboard greys the hit
+   rate below 30.
+2. Check `rejected · no 1:4 geometry` first. With the reclaim reading's wide
+   sequence-extreme stop this should dominate. If it does, there is no sample
+   and the 20% claim is unmeasurable — stop there.
+3. Compare the measured rate to **7.4%** and **19.8%** (Part 3g), not to the
+   asserted 20%.
+4. Flip `i_fvgMode` to `Continuation` and compare. If continuation tests better,
+   that is evidence the deck's own slide-11 geometry is not the edge.
+5. Re-run at `slippage` 20 and 40 ticks. $1,000 on NQ ($20/pt) is a 50-point
+   stop; 20 points of slip on an 08:30 CPI print costs ~1.4 bullets, and two
+   bullets is the whole account. Shipped at 4 ticks, which is optimistic.
+6. Vary `i_dispMult` (0 / 0.5 / 1.5), `i_maxWait` (10 / 20 / 40),
+   `i_stopBasis`, `i_reclaim`. An edge that clears break-even at one parameter
+   set is curve-fit.
+7. Then `i_simDeath` on, to see single-account survival — the cost side slide 8
    omits.
 
 ## Part 5 — Known limitations
 
-- One unresolved imbalance tracked per direction; a newer FVG overwrites an older
+- One unresolved imbalance per direction; a newer gap overwrites an older
   untriggered one.
-- RR is filtered using the signal-bar close as a proxy entry, but fills occur at
-  the next bar's open (`process_orders_on_close = false`). On a news bar that gap
-  can be large, so *realised* R is worse than *filtered* R. `Avg R per trade`
-  reports the realised figure — compare the two.
-- `i_fixTgt = false` follows the source's wording more literally but breaks the
-  fixed $4,000 payoff the portfolio maths depends on.
-- Requires volume. The dashboard shows `NO VOLUME DATA` when `Σv = 0`.
+- RR is filtered on the signal-bar close but fills occur at the next bar's open
+  (`process_orders_on_close = false`). On a news bar that gap is large, so
+  realised R is worse than filtered R. `Avg R per trade` is the realised
+  figure — compare the two.
+- `i_fixTgt = false` follows "reversion to the central VWAP" more literally but
+  breaks the fixed $4,000 payoff the portfolio maths assumes.
+- Requires volume; dashboard shows `NO VOLUME DATA` when `Σv = 0`.
 - No eval, payout, profit-split, consistency-rule or multi-account modelling.
   Those belong in a portfolio simulator, not Pine.

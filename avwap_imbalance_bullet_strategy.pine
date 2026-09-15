@@ -2,17 +2,24 @@
 // =============================================================================
 // Anchored VWAP + Imbalance ("Bullet") Strategy
 // -----------------------------------------------------------------------------
-// Encodes Section 4 of the "Mathematical Risk Framework" source:
+// Encodes the execution protocol of "The Prop Firm Loophole: A Mathematical
+// Framework for Extraction" (Garland Trader, 14 slides) -- slides 10 and 11:
 //   1. Anchor VWAP at 00:00 New York.
 //   2. Bias gate: longs only below the -1 SD band, shorts only above +1 SD.
-//   3. Detect a 3-candle Fair Value Gap (wick of candle 1 vs wick of candle 3).
-//   4. Enter on a mechanical CLOSE back through the imbalance after price taps it.
+//   3. Detect a 3-candle Fair Value Gap. Slide 11 defines the LONG setup as a
+//      gap between CANDLE 1's LOW and CANDLE 3's HIGH -- i.e. a DOWNWARD
+//      displacement -- entered LONG on a close back above it. That is an
+//      exhaustion/reclaim pattern, not the classic bullish-FVG continuation.
+//      `i_fvgMode` selects which reading; the slide-11 reading is the default.
+//   4. Enter on a mechanical CLOSE back through the imbalance.
 //   5. Target reversion to the VWAP centreline; require >= 1:4 R/R or skip.
 //   6. Execute only inside the 08:30 ET data-release window.
 //
-// Sections 1, 2, 3, 5 and 6 of the source describe a MULTI-ACCOUNT portfolio
-// (evaluation cost, account rotation, payout scheduling). Pine has no concept of
-// more than one account, so none of that is testable here. What this script
+// Slide 10 pins the chart to 1-MINUTE NQ. Slides 1-9 and 12-14 describe a
+// MULTI-ACCOUNT portfolio
+// (evaluation cost, account rotation, payout scheduling) and a coaching offer.
+// Pine has no concept of more than one account, so none of that is testable
+// here. What this script
 // isolates is the single load-bearing empirical claim the whole framework rests
 // on: that the 1:4 setup hits ~20% of the time. Read the "1:4 hit rate" row of
 // the dashboard -- that number alone decides whether the portfolio maths works.
@@ -65,11 +72,29 @@ i_sdMult   = input.float(1.0, "SD band multiple (bias gate)", minval = 0.1, step
 i_flatEOD  = input.bool(true, "Flatten at window close", group = G_SESS,
      tooltip = "Prop risk desks do not let an intraday model hold overnight.")
 
+i_fvgMode  = input.string("Reclaim (slide 11)", "Imbalance reading",
+     options = ["Reclaim (slide 11)", "Continuation (classic FVG)"], group = G_FVG,
+     tooltip = "RECLAIM (the source's own definition): the long setup is a gap "
+             + "between candle 1's LOW and candle 3's HIGH -- a downward "
+             + "displacement into the discount zone -- entered long on a close "
+             + "back ABOVE that gap. Exhaustion reversal.\n\n"
+             + "CONTINUATION: the conventional bullish FVG (candle 1's high below "
+             + "candle 3's low) tapped and held as support. This is what most "
+             + "FVG scripts mean, and it is NOT what the source describes.")
+i_stopBasis= input.string("Auto (per mode)", "Stop reference",
+     options = ["Auto (per mode)", "Sequence extreme", "Gap far edge"], group = G_TRD,
+     tooltip = "Reclaim mode places the stop beyond the 3-candle swing extreme "
+             + "(the displacement low for a long), because the gap's far edge sits "
+             + "above that low and would be run first. That stop is WIDE, which is "
+             + "exactly why 1:4 geometry is scarce -- see the rejection counter.")
 i_dispMult = input.float(1.0, "Displacement: middle candle range >= x ATR(14)",
      minval = 0.0, step = 0.1, group = G_FVG,
      tooltip = "The source says an 'aggressive candle creates a price "
              + "displacement' but never quantifies it. Set 0 to disable.")
-i_needBody = input.bool(true, "Middle candle must close in gap direction", group = G_FVG)
+i_needBody = input.bool(true, "Displacement candle must close in gap direction",
+     group = G_FVG,
+     tooltip = "In reclaim mode the displacement candle is AGAINST the trade: a "
+             + "bearish candle 2 precedes a long. That is the exhaustion premise.")
 i_reclaim  = input.string("Far edge", "Reclaim level",
      options = ["Far edge", "Midpoint"], group = G_FVG,
      tooltip = "'Far edge' = a close fully back through the imbalance (strict "
@@ -120,6 +145,13 @@ if timeframe.isdwm
          + "08:30 execution window cannot be evaluated on daily or higher bars. "
          + "Use 1m-15m; the source implies 1m-5m on NQ.")
 
+// Slide 10 specifies a 1-minute chart. Higher timeframes change FVG frequency
+// and stop width materially, so the 1:4 geometry result is not transferable.
+var bool tfWarned = false
+if not tfWarned and not (timeframe.period == "1" or timeframe.period == "3"
+     or timeframe.period == "5")
+    tfWarned := true
+
 // -----------------------------------------------------------------------------
 // 3. Session & anchor detection
 // -----------------------------------------------------------------------------
@@ -160,77 +192,114 @@ bandDn = avwapV - i_sdMult * vwSD
 hasVol = sumV > 0
 
 // -----------------------------------------------------------------------------
-// 5. Fair Value Gap detection  ([2] = first, [1] = displacement, [0] = third)
+// 5. Imbalance detection  ([2] = candle 1, [1] = candle 2/displacement, [0] = candle 3)
 // -----------------------------------------------------------------------------
 atrV     = ta.atr(14)
 midRange = high[1] - low[1]
 dispOK   = i_dispMult <= 0 or na(atrV[1]) or midRange >= i_dispMult * atrV[1]
 
-bullBody = not i_needBody or close[1] > open[1]
-bearBody = not i_needBody or close[1] < open[1]
+bullDisp = not i_needBody or close[1] > open[1]
+bearDisp = not i_needBody or close[1] < open[1]
 
-newBull = high[2] < low[0]  and dispOK and bullBody
-newBear = low[2]  > high[0] and dispOK and bearBody
+// Two geometries. upGap = candle 1's HIGH below candle 3's LOW (upward
+// displacement). dnGap = candle 1's LOW above candle 3's HIGH (downward
+// displacement) -- this is the one slide 11 draws for its LONG setup.
+upGap = high[2] < low[0] and dispOK and bullDisp
+dnGap = low[2]  > high[0] and dispOK and bearDisp
+
+recl  = i_fvgMode == "Reclaim (slide 11)"
+
+// Long side: reclaim uses the DOWN gap, continuation uses the UP gap.
+formL = recl ? dnGap : upGap
+lTopN = recl ? low[2]  : low[0]     // gap upper edge  = the long trigger level
+lBotN = recl ? high[0] : high[2]    // gap lower edge
+// Short side: mirror.
+formS = recl ? upGap : dnGap
+sTopN = recl ? low[0]  : low[2]
+sBotN = recl ? high[2] : high[0]    // gap lower edge  = the short trigger level
+
+seqLo = math.min(math.min(low[0],  low[1]),  low[2])
+seqHi = math.max(math.max(high[0], high[1]), high[2])
+
+// In reclaim mode price starts on the far side of the gap and must travel
+// through it, so there is nothing to "tap" first. In continuation mode price
+// must return into the gap before the reclaim counts.
+needTap = not recl
 
 // -----------------------------------------------------------------------------
 // 6. Imbalance state (most recent unresolved zone per direction)
 // -----------------------------------------------------------------------------
-var float bullTop = na      // upper edge of the bullish gap  = low[0]
-var float bullBot = na      // lower edge                     = high[2]
-var bool  bullTap = false
-var int   bullAge = 0
+var float lTop  = na
+var float lBot  = na
+var float lSwLo = na
+var bool  lTapped = false
+var int   lAge  = 0
 
-var float bearTop = na      // upper edge of the bearish gap  = low[2]
-var float bearBot = na      // lower edge                     = high[0]
-var bool  bearTap = false
-var int   bearAge = 0
+var float sTop  = na
+var float sBot  = na
+var float sSwHi = na
+var bool  sTapped = false
+var int   sAge  = 0
 
 tickSz = syminfo.mintick
 
-if newBull
-    bullTop := low[0]
-    bullBot := high[2]
-    bullTap := false
-    bullAge := 0
+if formL
+    lTop    := lTopN
+    lBot    := lBotN
+    lSwLo   := seqLo
+    lTapped := not needTap
+    lAge    := 0
 
-if newBear
-    bearTop := low[2]
-    bearBot := high[0]
-    bearTap := false
-    bearAge := 0
+if formS
+    sTop    := sTopN
+    sBot    := sBotN
+    sSwHi   := seqHi
+    sTapped := not needTap
+    sAge    := 0
 
-if not na(bullTop) and not newBull
-    bullAge += 1
-if not na(bearTop) and not newBear
-    bearAge += 1
+if not na(lTop) and not formL
+    lAge += 1
+if not na(sTop) and not formS
+    sAge += 1
 
-// Invalidate: a close through the far side means the imbalance failed, not held.
-if not na(bullBot) and close < bullBot
-    bullTop := na
-    bullBot := na
-    bullTap := false
-if not na(bearTop) and close > bearTop
-    bearTop := na
-    bearBot := na
-    bearTap := false
+// Expire on age
+if not na(lTop) and lAge > i_maxWait
+    lTop := na
+    lBot := na
+    lSwLo := na
+    lTapped := false
+if not na(sTop) and sAge > i_maxWait
+    sTop := na
+    sBot := na
+    sSwHi := na
+    sTapped := false
 
-if not na(bullTop) and bullAge > i_maxWait
-    bullTop := na
-    bullBot := na
-    bullTap := false
-if not na(bearTop) and bearAge > i_maxWait
-    bearTop := na
-    bearBot := na
-    bearTap := false
+// Invalidate: price takes out the structure the stop would sit behind.
+if not na(lSwLo) and close < lSwLo
+    lTop := na
+    lBot := na
+    lSwLo := na
+    lTapped := false
+if not na(sSwHi) and close > sSwHi
+    sTop := na
+    sBot := na
+    sSwHi := na
+    sTapped := false
 
-// Tap = price traded into the gap
-if not na(bullTop) and low <= bullTop
-    bullTap := true
-if not na(bearBot) and high >= bearBot
-    bearTap := true
+// Continuation mode only: price must trade back into the gap first.
+if needTap and not na(lTop) and low <= lTop
+    lTapped := true
+if needTap and not na(sBot) and high >= sBot
+    sTapped := true
 
-bullRec = i_reclaim == "Midpoint" and not na(bullTop) ? (bullTop + bullBot) / 2.0 : bullTop
-bearRec = i_reclaim == "Midpoint" and not na(bearTop) ? (bearTop + bearBot) / 2.0 : bearBot
+lRecLvl = i_reclaim == "Midpoint" and not na(lTop) ? (lTop + lBot) / 2.0 : lTop
+sRecLvl = i_reclaim == "Midpoint" and not na(sTop) ? (sTop + sBot) / 2.0 : sBot
+
+// Stop reference. Reclaim mode must use the sequence extreme: the gap's far
+// edge sits INSIDE the displacement candle and would be taken out first.
+useSeq = i_stopBasis == "Sequence extreme" or (i_stopBasis == "Auto (per mode)" and recl)
+lStopRef = useSeq ? lSwLo : lBot
+sStopRef = useSeq ? sSwHi : sTop
 
 // -----------------------------------------------------------------------------
 // 7. Bullet account state
@@ -252,16 +321,16 @@ if i_simDeath and bulUsed >= i_bullets
 allowLong  = i_dirMode != "Short only"
 allowShort = i_dirMode != "Long only"
 
-// Bias gate: the source permits longs only in the discount zone (below -1 SD)
-// and shorts only in the premium zone (above +1 SD).
-longBias  = not na(bandDn) and bullRec < bandDn
-shortBias = not na(bandUp) and bearRec > bandUp
+// Bias gate (slide 10): longs strictly below the lower 1st SD band, shorts
+// strictly above the upper band.
+longBias  = not na(bandDn) and not na(lRecLvl) and lRecLvl < bandDn
+shortBias = not na(bandUp) and not na(sRecLvl) and sRecLvl > bandUp
 
-rawLong  = bullTap and not na(bullRec) and close > bullRec and close[1] <= bullRec
-rawShort = bearTap and not na(bearRec) and close < bearRec and close[1] >= bearRec
+rawLong  = lTapped and not na(lRecLvl) and close > lRecLvl and close[1] <= lRecLvl
+rawShort = sTapped and not na(sRecLvl) and close < sRecLvl and close[1] >= sRecLvl
 
-lStop = not na(bullBot) ? bullBot - i_stopBuf * tickSz : na
-sStop = not na(bearTop) ? bearTop + i_stopBuf * tickSz : na
+lStop = not na(lStopRef) ? lStopRef - i_stopBuf * tickSz : na
+sStop = not na(sStopRef) ? sStopRef + i_stopBuf * tickSz : na
 
 lRisk = not na(lStop) ? close - lStop : na
 sRisk = not na(sStop) ? sStop - close : na
@@ -287,7 +356,7 @@ var int cRejRR  = 0     // rejected: 1:4 geometry unavailable
 var int cRejQty = 0     // rejected: stop too wide to size even 1 contract
 var int cTaken  = 0
 
-if inWindow and (newBull or newBear)
+if inWindow and (formL or formS)
     cFVG += 1
 
 trigAny = (rawLong and allowLong) or (rawShort and allowShort)
@@ -401,12 +470,12 @@ plot(i_showLvl and strategy.position_size != 0 ? pStop : na, "Stop",
 plot(i_showLvl and strategy.position_size != 0 ? liveTgt : na, "Target",
      color = color.new(color.lime, 0), style = plot.style_linebr, linewidth = 2)
 
-if i_showFVG and newBull
-    box.new(bar_index - 2, low[0], bar_index + i_maxWait, high[2],
+if i_showFVG and formL
+    box.new(bar_index - 2, lTopN, bar_index + i_maxWait, lBotN,
          border_color = color.new(color.green, 30),
          bgcolor = color.new(color.green, 86))
-if i_showFVG and newBear
-    box.new(bar_index - 2, low[2], bar_index + i_maxWait, high[0],
+if i_showFVG and formS
+    box.new(bar_index - 2, sTopN, bar_index + i_maxWait, sBotN,
          border_color = color.new(color.red, 30),
          bgcolor = color.new(color.red, 86))
 
@@ -422,7 +491,7 @@ bgcolor(inWindow ? color.new(color.blue, 94) : na, title = "Execution window")
 // -----------------------------------------------------------------------------
 // 14. Dashboard
 // -----------------------------------------------------------------------------
-var table dash = table.new(position.top_right, 2, 15,
+var table dash = table.new(position.top_right, 2, 16,
      bgcolor = color.new(color.black, 12), border_width = 1, border_color = color.new(color.gray, 60))
 
 f_row(int r, string k, string v, color c) =>
@@ -433,33 +502,36 @@ f_row(int r, string k, string v, color c) =>
 
 if i_showTbl and barstate.islast
     table.merge_cells(dash, 0, 0, 1, 0)
-    table.cell(dash, 0, 0, "AVWAP Imbalance 1:" + str.tostring(i_minRR, "#.#"),
+    table.cell(dash, 0, 0, "AVWAP Imbalance 1:" + str.tostring(i_minRR, "#.#")
+         + (tfWarned ? "  (source: 1m)" : ""),
          text_color = color.white, text_size = size.normal, bgcolor = color.new(color.blue, 55))
 
     hitCol = nClosed < 30 ? color.gray : hitRate >= 20.0 ? color.lime
                : hitRate >= beRate ? color.orange : color.red
 
-    f_row(1,  "Imbalances in window", str.tostring(cFVG),        color.silver)
-    f_row(2,  "Reclaim triggers",      str.tostring(cTrig),       color.silver)
-    f_row(3,  "  rejected · bias zone",str.tostring(cRejBia),     color.orange)
-    f_row(4,  "  rejected · no 1:" + str.tostring(i_minRR, "#.#") + " geometry",
+    f_row(1,  "Reading", recl ? "reclaim (slide 11)" : "continuation",
+              recl ? color.aqua : color.orange)
+    f_row(2,  "Imbalances in window", str.tostring(cFVG),        color.silver)
+    f_row(3,  "Reclaim triggers",      str.tostring(cTrig),       color.silver)
+    f_row(4,  "  rejected · bias zone",str.tostring(cRejBia),     color.orange)
+    f_row(5,  "  rejected · no 1:" + str.tostring(i_minRR, "#.#") + " geometry",
                                        str.tostring(cRejRR),      color.orange)
-    f_row(5,  "  rejected · stop too wide", str.tostring(cRejQty),color.orange)
-    f_row(6,  "Trades taken",          str.tostring(cTaken),      color.aqua)
-    f_row(7,  "Closed / wins",         str.tostring(nClosed) + " / " + str.tostring(nWin),
+    f_row(6,  "  rejected · stop too wide", str.tostring(cRejQty),color.orange)
+    f_row(7,  "Trades taken",          str.tostring(cTaken),      color.aqua)
+    f_row(8,  "Closed / wins",         str.tostring(nClosed) + " / " + str.tostring(nWin),
                                                                   color.silver)
-    f_row(8,  "1:" + str.tostring(i_minRR, "#.#") + " HIT RATE",
+    f_row(9,  "1:" + str.tostring(i_minRR, "#.#") + " HIT RATE",
                                        str.tostring(hitRate, "#.#") + " %", hitCol)
-    f_row(9,  "  source asserts",      "20.0 %",                  color.gray)
-    f_row(10, "  gross break-even",    str.tostring(beRate, "#.#") + " %", color.gray)
-    f_row(11, "Avg R per trade",       str.tostring(avgR, "#.##") + " R",
+    f_row(10,  "  source asserts",      "20.0 %",                  color.gray)
+    f_row(11, "  gross break-even",    str.tostring(beRate, "#.#") + " %", color.gray)
+    f_row(12, "Avg R per trade",       str.tostring(avgR, "#.##") + " R",
               avgR > 0 ? color.lime : color.red)
-    f_row(12, "Net P&L",               "$" + str.tostring(strategy.netprofit, "#"),
+    f_row(13, "Net P&L",               "$" + str.tostring(strategy.netprofit, "#"),
               strategy.netprofit > 0 ? color.lime : color.red)
-    f_row(13, "Bullets spent (of " + str.tostring(i_bullets) + ")",
+    f_row(14, "Bullets spent (of " + str.tostring(i_bullets) + ")",
                                        str.tostring(bulUsed, "#.##"),
               bulUsed >= i_bullets ? color.red : color.silver)
-    f_row(14, "Account", acctDead ? "DEAD" : hasVol ? "alive" : "NO VOLUME DATA",
+    f_row(15, "Account", acctDead ? "DEAD" : hasVol ? "alive" : "NO VOLUME DATA",
               acctDead ? color.red : hasVol ? color.lime : color.orange)
 
 // -----------------------------------------------------------------------------
