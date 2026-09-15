@@ -519,6 +519,76 @@ that cannot fire — nothing in the deck survives contact with its own data.
 Getting to a defensible answer needs n ≈ 200–400 *per window* (Part 3c), i.e.
 roughly 1–2 years of 1-minute data, not 32 days.
 
+## Part 3f — 47 days, n=220, three sequential blocks: no edge
+
+`data/mnq1_1m_tradingview.csv` now merges three contiguous MNQ1! 1-minute
+exports: **2026-07-12 → 2026-09-15, 64,620 bars, 47 trading days.** The three
+blocks were supplied in reverse chronological order, so each earlier block is
+a clean out-of-sample test of conclusions already drawn from the later ones.
+
+### avg R by block (fixed 4R target, 1 pt/side slippage)
+
+| Window | Jul 12–31 | Aug 2–21 | Aug 23–Sep 15 | ALL |
+|---|---|---|---|---|
+| 0830–0930 premkt | **−0.377** | +0.103 | +0.578 | +0.178 (n=31) |
+| 0930–1600 RTH | +0.105 | **−0.029** | +0.691 | +0.226 (n=103) |
+| 1300–1600 afternoon | **−0.120** | +0.041 | +0.644 | +0.153 (n=68) |
+| 1800–1700 all session | **−0.060** | **−0.050** | +0.302 | +0.061 (n=220) |
+
+**Only the Aug 23 – Sep 15 block is positive, in every window.** That block is
+exactly the data Parts 3b–3d were built on. The two earlier blocks are zero to
+negative throughout. One favourable three-week stretch produced the entire
+apparent edge.
+
+### Full-sample verdict
+
+| Window | n | hit | 95% CI (hit) | avg R | 95% CI (avg R) | P(avg R ≤ 0) |
+|---|---|---|---|---|---|---|
+| 0830–0930 premkt | 31 | 16.1% | [7.1, 32.6] | +0.178 | [−0.38, +0.79] | 28.6% |
+| 0930–1030 the open | **4** | — | — | +0.710 | [−0.59, +2.57] | 25.5% |
+| 0930–1600 RTH | 103 | 21.4% | [14.5, 30.2] | +0.226 | [−0.11, +0.58] | 9.7% |
+| 1300–1600 afternoon | 68 | 17.6% | [10.4, 28.4] | +0.153 | [−0.24, +0.56] | 23.3% |
+| **1800–1700 all session** | **220** | **24.1%** | **[18.9, 30.2]** | **+0.061** | **[−0.17, +0.30]** | **31.0%** |
+
+Note the hit-rate metric has now stopped flattering it too: at n=136 the
+all-session CI was [20.4%, 35.2%], clearing the 19.8% worst-case break-even.
+At n=220 it is **[18.9%, 30.2%]** — the lower bound has fallen *below*
+break-even as data accumulated.
+
+### Abundant 1:4 geometry does not mean edge — a prior suggestion was wrong
+
+Part 3e observed that 13:00–15:00 ET clears 1:4 on 85–86% of triggers and
+suggested that window was "the thing worth testing". **With 47 days it is
+refuted.** Geometry availability and expectancy are unrelated:
+
+| Hour ET | triggers | median stop | share ≥ 1:4 | n | avg R | sum R |
+|---|---|---|---|---|---|---|
+| 06:00 | 222 | 14.0 pt | 59.3% | 21 | −0.455 | **−9.56** |
+| 07:00 | 206 | 20.8 pt | 38.7% | 18 | −0.662 | **−11.91** |
+| 08:00 premarket | 229 | 22.0 pt | 51.4% | 28 | +0.035 | +0.98 |
+| 09:00 (open) | 228 | 34.8 pt | 31.1% | 17 | +0.153 | +2.60 |
+| 10:00 (post-bell) | 198 | **39.8 pt** | **19.5%** | 5 | −0.185 | −0.92 |
+| 13:00 | 225 | 20.2 pt | **83.3%** | 31 | −0.147 | −4.54 |
+| 14:00 | 234 | 18.0 pt | **78.4%** | 26 | −0.035 | −0.91 |
+| 15:00 | 227 | 22.5 pt | **82.6%** | 26 | −0.156 | −4.05 |
+
+The three hours with the *best* 1:4 availability (13:00–15:00, 78–83%) are all
+**negative**. The 06:00–07:00 hours combine decent availability with the worst
+expectancy in the day (−21.5 R combined). Whether a 1:4 target is reachable
+says nothing about whether it is reached.
+
+The strict open window remains structurally unusable: **n=4 in 47 days**,
+median stop 39.8 pt post-bell, 19.5% of triggers clearing 1:4.
+
+### Conclusion on the execution layer
+
+47 trading days, 220 trades, three sequential out-of-sample blocks, every
+window tested: **avg R +0.061, P(avg R ≤ 0) = 31%. No edge.** The setup is
+well-specified and the geometry is real; the expectancy is not. Nothing
+remains of the deck's $498,000, its "$20,000 week", or the 20% hit rate its
+bullet arithmetic depends on — and that arithmetic was already broken on its
+own terms (Parts 3a–3d).
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
