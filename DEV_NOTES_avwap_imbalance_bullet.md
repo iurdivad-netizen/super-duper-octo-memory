@@ -679,6 +679,78 @@ three blocks at −0.92 and −0.55. That is a fitted cell, not a stable effect.
   establishing one would need a fresh out-of-sample period, not more cells
   from these 47 days.
 
+## Part 3h — The 25 pt / 1.1 R reading: the decisive test
+
+A reported observation of the creator's actual trading: **~25 point stop,
+~1.1 reward:risk** — not the deck's 1:4. This is far more testable than
+anything above, because it removes the scarce 1:4-to-VWAP geometry filter and
+the sample jumps from n=220 to **n=770**. Cost/R at a 25 pt stop is 8.8%, so
+costs are no longer an excuse either.
+
+### It first contradicts the deck's own arithmetic
+
+| | Deck (slides 5–8) | Reported actual |
+|---|---|---|
+| R:R | 1:4 | **1.1** |
+| Win rate needed (gross) | 20% | **47.6%** |
+| Win rate needed (after costs) | ~20% | **51.8%** |
+| Premise | "viable with **zero edge**" | requires a genuine ~52% edge |
+
+At 1.1 R you cannot "exploit variance with no expected value" — slide 5's
+whole claim. And a $4,000 payout needs ~3.6 net R of grinding rather than one
+lucky trade, re-exposing the drawdown repeatedly. **If the creator really
+trades 25 pt / 1.1 R, slides 5–8 describe a method they do not use.**
+
+### Measured: below break-even in every configuration
+
+Fixed 25 pt stop, 1.1 R target, bias gate kept, no distance-to-VWAP filter:
+
+| Variant | n | win% | avg R | 95% CI | P(≤0) | Jul | Aug1 | Aug2 |
+|---|---|---|---|---|---|---|---|---|
+| close-thru, 18:00 anchor | 770 | 43.9% | **−0.130** | **[−0.21, −0.05]** | 100% | −0.18 | −0.09 | −0.11 |
+| close-thru, 01:00 (deck) | 747 | 45.4% | −0.098 | [−0.18, −0.02] | 99% | −0.14 | −0.11 | −0.04 |
+| RETEST, 18:00 | 640 | 45.3% | −0.078 | [−0.16, +0.00] | 97% | −0.16 | −0.01 | −0.05 |
+| **RETEST, 01:00 (deck)** | **617** | **48.6%** | **−0.008** | **[−0.09, +0.08]** | 59% | −0.07 | −0.04 | +0.09 |
+| continuation FVG, 18:00 | 568 | 46.3% | −0.078 | [−0.17, +0.01] | 96% | −0.09 | −0.13 | −0.00 |
+
+Break-even is 51.8%. Every variant's win rate is **below** it. The best
+configuration found anywhere in this exercise — retest entry on the deck's own
+midnight-CT anchor — lands at **avg R −0.008 on n=617: exactly zero.**
+
+### The stop/target grid removes the last escape
+
+Twenty combinations, n = 477–973 each, cost/R 5.5–14.7%:
+
+| Stop | R:R | cost/R | break-even win% | n | actual win% | **gap** | avg R | P(≤0) |
+|---|---|---|---|---|---|---|---|---|
+| 15 | 1.0 | 14.7% | 57.3 | 973 | 45.4 | **−11.9** | −0.159 | 100% |
+| 20 | 1.1 | 11.0% | 52.9 | 856 | 43.8 | **−9.1** | −0.116 | 100% |
+| **25** | **1.1** | 8.8% | 51.8 | 770 | 43.9 | **−7.9** | −0.130 | 100% |
+| 25 | 2.0 | 8.8% | 36.3 | 678 | 32.0 | −4.3 | −0.101 | 97% |
+| 30 | 1.1 | 7.3% | 51.1 | 686 | 46.5 | **−4.6** | −0.039 | 94% |
+| 40 | 1.0 | 5.5% | 52.8 | 581 | 48.0 | −4.7 | −0.056 | 95% |
+
+**The win rate falls short of break-even in all 20 cells, by 4.3 to 11.9
+percentage points, with P(avg R ≤ 0) ≥ 94% everywhere.** This is not a
+cost problem, a stop-width problem, an R:R problem, or a sample-size problem.
+The entry's raw hit rate simply does not reach break-even at any setting.
+
+### What this does and does not establish
+
+Establishes: **the mechanical entry the deck specifies has no edge.** Slide 11
+claims "this mechanical, rules-based entry removes emotion and provides the
+technical edge needed to shatter the baseline 20% win rate." Tested
+mechanically at n=770 across 20 stop/target combinations and four VWAP
+anchors, it does not reach break-even anywhere.
+
+Does not establish: that the creator is unprofitable. If their entries are
+discretionary — screen-reading at the open rather than firing on a 3-candle
+pattern — a mechanical FVG trigger will not reproduce them, and this test says
+nothing about their results. But that is the point: **the deck sells a
+mechanical system, and the mechanical system is what fails.** Any edge living
+in discretion is precisely what the 12-week programme (slide 14) cannot
+transfer through a rules list.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,

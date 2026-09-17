@@ -53,7 +53,7 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
         slip_ticks=4.0, comm_per_side=2.04, reclaim_mid=False,
         stop_basis="auto", bias_on_entry=False, use_tv_vwap=False,
         anchor_hour=0, fixed_r_target=None, flat_eod=True,
-        trig_level='top', entry_mode='market', retest_bars=15, min_stop_pts=0.0):
+        trig_level='top', entry_mode='market', retest_bars=15, min_stop_pts=0.0, fixed_stop_pts=None):
 
     n = len(rows)
     tr = [None]*n
@@ -129,7 +129,10 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
             for a in armed:
                 touched = (l <= a["lvl"]) if a["dir"]>0 else (h >= a["lvl"])
                 if not touched: continue
-                ep = a["lvl"]; risk2 = a["dir"]*(ep - a["stop"])
+                ep = a["lvl"]
+                st2 = (ep - a["dir"]*fixed_stop_pts) if fixed_stop_pts else a["stop"]
+                a = dict(a, stop=st2)
+                risk2 = a["dir"]*(ep - a["stop"])
                 if risk2 <= 0: continue
                 if risk2 < min_stop_pts: continue
                 q2 = min(int(bullet//(risk2*point_value)), 50) if risk2*point_value>0 else 0
@@ -174,7 +177,7 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
                       lBot if trig_level=='bot' else lTop)
                 fired = (c > lvl) and (c1 <= lvl)
                 stop_ref = lSw if use_seq else lBot
-                stop = stop_ref - stop_buf_ticks*tick
+                stop = (c - fixed_stop_pts) if fixed_stop_pts else (stop_ref - stop_buf_ticks*tick)
                 risk = c - stop; rew = (vw[i]-c) if vw[i] else None
                 bias_lvl = c if bias_on_entry else lvl
                 bias = (sd[i] is not None) and bias_lvl < (vw[i]-sd_mult*sd[i])
@@ -183,7 +186,7 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
                       sTop if trig_level=='bot' else sBot)
                 fired = (c < lvl) and (c1 >= lvl)
                 stop_ref = sSw if use_seq else sTop
-                stop = stop_ref + stop_buf_ticks*tick
+                stop = (c + fixed_stop_pts) if fixed_stop_pts else (stop_ref + stop_buf_ticks*tick)
                 risk = stop - c; rew = (c-vw[i]) if vw[i] else None
                 bias_lvl = c if bias_on_entry else lvl
                 bias = (sd[i] is not None) and bias_lvl > (vw[i]+sd_mult*sd[i])
