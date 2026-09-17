@@ -52,7 +52,8 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
         point_value=20.0, bullet=1000.0, sess=(8*60+30, 9*60+30),
         slip_ticks=4.0, comm_per_side=2.04, reclaim_mid=False,
         stop_basis="auto", bias_on_entry=False, use_tv_vwap=False,
-        anchor_hour=0, fixed_r_target=None, flat_eod=True):
+        anchor_hour=0, fixed_r_target=None, flat_eod=True,
+        trig_level='top', entry_mode='market', retest_bars=15, min_stop_pts=0.0):
 
     n = len(rows)
     tr = [None]*n
@@ -91,6 +92,7 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
     lTop=lBot=lSw=None; lAge=0
     sTop=sBot=sSw=None; sAge=0
     pos=None  # dict(dir, entry, stop, tgt, qty, i)
+    armed=[]
     trades=[]
 
     for i in range(2, n):
@@ -121,6 +123,21 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
                 trades.append(dict(dt=pos["dt"], dir=pos["dir"], why=why, net=net,
                                    R=net/bullet, rr=pos["rr"], risk=pos["riskpts"]))
                 pos=None
+
+        if entry_mode == 'retest' and pos is None and armed:
+            armed = [a for a in armed if a["exp"] >= i]
+            for a in armed:
+                touched = (l <= a["lvl"]) if a["dir"]>0 else (h >= a["lvl"])
+                if not touched: continue
+                ep = a["lvl"]; risk2 = a["dir"]*(ep - a["stop"])
+                if risk2 <= 0: continue
+                if risk2 < min_stop_pts: continue
+                q2 = min(int(bullet//(risk2*point_value)), 50) if risk2*point_value>0 else 0
+                if q2 < 1: continue
+                tgt = (ep + a["dir"]*fixed_r_target*risk2) if fixed_r_target else a["vw"]
+                pos = dict(dir=a["dir"], entry=ep, stop=a["stop"], tgt=tgt, qty=q2,
+                           rr=(a["dir"]*(tgt-ep))/risk2, riskpts=risk2, dt=r["dt"])
+                C["taken"] += 1; armed=[]; break
 
         disp_ok = (disp_mult<=0) or (atr[i-1] is None) or ((h1-l1) >= disp_mult*atr[i-1])
         bull_disp = (not need_body) or (c1 > o1)
@@ -153,7 +170,8 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
             if d>0 and lTop is None: continue
             if d<0 and sTop is None: continue
             if d>0:
-                lvl = (lTop+lBot)/2.0 if reclaim_mid else lTop
+                lvl = (lTop+lBot)/2.0 if (reclaim_mid or trig_level=='mid') else (
+                      lBot if trig_level=='bot' else lTop)
                 fired = (c > lvl) and (c1 <= lvl)
                 stop_ref = lSw if use_seq else lBot
                 stop = stop_ref - stop_buf_ticks*tick
@@ -161,7 +179,8 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
                 bias_lvl = c if bias_on_entry else lvl
                 bias = (sd[i] is not None) and bias_lvl < (vw[i]-sd_mult*sd[i])
             else:
-                lvl = (sTop+sBot)/2.0 if reclaim_mid else sBot
+                lvl = (sTop+sBot)/2.0 if (reclaim_mid or trig_level=='mid') else (
+                      sTop if trig_level=='bot' else sBot)
                 fired = (c < lvl) and (c1 >= lvl)
                 stop_ref = sSw if use_seq else sTop
                 stop = stop_ref + stop_buf_ticks*tick
@@ -176,10 +195,17 @@ def run(rows, *, mode="reclaim", min_rr=4.0, sd_mult=1.0, disp_mult=1.0,
             C["rr_avail"].append(rr); C["risk_pts"].append(risk)
             if rr < min_rr:
                 C["rej_rr"] += 1; continue
+            if risk < min_stop_pts:
+                continue
             qty = min(int(bullet//(risk*point_value)), 50) if risk*point_value>0 else 0
             if qty < 1:
                 C["rej_qty"] += 1; continue
-            if pos is None and i+1 < n:
+            if pos is not None: continue
+            if entry_mode == 'retest':
+                armed.append(dict(dir=d, lvl=lvl, stop=stop, vw=vw[i],
+                                  exp=i+retest_bars, dt=r["dt"], rr=rr))
+                continue
+            if i+1 < n:
                 ep = rows[i+1]["o"] + d*slip_ticks*tick
                 tgt = (ep + d*fixed_r_target*risk) if fixed_r_target else vw[i]
                 pos = dict(dir=d, entry=ep, stop=stop,

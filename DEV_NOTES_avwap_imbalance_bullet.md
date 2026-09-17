@@ -589,6 +589,96 @@ remains of the deck's $498,000, its "$20,000 week", or the 20% hit rate its
 bullet arithmetic depends on — and that arithmetic was already broken on its
 own terms (Parts 3a–3d).
 
+## Part 3g — Anchor sweep, entry mechanics, and a correction
+
+### Correction: the n=220 headline was a biased subsample
+
+Parts 3b–3f used TradingView's supplied `New York VWAP` column. That column is
+**empty on 30.5% of bars (19,740 of 64,620) — the entire 18:00–00:00 ET globex
+evening.** Those bars were silently skipped, so the n=220 / avg R +0.061
+result covered only the part of the session TradingView had populated.
+
+With the VWAP recomputed over **all** bars, every anchor is **negative**:
+
+| VWAP anchor | n | hit | avg R | 95% CI | P(≤0) | Jul | Aug1 | Aug2 |
+|---|---|---|---|---|---|---|---|---|
+| **18:00 ET globex open** | 424 | 18.6% | **−0.180** | **[−0.34, −0.02]** | 99% | −0.18 | −0.26 | −0.11 |
+| 00:00 ET midnight NY | 384 | 20.3% | −0.103 | [−0.27, +0.07] | 89% | −0.08 | −0.15 | −0.09 |
+| 01:00 ET midnight CT (deck) | 378 | 20.6% | **−0.082** | [−0.25, +0.09] | 84% | −0.11 | −0.18 | +0.02 |
+| 09:30 ET cash open | 514 | 18.3% | **−0.187** | **[−0.34, −0.04]** | 99% | −0.19 | −0.14 | −0.22 |
+| TV column (30% of bars missing) | 220 | 24.1% | +0.061 | [−0.17, +0.31] | 31% | −0.06 | −0.05 | +0.30 |
+
+**Answer to "is 18:00 an improvement": no — it is the worst anchor tested**,
+with a CI that excludes zero on the negative side and all three
+out-of-sample blocks negative. The deck's own 01:00 ET (midnight CT) anchor is
+the least bad. None is positive. The earlier "expectancy ≈ zero" verdict was
+optimistic; corrected, it is negative.
+
+### The entry timing observation was right, and it is the key diagnosis
+
+In reclaim mode price starts *below* the gap and the trigger is
+`close > gap top`. To close above the top, price must rally through the
+**entire** gap — so **at the moment of entry the imbalance is fully filled and
+no longer exists.** The entry is at the far edge of the displacement with the
+stop back at the swing low, which is why median stops were 18–40 pt.
+
+Waiting for a **retest** of the reclaimed level instead (limit at the gap edge,
+stop just beyond the gap) fixes exactly that. Measured, all-session, 18:00
+anchor, fixed 4R:
+
+| Entry mechanic | n | hit | median stop | **GROSS avg R** | NET avg R |
+|---|---|---|---|---|---|
+| close > gap top (as implemented) | 424 | 18.6% | 18.2 pt | **−0.074** | −0.180 |
+| **RETEST gap top, stop beyond gap** | 866 | **23.8%** | **3.0 pt** | **+0.178** | **−0.199** |
+
+**Before costs the retest entry turns a no-edge signal into a positive one**
+(−0.074 → +0.178 avg R). The observation identified a real defect and the fix
+genuinely improves signal quality.
+
+It still loses, for a different reason: the retest stop sits 3.0 points away,
+and transaction costs are then **73.5% of the risk unit.**
+
+### Costs, not signal quality, are what kill it
+
+Cost per R depends only on stop width — it is invariant to position size:
+
+```
+cost/R = 2·slip_pts/stop_pts + 2·commission/(stop_pts · point_value)
+```
+
+| Stop (pts) | cost/R at 1 pt/side + $2.04/side |
+|---|---|
+| 3.0 | **73.5%** |
+| 8 | 28.3% |
+| 11.5 | 19.2% |
+| 15.8 | 14.0% |
+| 20.8 | 10.6% |
+
+On NQ the stop must be ≥ ~12–15 points before costs fall under 15% of R. The
+deck's tight-FVG entries do not produce stops that wide, and its
+"$1,000 risk per bullet" sizing forces 6–12 contracts on a small stop, so
+slippage and commission scale straight into the risk unit.
+
+Forcing a ≥12 pt stop does produce the only positive cell found:
+n=54, hit 27.8%, gross +0.286, **net +0.237**, P(≤0) = 18%, blocks
++0.28 / −0.03 / +0.32. **It is not evidence.** Several hundred cells were
+tested this session (≈5 anchors × 9 entry mechanics × 5 windows × 8 stop
+filters × target and slippage modes); dozens of cells at P(≤0)≈0.2 are
+expected from noise alone. Its neighbours are non-monotonic (min-stop 6 gives
+gross −0.232 against min-stop 0's +0.178) and the min-stop 15 cell has two of
+three blocks at −0.92 and −0.55. That is a fitted cell, not a stable effect.
+
+### Where the execution layer actually stands
+
+- The signal has **no edge as the deck specifies the entry** (−0.074 gross).
+- Fixing the entry to a retest gives a **real gross edge (+0.178)** that is
+  entirely consumed by costs at the stop widths the pattern produces.
+- No VWAP anchor rescues it; 18:00 is the worst of the four.
+- The only viable direction would be a variant whose natural stop is 12–20 pt
+  *and* retains the retest's gross edge. Nothing tested does both, and
+  establishing one would need a fresh out-of-sample period, not more cells
+  from these 47 days.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
