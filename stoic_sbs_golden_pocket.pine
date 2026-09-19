@@ -1,0 +1,793 @@
+// =============================================================================
+// Stoic Trader — SBS / Golden Pocket
+// -----------------------------------------------------------------------------
+// A mechanical rendering of the publicly documented "Stoic Trader System"
+// (@StoicTA / stoicedge.com), which is a four-step discretionary trend-
+// continuation template:
+//
+//   1. Bias        — 20 & 200 moving averages. Price above both = bullish,
+//                    below both = bearish, 20 crossing 200 = transition.
+//   2. Structure   — an impulsive move (a break of structure) that develops
+//                    into a Swing Breakout Sequence (SBS).
+//   3. Entry       — at or near the 61.8% retracement of that impulse.
+//   4. Targets     — 2R, 3R, 4R off a stop placed beyond the sequence extreme.
+//
+// The SBS narrative, in its long form, is six beats:
+//
+//   breakout -> first pullback ("first tap", FT) -> new high ->
+//   return to liquidate the FT -> reversal off that sweep -> new swing high
+//
+// This script tracks that sequence as an explicit state machine, one per
+// direction, and reports which beat the market is currently on.
+//
+// -----------------------------------------------------------------------------
+// WHAT THIS IS, AND WHAT IT IS NOT
+// -----------------------------------------------------------------------------
+// The documented edge of the Stoic system is execution discipline — pre-marked
+// levels, fixed R multiples, daily stop-outs — not the signal itself. A 20/200
+// MA filter plus a 61.8% retracement is a generic continuation template that
+// appears in dozens of published systems. This script therefore aims to be an
+// honest *bookkeeper*: it finds the structure, draws the level, computes R, and
+// keeps a running scorecard of what actually happened afterwards. It does not
+// claim the setup has an edge on your instrument. The built-in scorecard exists
+// precisely so you can check that before risking anything.
+//
+// Everything the script draws is derived from CONFIRMED pivots (ta.pivothigh /
+// ta.pivotlow), so structure is recognised `Pivot right` bars after the fact.
+// That lag is real and unavoidable — it is the cost of not repainting.
+//
+// -----------------------------------------------------------------------------
+// WHAT IT DRAWS
+// -----------------------------------------------------------------------------
+//   * 20 / 200 MA trend ribbon, coloured by bias, greyed during transition.
+//   * The live 61.8% level and golden zone (0.50 -> 0.786) of the current
+//     impulse leg, per direction.
+//   * On a trigger: entry / stop / 2R / 3R / 4R lines plus a labelled zone box.
+//   * Previous day high / low / close — the levels the Stoic ritual says to
+//     mark the night before.
+//   * A dashboard: bias, SBS stage per direction, live levels, active setup,
+//     and a forward-tested scorecard (% of setups that reached 2R / 3R / 4R).
+//
+// -----------------------------------------------------------------------------
+// SCORECARD METHODOLOGY (read before trusting the numbers)
+// -----------------------------------------------------------------------------
+// Outcomes are resolved on BAR data, so when a bar's range contains both the
+// stop and a target the script counts the STOP. That is the conservative
+// assumption and it understates the hit rate; a tick-level test would score
+// higher. Entry is the close of the trigger bar with no slippage or commission
+// modelled, and tracking begins on the following bar. Treat the scorecard as a
+// smoke test that rejects obviously broken settings — not as a backtest.
+// =============================================================================
+
+//@version=6
+
+indicator("Stoic Trader — SBS / Golden Pocket",
+     shorttitle        = "STOIC SBS",
+     overlay           = true,
+     max_lines_count   = 500,
+     max_labels_count  = 500,
+     max_boxes_count   = 500,
+     max_bars_back     = 5000)
+
+
+// -----------------------------------------------------------------------------
+// INPUT GROUPS
+// -----------------------------------------------------------------------------
+G_BIAS = "1 · Bias (20 / 200)"
+G_STRU = "2 · Structure (SBS)"
+G_FIB  = "3 · Golden pocket entry"
+G_RISK = "4 · Stop & targets"
+G_LEV  = "Pre-marked levels"
+G_DISP = "Display"
+G_TBL  = "Dashboard"
+
+
+// -----------------------------------------------------------------------------
+// 1 · BIAS
+// -----------------------------------------------------------------------------
+i_maFastLen = input.int(20, "Fast MA length", minval = 2, maxval = 500, group = G_BIAS)
+i_maSlowLen = input.int(200, "Slow MA length", minval = 2, maxval = 1000, group = G_BIAS)
+i_maType    = input.string("SMA", "MA type", options = ["SMA", "EMA"], group = G_BIAS,
+     tooltip = "The written system specifies simple moving averages. The Stoic Edge " +
+               "Compass marketing mentions a 200 EMA, so both are offered.")
+i_biasMode  = input.string("Price above/below both", "Bias rule",
+     options = ["Price above/below both", "MA stack only", "Price + MA stack (strict)"],
+     group = G_BIAS,
+     tooltip = "Price above/below both — the documented rule.\n" +
+               "MA stack only — 20 vs 200 regardless of price.\n" +
+               "Strict — both conditions, fewer and cleaner signals.")
+i_cautBars  = input.int(10, "Caution: bars after a 20/200 cross", minval = 0, maxval = 200,
+     group = G_BIAS,
+     tooltip = "The 20 crossing the 200 is a transition, not a bias. Flag the first " +
+               "N bars after a cross as caution.")
+i_cautSep   = input.float(0.15, "Caution: MA separation below (% of price)",
+     minval = 0.0, step = 0.05, group = G_BIAS,
+     tooltip = "When the two MAs are this close together the bias is noise.")
+
+maFastSma = ta.sma(close, i_maFastLen)
+maFastEma = ta.ema(close, i_maFastLen)
+maSlowSma = ta.sma(close, i_maSlowLen)
+maSlowEma = ta.ema(close, i_maSlowLen)
+
+maFast = i_maType == "EMA" ? maFastEma : maFastSma
+maSlow = i_maType == "EMA" ? maSlowEma : maSlowSma
+
+stackBull = maFast > maSlow
+stackBear = maFast < maSlow
+priceBull = close > maFast and close > maSlow
+priceBear = close < maFast and close < maSlow
+
+isBull = switch i_biasMode
+    "MA stack only"             => stackBull
+    "Price + MA stack (strict)" => stackBull and priceBull
+    =>                             priceBull
+
+isBear = switch i_biasMode
+    "MA stack only"             => stackBear
+    "Price + MA stack (strict)" => stackBear and priceBear
+    =>                             priceBear
+
+bias = isBull ? 1 : isBear ? -1 : 0
+
+maCross      = ta.cross(maFast, maSlow)
+barsSinceX   = ta.barssince(maCross)
+maSepPct     = close != 0 ? math.abs(maFast - maSlow) / close * 100.0 : 0.0
+inTransition = (not na(barsSinceX) and barsSinceX < i_cautBars) or maSepPct < i_cautSep
+caution      = inTransition or bias == 0
+
+
+// -----------------------------------------------------------------------------
+// 2 · STRUCTURE
+// -----------------------------------------------------------------------------
+i_pivLeft  = input.int(5, "Pivot left bars", minval = 1, maxval = 100, group = G_STRU)
+i_pivRight = input.int(5, "Pivot right bars", minval = 1, maxval = 100, group = G_STRU,
+     tooltip = "Structure is confirmed this many bars late. Higher = cleaner swings, " +
+               "later recognition. This is the single most impactful setting here.")
+i_reqSBS   = input.bool(false, "Require the full SBS (wait for the FT liquidation)",
+     group = G_STRU,
+     tooltip = "OFF (default) = the documented four-step system: break structure, " +
+               "then buy the 61.8% of the impulse.\n" +
+               "ON = the strict six-beat sequence: the pullback must first make a new " +
+               "extreme and then return to sweep the first-tap level. Far fewer signals.")
+i_reqBias  = input.bool(true, "Only take setups aligned with the 20/200 bias", group = G_STRU)
+i_blockCau = input.bool(false, "Block setups while the bias is in transition", group = G_STRU)
+i_maxSeq   = input.int(250, "Invalidate a sequence after N bars (0 = never)",
+     minval = 0, maxval = 2000, group = G_STRU)
+
+
+// -----------------------------------------------------------------------------
+// 3 · GOLDEN POCKET
+// -----------------------------------------------------------------------------
+i_fibEntry   = input.float(0.618, "Entry retracement", minval = 0.1, maxval = 0.99,
+     step = 0.001, group = G_FIB)
+i_fibShallow = input.float(0.500, "Zone — shallow edge", minval = 0.1, maxval = 0.99,
+     step = 0.001, group = G_FIB)
+i_fibDeep    = input.float(0.786, "Zone — deep edge", minval = 0.1, maxval = 0.99,
+     step = 0.001, group = G_FIB)
+i_legMode    = input.string("Full impulse leg", "Measure the retracement from",
+     options = ["Full impulse leg", "Last leg (recent swing)"], group = G_FIB,
+     tooltip = "Full impulse leg — origin swing of the breakout to the running extreme. " +
+               "This is the documented reading.\n" +
+               "Last leg — most recent confirmed swing to the running extreme. Shallower " +
+               "levels, more signals in extended trends.")
+i_entryMode  = input.string("Confirmation close", "Trigger",
+     options = ["Confirmation close", "Golden touch"], group = G_FIB,
+     tooltip = "Confirmation close — price must tap the level and then close back " +
+               "through it in the direction of bias, on a candle closing with the trend.\n" +
+               "Golden touch — fires on the first tap of the level. Earlier, noisier.")
+
+
+// -----------------------------------------------------------------------------
+// 4 · RISK
+// -----------------------------------------------------------------------------
+i_stopMode = input.string("Sequence extreme", "Stop reference",
+     options = ["Sequence extreme", "Impulse origin"], group = G_RISK,
+     tooltip = "Sequence extreme — beyond the low/high of the current pullback (tight, " +
+               "the documented placement).\n" +
+               "Impulse origin — beyond the swing that started the leg (wide, survives noise).")
+i_stopBuf  = input.float(0.10, "Stop buffer (ATR multiple)", minval = 0.0, step = 0.05,
+     group = G_RISK)
+i_atrLen   = input.int(14, "ATR length", minval = 1, maxval = 200, group = G_RISK)
+i_t1       = input.float(2.0, "Target 1 (R)", minval = 0.1, step = 0.1, group = G_RISK)
+i_t2       = input.float(3.0, "Target 2 (R)", minval = 0.1, step = 0.1, group = G_RISK)
+i_t3       = input.float(4.0, "Target 3 (R)", minval = 0.1, step = 0.1, group = G_RISK)
+
+atrVal = ta.atr(i_atrLen)
+
+
+// -----------------------------------------------------------------------------
+// PRE-MARKED LEVELS
+// -----------------------------------------------------------------------------
+i_showPD = input.bool(true, "Previous day high / low / close", group = G_LEV,
+     tooltip = "The three levels the Stoic routine says to mark the night before. " +
+               "Intraday charts only.")
+
+[pdHigh, pdLow, pdClose] = request.security(syminfo.tickerid, "D",
+     [high[1], low[1], close[1]], barmerge.gaps_off, barmerge.lookahead_off)
+
+
+// -----------------------------------------------------------------------------
+// DISPLAY
+// -----------------------------------------------------------------------------
+i_showRibbon = input.bool(true, "Trend ribbon", group = G_DISP)
+i_showFib    = input.bool(true, "Live golden zone", group = G_DISP)
+i_showSetups = input.bool(true, "Setup boxes and R lines", group = G_DISP)
+i_maxSetups  = input.int(6, "Keep the last N setups on the chart", minval = 1, maxval = 50,
+     group = G_DISP)
+i_projBars   = input.int(30, "Project setup lines forward N bars", minval = 5, maxval = 200,
+     group = G_DISP)
+i_colorBars  = input.bool(false, "Colour bars by bias", group = G_DISP)
+i_showTable  = input.bool(true, "Dashboard", group = G_TBL)
+i_tblPos     = input.string("Top right", "Dashboard position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = G_TBL)
+
+COL_BULL = #26a69a
+COL_BEAR = #ef5350
+COL_CAUT = #f9c80e
+COL_NEUT = #787b86
+
+
+// -----------------------------------------------------------------------------
+// TYPES
+// -----------------------------------------------------------------------------
+// One Seq per direction. `stage` is the SBS beat the market is on:
+//   0 idle · 1 breakout · 2 first tap · 3 new extreme · 4 FT liquidated · 5 armed
+type Seq
+    int   dir        = 0
+    int   stage      = 0
+    int   startBar   = na
+    float origin     = na     // swing that launched the impulse (low for a bull leg)
+    float extreme    = na     // running impulse extreme
+    int   extremeBar = na
+    float ft         = na     // first-tap level: the first pullback pivot after the break
+    int   ftBar      = na
+    float ftExtreme  = na     // the impulse extreme at the moment the FT was confirmed
+    float pullExt    = na     // counter-extreme since the last new impulse extreme
+    bool  tapped     = false  // has price traded through the entry retracement yet
+
+type Trade
+    int   dir    = 0
+    bool  active = false
+    int   bar    = na
+    float entry  = na
+    float stop   = na
+    float tgt1   = na
+    float tgt2   = na
+    float tgt3   = na
+    int   hit    = 0          // highest target reached before resolution
+    float mfeR   = 0.0
+
+type Draw
+    box   zone
+    line  lnEntry
+    line  lnStop
+    line  lnT1
+    line  lnT2
+    line  lnT3
+    label tag
+
+
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+// `a` is more favourable than `b` for the given direction.
+f_better(int dir, float a, float b) =>
+    dir == 1 ? a > b : a < b
+
+// Retracement of the leg `from` -> `to`. Direction-agnostic: for a bear leg
+// `to - from` is negative and the result sits above `to`, which is correct.
+f_retr(float from, float to, float f) =>
+    to - (to - from) * f
+
+f_reset(Seq s) =>
+    s.dir        := 0
+    s.stage      := 0
+    s.startBar   := na
+    s.origin     := na
+    s.extreme    := na
+    s.extremeBar := na
+    s.ft         := na
+    s.ftBar      := na
+    s.ftExtreme  := na
+    s.pullExt    := na
+    s.tapped     := false
+    s
+
+f_start(Seq s, int dir, float origin, int originBar) =>
+    s.dir        := dir
+    s.stage      := 1
+    s.startBar   := bar_index
+    s.origin     := origin
+    s.extreme    := dir == 1 ? high : low
+    s.extremeBar := bar_index
+    s.ft         := na
+    s.ftBar      := na
+    s.ftExtreme  := na
+    s.pullExt    := dir == 1 ? low : high
+    s.tapped     := false
+    s
+
+// Advance the sequence one bar. `ftPivot` is the pivot that can become the
+// first tap (a pivot low for a bull leg), na on bars where none confirmed.
+f_advance(Seq s, float ftPivot, int ftPivotBar, int maxBars) =>
+    if s.stage > 0
+        dir  = s.dir
+        cur  = dir == 1 ? high : low
+        anti = dir == 1 ? low  : high
+
+        if f_better(dir, cur, s.extreme)
+            s.extreme    := cur
+            s.extremeBar := bar_index
+            s.pullExt    := anti            // pullback measurement restarts at a new extreme
+            s.tapped     := false           // the leg moved: an older tap no longer counts
+        else if f_better(dir, s.pullExt, anti)
+            s.pullExt    := anti
+
+        if s.stage == 1 and not na(ftPivot) and ftPivotBar > s.startBar
+            // beat 2 — the first pullback after the break of structure
+            s.ft        := ftPivot
+            s.ftBar     := ftPivotBar
+            s.ftExtreme := s.extreme
+            s.stage     := 2
+        else if s.stage == 2 and f_better(dir, cur, s.ftExtreme)
+            // beat 3 — a new extreme beyond the one that stood when the FT formed
+            s.stage := 3
+        else if s.stage == 3 and not f_better(dir, anti, s.ft)
+            // beat 4 — price returns to liquidate the first tap
+            s.stage := 4
+
+        // Invalidation: the leg's origin is given back, or the sequence goes stale.
+        // Gated on bar confirmation — fields of a `var` object are NOT rolled back
+        // between realtime ticks, so an intrabar dip through the origin would
+        // otherwise destroy the sequence permanently even if the bar closed back
+        // above it. High/low driven updates above are monotone within a bar and
+        // need no such gate.
+        staleOut = maxBars > 0 and bar_index - s.startBar > maxBars
+        if (not f_better(dir, close, s.origin) and barstate.isconfirmed) or staleOut
+            f_reset(s)
+    s
+
+// Resolve an open trade against the current bar.
+// Returns 0 = still open, 1 = stopped out, 2 = final target reached.
+// Stop is checked BEFORE targets, so a bar containing both scores as a stop.
+f_track(Trade t) =>
+    int outcome = 0
+    if t.active and bar_index > t.bar
+        rUnit = math.abs(t.entry - t.stop)
+        fav   = t.dir == 1 ? high : low
+        mfe   = rUnit > 0 ? (t.dir == 1 ? fav - t.entry : t.entry - fav) / rUnit : 0.0
+        if mfe > t.mfeR
+            t.mfeR := mfe
+        stopHit = t.dir == 1 ? low <= t.stop : high >= t.stop
+        if stopHit
+            t.active := false
+            outcome  := 1
+        else if (t.dir == 1 ? high >= t.tgt3 : low <= t.tgt3)
+            t.hit    := 3
+            t.active := false
+            outcome  := 2
+        else if (t.dir == 1 ? high >= t.tgt2 : low <= t.tgt2)
+            t.hit    := math.max(t.hit, 2)
+        else if (t.dir == 1 ? high >= t.tgt1 : low <= t.tgt1)
+            t.hit    := math.max(t.hit, 1)
+    outcome
+
+f_stageName(int st) =>
+    switch st
+        0 => "idle"
+        1 => "1 · breakout"
+        2 => "2 · first tap"
+        3 => "3 · new extreme"
+        4 => "4 · FT swept"
+        5 => "5 · in trade"
+        => "—"
+
+
+// -----------------------------------------------------------------------------
+// PIVOTS AND BREAK OF STRUCTURE
+// -----------------------------------------------------------------------------
+pivHigh = ta.pivothigh(high, i_pivLeft, i_pivRight)
+pivLow  = ta.pivotlow(low, i_pivLeft, i_pivRight)
+pivBar  = bar_index - i_pivRight
+
+var float lastPH    = na
+var int   lastPHbar = na
+var bool  phTaken   = true
+var float lastPL    = na
+var int   lastPLbar = na
+var bool  plTaken   = true
+
+if not na(pivHigh)
+    lastPH    := pivHigh
+    lastPHbar := pivBar
+    phTaken   := false
+
+if not na(pivLow)
+    lastPL    := pivLow
+    lastPLbar := pivBar
+    plTaken   := false
+
+// The documented rule is a CLOSE through prior structure, so the break is only
+// registered on a confirmed bar. This also keeps the sequence state machine from
+// latching on an intrabar spike that the close does not support.
+bosUp = not na(lastPH) and not phTaken and close > lastPH and not na(lastPL) and barstate.isconfirmed
+bosDn = not na(lastPL) and not plTaken and close < lastPL and not na(lastPH) and barstate.isconfirmed
+
+if bosUp
+    phTaken := true
+if bosDn
+    plTaken := true
+
+
+// -----------------------------------------------------------------------------
+// SEQUENCE STATE MACHINES
+// -----------------------------------------------------------------------------
+var Seq   bullSeq = Seq.new()
+var Seq   bearSeq = Seq.new()
+var Trade bullTrd = Trade.new()
+var Trade bearTrd = Trade.new()
+
+// Resolve open trades first, so a sequence freed this bar can be reused below.
+outBull = f_track(bullTrd)
+outBear = f_track(bearTrd)
+
+var int   nSetups = 0
+var int   nStop   = 0
+var int   nT1     = 0
+var int   nT2     = 0
+var int   nT3     = 0
+
+if outBull != 0
+    nSetups := nSetups + 1
+    nT1     := nT1 + (bullTrd.hit >= 1 ? 1 : 0)
+    nT2     := nT2 + (bullTrd.hit >= 2 ? 1 : 0)
+    nT3     := nT3 + (bullTrd.hit >= 3 ? 1 : 0)
+    nStop   := nStop + (bullTrd.hit == 0 ? 1 : 0)
+    f_reset(bullSeq)
+
+if outBear != 0
+    nSetups := nSetups + 1
+    nT1     := nT1 + (bearTrd.hit >= 1 ? 1 : 0)
+    nT2     := nT2 + (bearTrd.hit >= 2 ? 1 : 0)
+    nT3     := nT3 + (bearTrd.hit >= 3 ? 1 : 0)
+    nStop   := nStop + (bearTrd.hit == 0 ? 1 : 0)
+    f_reset(bearSeq)
+
+// A breakout starts a sequence only when none is running in that direction.
+// Subsequent breaks inside a live sequence are simply beat 3 (a new extreme).
+if bosUp and bullSeq.stage == 0
+    f_start(bullSeq, 1, lastPL, lastPLbar)
+if bosDn and bearSeq.stage == 0
+    f_start(bearSeq, -1, lastPH, lastPHbar)
+
+bullSeq := f_advance(bullSeq, pivLow, pivBar, i_maxSeq)
+bearSeq := f_advance(bearSeq, pivHigh, pivBar, i_maxSeq)
+
+
+// -----------------------------------------------------------------------------
+// LIVE RETRACEMENT LEVELS
+// -----------------------------------------------------------------------------
+useLastLeg = i_legMode == "Last leg (recent swing)"
+
+bullFrom = bullSeq.stage > 0 ? (useLastLeg and not na(lastPL) and f_better(1, lastPL, bullSeq.origin) ? lastPL : bullSeq.origin) : na
+bearFrom = bearSeq.stage > 0 ? (useLastLeg and not na(lastPH) and f_better(-1, lastPH, bearSeq.origin) ? lastPH : bearSeq.origin) : na
+
+bullEntryLvl = bullSeq.stage > 0 ? f_retr(bullFrom, bullSeq.extreme, i_fibEntry)   : na
+bullShallow  = bullSeq.stage > 0 ? f_retr(bullFrom, bullSeq.extreme, i_fibShallow) : na
+bullDeep     = bullSeq.stage > 0 ? f_retr(bullFrom, bullSeq.extreme, i_fibDeep)    : na
+
+bearEntryLvl = bearSeq.stage > 0 ? f_retr(bearFrom, bearSeq.extreme, i_fibEntry)   : na
+bearShallow  = bearSeq.stage > 0 ? f_retr(bearFrom, bearSeq.extreme, i_fibShallow) : na
+bearDeep     = bearSeq.stage > 0 ? f_retr(bearFrom, bearSeq.extreme, i_fibDeep)    : na
+
+
+// -----------------------------------------------------------------------------
+// TRIGGERS
+// -----------------------------------------------------------------------------
+minStage = i_reqSBS ? 4 : 2
+
+bullWasTapped = bullSeq.tapped
+bearWasTapped = bearSeq.tapped
+
+bullTapNow = bullSeq.stage > 0 and bullSeq.stage < 5 and not na(bullEntryLvl) and low <= bullEntryLvl
+bearTapNow = bearSeq.stage > 0 and bearSeq.stage < 5 and not na(bearEntryLvl) and high >= bearEntryLvl
+
+if bullTapNow
+    bullSeq.tapped := true
+if bearTapNow
+    bearSeq.tapped := true
+
+bullFirstTouch = bullTapNow and not bullWasTapped
+bearFirstTouch = bearTapNow and not bearWasTapped
+
+bullConfirm = bullSeq.tapped and close > bullEntryLvl and close > open
+bearConfirm = bearSeq.tapped and close < bearEntryLvl and close < open
+
+gateBull = bullSeq.stage >= minStage and bullSeq.stage < 5 and not bullTrd.active and
+     (not i_reqBias or bias == 1) and (not i_blockCau or not caution) and barstate.isconfirmed
+gateBear = bearSeq.stage >= minStage and bearSeq.stage < 5 and not bearTrd.active and
+     (not i_reqBias or bias == -1) and (not i_blockCau or not caution) and barstate.isconfirmed
+
+rawBull = i_entryMode == "Golden touch" ? bullFirstTouch : bullConfirm
+rawBear = i_entryMode == "Golden touch" ? bearFirstTouch : bearConfirm
+
+// Stop reference and resulting R, evaluated for both directions every bar.
+bullStopRef = i_stopMode == "Impulse origin" ? bullSeq.origin : bullSeq.pullExt
+bearStopRef = i_stopMode == "Impulse origin" ? bearSeq.origin : bearSeq.pullExt
+bullStopRaw = math.min(nz(bullStopRef, low), low) - i_stopBuf * atrVal
+bearStopRaw = math.max(nz(bearStopRef, high), high) + i_stopBuf * atrVal
+
+bullR = close - bullStopRaw
+bearR = bearStopRaw - close
+
+minR = math.max(syminfo.mintick, atrVal * 0.05)
+
+bullTrigger = gateBull and rawBull and bullR > minR
+bearTrigger = gateBear and rawBear and bearR > minR
+
+
+// -----------------------------------------------------------------------------
+// SETUP CREATION
+// -----------------------------------------------------------------------------
+var array<Draw> drawings = array.new<Draw>()
+
+f_trimDrawings(array<Draw> arr, int keep) =>
+    while arr.size() > keep
+        d = arr.shift()
+        box.delete(d.zone)
+        line.delete(d.lnEntry)
+        line.delete(d.lnStop)
+        line.delete(d.lnT1)
+        line.delete(d.lnT2)
+        line.delete(d.lnT3)
+        label.delete(d.tag)
+    arr
+
+if bullTrigger
+    bullTrd.dir    := 1
+    bullTrd.active := true
+    bullTrd.bar    := bar_index
+    bullTrd.entry  := close
+    bullTrd.stop   := bullStopRaw
+    bullTrd.tgt1   := close + i_t1 * bullR
+    bullTrd.tgt2   := close + i_t2 * bullR
+    bullTrd.tgt3   := close + i_t3 * bullR
+    bullTrd.hit    := 0
+    bullTrd.mfeR   := 0.0
+    bullSeq.stage  := 5
+
+if bearTrigger
+    bearTrd.dir    := -1
+    bearTrd.active := true
+    bearTrd.bar    := bar_index
+    bearTrd.entry  := close
+    bearTrd.stop   := bearStopRaw
+    bearTrd.tgt1   := close - i_t1 * bearR
+    bearTrd.tgt2   := close - i_t2 * bearR
+    bearTrd.tgt3   := close - i_t3 * bearR
+    bearTrd.hit    := 0
+    bearTrd.mfeR   := 0.0
+    bearSeq.stage  := 5
+
+if i_showSetups and (bullTrigger or bearTrigger)
+    dir   = bullTrigger ? 1 : -1
+    col   = dir == 1 ? COL_BULL : COL_BEAR
+    entry = dir == 1 ? bullTrd.entry : bearTrd.entry
+    stp   = dir == 1 ? bullTrd.stop  : bearTrd.stop
+    g1    = dir == 1 ? bullTrd.tgt1  : bearTrd.tgt1
+    g2    = dir == 1 ? bullTrd.tgt2  : bearTrd.tgt2
+    g3    = dir == 1 ? bullTrd.tgt3  : bearTrd.tgt3
+    zTop  = dir == 1 ? math.max(bullShallow, bullDeep) : math.max(bearShallow, bearDeep)
+    zBot  = dir == 1 ? math.min(bullShallow, bullDeep) : math.min(bearShallow, bearDeep)
+    zLeft = dir == 1 ? nz(bullSeq.extremeBar, bar_index - 10) : nz(bearSeq.extremeBar, bar_index - 10)
+    rVal  = math.abs(entry - stp)
+
+    d = Draw.new()
+    d.zone = box.new(zLeft, zTop, bar_index + i_projBars, zBot,
+         border_color = color.new(col, 40), bgcolor = color.new(col, 88))
+    d.lnEntry = line.new(bar_index, entry, bar_index + i_projBars, entry,
+         color = col, width = 2)
+    d.lnStop = line.new(bar_index, stp, bar_index + i_projBars, stp,
+         color = color.new(COL_BEAR, 20), style = line.style_dashed)
+    d.lnT1 = line.new(bar_index, g1, bar_index + i_projBars, g1,
+         color = color.new(col, 35), style = line.style_dotted)
+    d.lnT2 = line.new(bar_index, g2, bar_index + i_projBars, g2,
+         color = color.new(col, 50), style = line.style_dotted)
+    d.lnT3 = line.new(bar_index, g3, bar_index + i_projBars, g3,
+         color = color.new(col, 65), style = line.style_dotted)
+    d.tag = label.new(bar_index, stp,
+         text = (dir == 1 ? "LONG " : "SHORT ") + str.tostring(i_fibEntry, "#.###") +
+                "  R " + str.tostring(rVal, format.mintick) +
+                (caution ? "  ⚠" : ""),
+         style = dir == 1 ? label.style_label_up : label.style_label_down,
+         color = color.new(col, 15), textcolor = color.white, size = size.small)
+    drawings.push(d)
+    f_trimDrawings(drawings, i_maxSetups)
+
+
+// -----------------------------------------------------------------------------
+// PLOTS
+// -----------------------------------------------------------------------------
+ribbonCol = caution ? COL_CAUT : bias == 1 ? COL_BULL : bias == -1 ? COL_BEAR : COL_NEUT
+
+pFast = plot(i_showRibbon ? maFast : na, "Fast MA", color = color.new(ribbonCol, 0), linewidth = 1)
+pSlow = plot(i_showRibbon ? maSlow : na, "Slow MA", color = color.new(ribbonCol, 30), linewidth = 2)
+fill(pFast, pSlow, color = color.new(ribbonCol, 88), title = "Trend ribbon")
+
+pBullSh = plot(i_showFib ? bullShallow : na, "Bull zone shallow",
+     color = color.new(COL_BULL, 70), style = plot.style_linebr)
+pBullDp = plot(i_showFib ? bullDeep : na, "Bull zone deep",
+     color = color.new(COL_BULL, 70), style = plot.style_linebr)
+fill(pBullSh, pBullDp, color = color.new(COL_BULL, 90), title = "Bull golden zone")
+
+pBearSh = plot(i_showFib ? bearShallow : na, "Bear zone shallow",
+     color = color.new(COL_BEAR, 70), style = plot.style_linebr)
+pBearDp = plot(i_showFib ? bearDeep : na, "Bear zone deep",
+     color = color.new(COL_BEAR, 70), style = plot.style_linebr)
+fill(pBearSh, pBearDp, color = color.new(COL_BEAR, 90), title = "Bear golden zone")
+
+plot(i_showFib ? bullEntryLvl : na, "Bull 0.618",
+     color = color.new(COL_BULL, 10), style = plot.style_linebr, linewidth = 2)
+plot(i_showFib ? bearEntryLvl : na, "Bear 0.618",
+     color = color.new(COL_BEAR, 10), style = plot.style_linebr, linewidth = 2)
+
+showPD = i_showPD and timeframe.isintraday
+plot(showPD ? pdHigh : na, "Prev day high",
+     color = color.new(COL_NEUT, 20), style = plot.style_linebr)
+plot(showPD ? pdLow : na, "Prev day low",
+     color = color.new(COL_NEUT, 20), style = plot.style_linebr)
+plot(showPD ? pdClose : na, "Prev day close",
+     color = color.new(COL_NEUT, 45), style = plot.style_linebr)
+
+plotshape(bullTrigger, "Long trigger", shape.triangleup, location.belowbar,
+     color = color.new(COL_BULL, 0), size = size.small, text = "SBS")
+plotshape(bearTrigger, "Short trigger", shape.triangledown, location.abovebar,
+     color = color.new(COL_BEAR, 0), size = size.small, text = "SBS")
+
+plotshape(bullFirstTouch and not bullTrigger, "Bull golden tap", shape.circle,
+     location.belowbar, color = color.new(COL_BULL, 55), size = size.tiny)
+plotshape(bearFirstTouch and not bearTrigger, "Bear golden tap", shape.circle,
+     location.abovebar, color = color.new(COL_BEAR, 55), size = size.tiny)
+
+plotshape(caution and not caution[1], "Transition", shape.diamond, location.top,
+     color = color.new(COL_CAUT, 30), size = size.tiny)
+
+barcolor(i_colorBars ? (caution ? color.new(COL_CAUT, 55) :
+     bias == 1 ? color.new(COL_BULL, 55) :
+     bias == -1 ? color.new(COL_BEAR, 55) : na) : na)
+
+
+// -----------------------------------------------------------------------------
+// DASHBOARD
+// -----------------------------------------------------------------------------
+tblPos = switch i_tblPos
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    =>                position.top_right
+
+var table dash = table.new(tblPos, 2, 22,
+     bgcolor = color.new(#131722, 12), border_width = 1,
+     border_color = color.new(COL_NEUT, 70), frame_width = 1,
+     frame_color = color.new(COL_NEUT, 60))
+
+f_row(table tb, int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color = color.new(#d1d4dc, 25),
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = vc,
+         text_size = size.small, text_halign = text.align_right)
+
+hasActive  = bullTrd.active or bearTrd.active
+resolved   = nSetups
+pT1        = resolved > 0 ? nT1 * 100.0 / resolved : na
+pT2        = resolved > 0 ? nT2 * 100.0 / resolved : na
+pT3        = resolved > 0 ? nT3 * 100.0 / resolved : na
+pStop      = resolved > 0 ? nStop * 100.0 / resolved : na
+// Expectancy of a flat "all out at target 1" plan: p * T1 - (1 - p) * 1R.
+expR       = resolved > 0 ? (nT1 / resolved) * i_t1 - (1.0 - nT1 / resolved) : na
+
+if i_showTable and barstate.islast
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 0, "STOIC · SBS / GOLDEN POCKET",
+         text_color = color.white, text_size = size.small, bgcolor = color.new(#2a2e39, 20))
+
+    biasTxt = bias == 1 ? "BULLISH" : bias == -1 ? "BEARISH" : "NO BIAS"
+    biasCol = bias == 1 ? COL_BULL : bias == -1 ? COL_BEAR : COL_NEUT
+    f_row(dash, 1, "1 · Bias", biasTxt, biasCol)
+    f_row(dash, 2, "Regime", caution ? "TRANSITION ⚠" : "clean",
+         caution ? COL_CAUT : COL_NEUT)
+    f_row(dash, 3, "MA separation", str.tostring(maSepPct, "#.##") + " %", color.new(#d1d4dc, 20))
+
+    f_row(dash, 4, "2 · SBS long", f_stageName(bullSeq.stage),
+         bullSeq.stage >= minStage ? COL_BULL : COL_NEUT)
+    f_row(dash, 5, "2 · SBS short", f_stageName(bearSeq.stage),
+         bearSeq.stage >= minStage ? COL_BEAR : COL_NEUT)
+
+    longLvl  = na(bullEntryLvl) ? "—" : str.tostring(bullEntryLvl, format.mintick)
+    shortLvl = na(bearEntryLvl) ? "—" : str.tostring(bearEntryLvl, format.mintick)
+    f_row(dash, 6, "3 · Long " + str.tostring(i_fibEntry, "#.###"), longLvl,
+         bullSeq.tapped ? COL_BULL : color.new(#d1d4dc, 20))
+    f_row(dash, 7, "3 · Short " + str.tostring(i_fibEntry, "#.###"), shortLvl,
+         bearSeq.tapped ? COL_BEAR : color.new(#d1d4dc, 20))
+
+    distTxt = "—"
+    if bullSeq.stage > 0 and not na(bullEntryLvl) and atrVal > 0
+        distTxt := str.tostring((close - bullEntryLvl) / atrVal, "#.##") + " ATR"
+    else if bearSeq.stage > 0 and not na(bearEntryLvl) and atrVal > 0
+        distTxt := str.tostring((bearEntryLvl - close) / atrVal, "#.##") + " ATR"
+    f_row(dash, 8, "Distance to level", distTxt, color.new(#d1d4dc, 20))
+
+    table.merge_cells(dash, 0, 9, 1, 9)
+    table.cell(dash, 0, 9, "ACTIVE SETUP", text_color = color.new(#d1d4dc, 35),
+         text_size = size.tiny, bgcolor = color.new(#2a2e39, 45))
+
+    if hasActive
+        t     = bullTrd.active ? bullTrd : bearTrd
+        tcol  = t.dir == 1 ? COL_BULL : COL_BEAR
+        rUnit = math.abs(t.entry - t.stop)
+        f_row(dash, 10, "Direction", t.dir == 1 ? "LONG" : "SHORT", tcol)
+        f_row(dash, 11, "Entry", str.tostring(t.entry, format.mintick), color.new(#d1d4dc, 20))
+        f_row(dash, 12, "Stop  (1R)", str.tostring(t.stop, format.mintick) +
+             "   " + str.tostring(rUnit, format.mintick), COL_BEAR)
+        f_row(dash, 13, "T1 " + str.tostring(i_t1, "#.#") + "R",
+             str.tostring(t.tgt1, format.mintick), t.hit >= 1 ? COL_BULL : color.new(#d1d4dc, 40))
+        f_row(dash, 14, "T2 " + str.tostring(i_t2, "#.#") + "R",
+             str.tostring(t.tgt2, format.mintick), t.hit >= 2 ? COL_BULL : color.new(#d1d4dc, 40))
+        f_row(dash, 15, "T3 " + str.tostring(i_t3, "#.#") + "R",
+             str.tostring(t.tgt3, format.mintick), t.hit >= 3 ? COL_BULL : color.new(#d1d4dc, 40))
+        f_row(dash, 16, "Open MFE", str.tostring(t.mfeR, "#.##") + " R", color.new(#d1d4dc, 20))
+    else
+        f_row(dash, 10, "Direction", "flat", COL_NEUT)
+        f_row(dash, 11, "Entry", "—", COL_NEUT)
+        f_row(dash, 12, "Stop  (1R)", "—", COL_NEUT)
+        f_row(dash, 13, "T1 " + str.tostring(i_t1, "#.#") + "R", "—", COL_NEUT)
+        f_row(dash, 14, "T2 " + str.tostring(i_t2, "#.#") + "R", "—", COL_NEUT)
+        f_row(dash, 15, "T3 " + str.tostring(i_t3, "#.#") + "R", "—", COL_NEUT)
+        f_row(dash, 16, "Open MFE", "—", COL_NEUT)
+
+    table.merge_cells(dash, 0, 17, 1, 17)
+    table.cell(dash, 0, 17, "SCORECARD · bar resolution, stop-first",
+         text_color = color.new(#d1d4dc, 35), text_size = size.tiny,
+         bgcolor = color.new(#2a2e39, 45))
+
+    f_row(dash, 18, "Resolved setups", str.tostring(resolved), color.new(#d1d4dc, 20))
+    f_row(dash, 19, "Reached " + str.tostring(i_t1, "#.#") + "R",
+         na(pT1) ? "—" : str.tostring(pT1, "#.#") + " %",
+         na(pT1) ? COL_NEUT : pT1 >= 40 ? COL_BULL : COL_CAUT)
+    f_row(dash, 20, "Reached " + str.tostring(i_t3, "#.#") + "R / stopped",
+         na(pT3) ? "—" : str.tostring(pT3, "#.#") + " % / " + str.tostring(pStop, "#.#") + " %",
+         color.new(#d1d4dc, 20))
+    f_row(dash, 21, "E[R] flat " + str.tostring(i_t1, "#.#") + "R",
+         na(expR) ? "—" : str.tostring(expR, "#.##") + " R",
+         na(expR) ? COL_NEUT : expR > 0 ? COL_BULL : COL_BEAR)
+
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(bullTrigger, "Stoic · long setup",
+     "Stoic SBS: long triggered at the golden pocket. Stop below the sequence low, targets 2R/3R/4R.")
+alertcondition(bearTrigger, "Stoic · short setup",
+     "Stoic SBS: short triggered at the golden pocket. Stop above the sequence high, targets 2R/3R/4R.")
+alertcondition(bullFirstTouch or bearFirstTouch, "Stoic · golden pocket tapped",
+     "Stoic SBS: price has tapped the 61.8% retracement of the current impulse leg.")
+alertcondition(bias != bias[1], "Stoic · bias flip",
+     "Stoic SBS: the 20/200 bias has changed.")
+
+if bullTrigger
+    alert(str.format("STOIC LONG {0} {1} | entry {2} stop {3} | T {4} / {5} / {6}",
+         syminfo.ticker, timeframe.period,
+         str.tostring(bullTrd.entry, format.mintick),
+         str.tostring(bullTrd.stop, format.mintick),
+         str.tostring(bullTrd.tgt1, format.mintick),
+         str.tostring(bullTrd.tgt2, format.mintick),
+         str.tostring(bullTrd.tgt3, format.mintick)), alert.freq_once_per_bar_close)
+
+if bearTrigger
+    alert(str.format("STOIC SHORT {0} {1} | entry {2} stop {3} | T {4} / {5} / {6}",
+         syminfo.ticker, timeframe.period,
+         str.tostring(bearTrd.entry, format.mintick),
+         str.tostring(bearTrd.stop, format.mintick),
+         str.tostring(bearTrd.tgt1, format.mintick),
+         str.tostring(bearTrd.tgt2, format.mintick),
+         str.tostring(bearTrd.tgt3, format.mintick)), alert.freq_once_per_bar_close)
