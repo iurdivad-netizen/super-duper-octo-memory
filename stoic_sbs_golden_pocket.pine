@@ -583,19 +583,19 @@ if i_showSetups and (bullTrigger or bearTrigger)
     rVal  = math.abs(entry - stp)
 
     d = Draw.new()
-    d.zone = box.new(zLeft, zTop, bar_index + i_projBars, zBot,
+    d.zone := box.new(zLeft, zTop, bar_index + i_projBars, zBot,
          border_color = color.new(col, 40), bgcolor = color.new(col, 88))
-    d.lnEntry = line.new(bar_index, entry, bar_index + i_projBars, entry,
+    d.lnEntry := line.new(bar_index, entry, bar_index + i_projBars, entry,
          color = col, width = 2)
-    d.lnStop = line.new(bar_index, stp, bar_index + i_projBars, stp,
+    d.lnStop := line.new(bar_index, stp, bar_index + i_projBars, stp,
          color = color.new(COL_BEAR, 20), style = line.style_dashed)
-    d.lnT1 = line.new(bar_index, g1, bar_index + i_projBars, g1,
+    d.lnT1 := line.new(bar_index, g1, bar_index + i_projBars, g1,
          color = color.new(col, 35), style = line.style_dotted)
-    d.lnT2 = line.new(bar_index, g2, bar_index + i_projBars, g2,
+    d.lnT2 := line.new(bar_index, g2, bar_index + i_projBars, g2,
          color = color.new(col, 50), style = line.style_dotted)
-    d.lnT3 = line.new(bar_index, g3, bar_index + i_projBars, g3,
+    d.lnT3 := line.new(bar_index, g3, bar_index + i_projBars, g3,
          color = color.new(col, 65), style = line.style_dotted)
-    d.tag = label.new(bar_index, stp,
+    d.tag := label.new(bar_index, stp,
          text = (dir == 1 ? "LONG " : "SHORT ") + str.tostring(i_fibEntry, "#.###") +
                 "  R " + str.tostring(rVal, format.mintick) +
                 (caution ? "  ⚠" : ""),

@@ -285,8 +285,8 @@ f_cluster(array<float> vals, array<int> bars, int scan, float t, int dir) =>
     int   bestFirst = na
     n = vals.size()
     if n > 0 and t > 0
-        from = math.max(0, n - scan)
-        for i = from to n - 1
+        startIdx = math.max(0, n - scan)
+        for i = startIdx to n - 1
             ref   = vals.get(i)
             cnt   = 0
             ext   = ref
@@ -334,8 +334,10 @@ f_edge(Edge e, float lvl, bool defined, bool confirmed,
         closeIn  = dir == 1 ? close < lvl : close > lvl
 
         if e.phase == 1
-            e.sweepExt := dir == 1 ? math.max(nz(e.sweepExt, high), high)
-                 : math.min(nz(e.sweepExt, low), low)
+            if dir == 1
+                e.sweepExt := math.max(nz(e.sweepExt, high), high)
+            else
+                e.sweepExt := math.min(nz(e.sweepExt, low), low)
 
         if confirmed
             if e.phase == 0
@@ -651,14 +653,14 @@ if anySig and i_showSig
     col  = trade.dir == 1 ? COL_LONG : COL_SHORT
     endX = bar_index + i_projBars
     d = Draw.new()
-    d.lnEntry = line.new(bar_index, trade.entry, endX, trade.entry, color = col, width = 2)
-    d.lnStop  = line.new(bar_index, trade.stop, endX, trade.stop,
+    d.lnEntry := line.new(bar_index, trade.entry, endX, trade.entry, color = col, width = 2)
+    d.lnStop  := line.new(bar_index, trade.stop, endX, trade.stop,
          color = color.new(COL_SHORT, 15), style = line.style_dashed)
-    d.lnTp1   = line.new(bar_index, trade.tp1, endX, trade.tp1,
+    d.lnTp1   := line.new(bar_index, trade.tp1, endX, trade.tp1,
          color = color.new(col, 35), style = line.style_dotted)
-    d.lnTp2   = line.new(bar_index, trade.tp2, endX, trade.tp2,
+    d.lnTp2   := line.new(bar_index, trade.tp2, endX, trade.tp2,
          color = color.new(col, 60), style = line.style_dotted)
-    d.tag     = label.new(bar_index, trade.stop,
+    d.tag     := label.new(bar_index, trade.stop,
          text = (trade.setup == 1 ? "S1 SWEEP " : "S2 BREAK ") +
                 (trade.dir == 1 ? "LONG" : "SHORT") +
                 "  1R " + str.tostring(math.abs(trade.entry - trade.stop), format.mintick),
