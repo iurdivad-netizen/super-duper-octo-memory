@@ -61,6 +61,17 @@ for i, l in enumerate(lines):          # raw source: strip() removes string bodi
     if re.search(r'str\.tostring\s*\([^)]*,\s*"\+', l):
         errs.append((i+1, "str.tostring format string cannot start with '+' -- prepend the sign yourself"))
 
+# ---------- 2d. object fields are assigned with ':=', never '=' (CE10089) ----------
+NS = ("ta","math","str","array","matrix","map","request","color","table","line","box",
+      "label","polyline","linefill","ticker","runtime","input","strategy","syminfo",
+      "timeframe","chart","barstate","session","alert","plot","shape","location","size",
+      "style","extend","xloc","yloc","position","text","order","barmerge","format",
+      "display","scale","currency","dividends","splits","earnings","adjustment")
+for i, l in enumerate(code):
+    m = re.match(r"^\s+(\w+)\.(\w+)\s*=(?!=)", l)
+    if m and m.group(1) not in NS:
+        errs.append((i+1, f"assign object field with ':=' not '=': {m.group(1)}.{m.group(2)} (CE10089)"))
+
 # ---------- 3. function defs must be at column 0 ----------
 for i, l in enumerate(code):
     if re.match(r"^\s+\w+\s*\([^)]*\)\s*=>\s*$", l):
