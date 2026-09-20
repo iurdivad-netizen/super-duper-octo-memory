@@ -1,0 +1,831 @@
+// =============================================================================
+// Stoic Range Blueprint — Consolidation → Expansion
+// -----------------------------------------------------------------------------
+// A mechanical implementation of the Stoic Range Blueprint (StoicEdge.com),
+// "A Mechanical Playbook for Simplifying Market Structure".
+//
+// The model in one paragraph: markets only ever consolidate and expand. Every
+// pattern language — order blocks, FVGs, liquidity sweeps, manipulation
+// sequences — describes price reacting to a range. So define the box, and trade
+// only its edges, in one of exactly two ways.
+//
+//   ANATOMY        top 20%  = Range High / high-probability edge
+//                  mid 60%  = The Chopping Block / No Edge Zone
+//                  bot 20%  = Range Low  / high-probability edge
+//                  "The edges are for execution. The middle is for targets.
+//                   Never initiate a trade from the 50% line."
+//
+//   SETUP 1        SWEEP & RETEST — false break and rapid return. Internal.
+//                  The Trap -> The Reversal -> The Retest.
+//                  TP1 = 50% midpoint.  TP2 = opposing boundary.
+//                  Deck says: high probability, common.
+//
+//   SETUP 2        BREAK & RETEST — true break and sustained hold. External.
+//                  The Break -> The Retest -> The Extension.
+//                  TP1 = 1x range height.  TP2 = 2x range height.
+//                  Deck says: lower probability, rare but explosive.
+//
+//   RISK           1R = entry to invalidation. The model finds the location;
+//                  only the trader decides the risk.
+//
+//   DISCIPLINE     1-2 trades a day max. No edge, no trade. If price is
+//                  churning at the 50% line it is not ready.
+//
+// -----------------------------------------------------------------------------
+// THE ONE HARD PROBLEM: DRAWING THE BOX
+// -----------------------------------------------------------------------------
+// Everything above is arithmetic on Range High and Range Low. The only genuinely
+// discretionary instruction in the deck is "look for multiple visual reactions
+// to draw the box", and that is what this script has to mechanise.
+//
+// Default method — "Pivot clusters" — is a literal reading of that sentence: a
+// range exists when at least N confirmed pivot highs agree on a level (within an
+// ATR-scaled tolerance) AND at least N confirmed pivot lows agree on another.
+// The box is drawn through the extremes of those clusters. "Channel contraction"
+// is offered as a simpler alternative for people who prefer a pure
+// volatility-compression read.
+//
+// Expect disagreement with your own eye. Tune `Touch tolerance` and
+// `Min touches per side` first; they move the box more than anything else.
+//
+// -----------------------------------------------------------------------------
+// A TENSION IN THE MODEL, MADE EXPLICIT
+// -----------------------------------------------------------------------------
+// At the instant price breaks Range High, Setup 1 says fade and Setup 2 says
+// follow. The deck resolves this only after the fact — a sweep is a "rapid
+// return", a breakout is a "retest that holds outside". So this script cannot
+// classify a break while it is happening. It watches, and commits only once the
+// break has resolved one way or the other:
+//
+//   wick beyond the boundary          -> PENDING   (unclassified)
+//   close back inside within N bars   -> SWEEP     (Setup 1 armed)
+//   H consecutive closes outside      -> BREAKOUT  (Setup 2 armed)
+//
+// The cost is that entries are late relative to the extreme. That is a property
+// of the model, not of the implementation, and no setting removes it.
+//
+// -----------------------------------------------------------------------------
+// SCORECARD
+// -----------------------------------------------------------------------------
+// Outcomes are tracked separately for Setup 1 and Setup 2 so the deck's central
+// claim — Setup 1 common and high-probability, Setup 2 rare but explosive — is
+// testable on your own instrument rather than taken on faith.
+//
+// Resolution is on BAR data: when a bar's range contains both the stop and a
+// target, the STOP is counted. That is conservative and understates hit rate.
+// Entry is the trigger bar's close, no slippage or commission. Tracking starts
+// on the following bar. This is a smoke test, not a backtest.
+// =============================================================================
+
+//@version=6
+
+indicator("Stoic Range Blueprint",
+     shorttitle        = "STOIC RANGE",
+     overlay           = true,
+     max_lines_count   = 500,
+     max_labels_count  = 500,
+     max_boxes_count   = 500,
+     max_bars_back     = 5000)
+
+
+// -----------------------------------------------------------------------------
+// INPUT GROUPS
+// -----------------------------------------------------------------------------
+G_BOX  = "1 · Defining the box"
+G_ANAT = "2 · Anatomy of the range"
+G_S1   = "3 · Setup 1 — Sweep & Retest"
+G_S2   = "4 · Setup 2 — Break & Retest"
+G_RISK = "5 · Risk & discipline"
+G_MTF  = "6 · Fractal context"
+G_DISP = "Display"
+G_TBL  = "Dashboard"
+
+
+// -----------------------------------------------------------------------------
+// 1 · DEFINING THE BOX
+// -----------------------------------------------------------------------------
+i_method    = input.string("Pivot clusters", "Detection method",
+     options = ["Pivot clusters", "Channel contraction"], group = G_BOX,
+     tooltip = "Pivot clusters — a literal reading of 'multiple visual reactions': " +
+               "N confirmed pivot highs agreeing on a level, and N pivot lows on another.\n" +
+               "Channel contraction — the lookback's high/low whenever that span is " +
+               "narrow relative to ATR. Simpler, always produces a box, less faithful.")
+i_pivLeft   = input.int(3, "Pivot left bars", minval = 1, maxval = 50, group = G_BOX)
+i_pivRight  = input.int(3, "Pivot right bars", minval = 1, maxval = 50, group = G_BOX,
+     tooltip = "Reactions are confirmed this many bars late. Ranges want tighter " +
+               "pivots than trend structure does.")
+i_scanPiv   = input.int(8, "Scan the last N pivots per side", minval = 2, maxval = 30,
+     group = G_BOX,
+     tooltip = "Each recent pivot is tried as a cluster reference and the one with " +
+               "the most agreeing touches wins. This is what stops a single sweep " +
+               "spike from defining the boundary.")
+i_keepPiv   = input.int(24, "Pivot memory per side", minval = 4, maxval = 100, group = G_BOX)
+i_minTouch  = input.int(2, "Min touches per side", minval = 2, maxval = 10, group = G_BOX,
+     tooltip = "The deck says 'multiple visual reactions'. Two is the literal minimum; " +
+               "three gives far fewer but far cleaner boxes.")
+i_tolAtr    = input.float(0.35, "Touch tolerance (ATR multiple)", minval = 0.01, step = 0.05,
+     group = G_BOX,
+     tooltip = "How far apart two reactions can be and still count as the same level. " +
+               "Tune this before anything else.")
+i_minHgt    = input.float(1.5, "Min range height (ATR multiple)", minval = 0.1, step = 0.1,
+     group = G_BOX)
+i_minSpan   = input.int(12, "Min range age (bars)", minval = 2, maxval = 500, group = G_BOX,
+     tooltip = "'Wait for the pause.' A box built from reactions only a few bars " +
+               "apart is not a consolidation.")
+i_ctrLen    = input.int(20, "Contraction lookback", minval = 4, maxval = 200, group = G_BOX,
+     tooltip = "Channel contraction method only.")
+i_ctrMax    = input.float(3.0, "Contraction max height (ATR multiple)", minval = 0.5, step = 0.1,
+     group = G_BOX, tooltip = "Channel contraction method only.")
+i_expire    = input.float(2.0, "Expire the box after expansion of (x height)",
+     minval = 0.5, step = 0.5, group = G_BOX,
+     tooltip = "Once price has travelled this many range heights beyond a boundary the " +
+               "consolidation is spent and a new box must form. 2.0 = after Setup 2's TP2.")
+
+
+// -----------------------------------------------------------------------------
+// 2 · ANATOMY
+// -----------------------------------------------------------------------------
+i_edgePct  = input.float(20.0, "High-probability edge band (% of range)",
+     minval = 1.0, maxval = 49.0, step = 1.0, group = G_ANAT,
+     tooltip = "The deck's figure is 20% top and 20% bottom, leaving a 60% no-edge zone.")
+i_blockMid = input.bool(true, "Block any entry priced inside the no-edge zone", group = G_ANAT,
+     tooltip = "'Never initiate a trade from the 50% line.' Both setups trigger at a " +
+               "boundary by construction, so this is a guard rail, not a filter.")
+
+
+// -----------------------------------------------------------------------------
+// 3 · SETUP 1 — SWEEP & RETEST
+// -----------------------------------------------------------------------------
+i_useS1     = input.bool(true, "Enable Setup 1", group = G_S1)
+i_sweepMax  = input.int(5, "'Rapid return' window (bars)", minval = 1, maxval = 50, group = G_S1,
+     tooltip = "A wick beyond the boundary is a SWEEP only if price closes back inside " +
+               "within this many bars. Longer = more sweeps called, less 'rapid'.")
+i_s1Entry   = input.string("Retest of the boundary", "Entry trigger",
+     options = ["Retest of the boundary", "Reclaim close"], group = G_S1,
+     tooltip = "Retest — the deck's third beat: price returns to the reclaimed boundary " +
+               "from inside and is rejected again. Later, cleaner.\n" +
+               "Reclaim close — enter on the bar that closes back inside. Earlier, noisier, " +
+               "and it catches the sweeps that never retest.")
+i_s1Retest  = input.int(15, "Abandon the sweep after (bars)", minval = 1, maxval = 200, group = G_S1)
+
+
+// -----------------------------------------------------------------------------
+// 4 · SETUP 2 — BREAK & RETEST
+// -----------------------------------------------------------------------------
+i_useS2     = input.bool(true, "Enable Setup 2", group = G_S2)
+i_holdBars  = input.int(2, "'Sustained hold' (consecutive closes outside)",
+     minval = 1, maxval = 20, group = G_S2,
+     tooltip = "This is the dial that splits a sweep from a true break. Raise it and " +
+               "more breaks get classified as sweeps.")
+i_s2Retest  = input.int(20, "Abandon the breakout after (bars)", minval = 1, maxval = 200,
+     group = G_S2)
+i_s2Stop    = input.string("Retest extreme", "Invalidation",
+     options = ["Retest extreme", "Range boundary"], group = G_S2,
+     tooltip = "Retest extreme — beyond the low/high of the holding retest bar. Tighter.\n" +
+               "Range boundary — beyond the broken boundary itself: a close back inside " +
+               "means the breakout failed. Wider, more literal.")
+
+
+// -----------------------------------------------------------------------------
+// 5 · RISK & DISCIPLINE
+// -----------------------------------------------------------------------------
+i_atrLen   = input.int(14, "ATR length", minval = 1, maxval = 200, group = G_RISK)
+i_stopBuf  = input.float(0.15, "Invalidation buffer (ATR multiple)", minval = 0.0, step = 0.05,
+     group = G_RISK)
+i_maxDay   = input.int(2, "Max signals per day (0 = unlimited)", minval = 0, maxval = 20,
+     group = G_RISK,
+     tooltip = "'1 to 2 trades a day max. If there is no edge, there is no trade.'")
+i_minRAtr  = input.float(0.10, "Reject setups with 1R below (ATR multiple)",
+     minval = 0.0, step = 0.05, group = G_RISK,
+     tooltip = "Guards against a degenerate invalidation sitting on top of the entry.")
+
+
+// -----------------------------------------------------------------------------
+// 6 · FRACTAL CONTEXT
+// -----------------------------------------------------------------------------
+i_useHtf = input.bool(true, "Show a higher-timeframe range", group = G_MTF,
+     tooltip = "'Ranges within ranges.' The previous completed HTF bar's high/low, as " +
+               "context for where this box sits inside the larger one.")
+i_htfTf  = input.timeframe("D", "Context timeframe", group = G_MTF)
+
+[htfHi, htfLo] = request.security(syminfo.tickerid, i_htfTf, [high[1], low[1]],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+
+// -----------------------------------------------------------------------------
+// DISPLAY
+// -----------------------------------------------------------------------------
+i_showBox   = input.bool(true, "Range box and edge bands", group = G_DISP)
+i_showMid   = input.bool(true, "50% midline", group = G_DISP)
+i_extend    = input.int(20, "Extend the box forward (bars)", minval = 0, maxval = 200,
+     group = G_DISP)
+i_showSig   = input.bool(true, "Signal lines and labels", group = G_DISP)
+i_keepSig   = input.int(6, "Keep the last N signals drawn", minval = 1, maxval = 50,
+     group = G_DISP)
+i_projBars  = input.int(30, "Project signal lines forward (bars)", minval = 5, maxval = 200,
+     group = G_DISP)
+i_showTable = input.bool(true, "Dashboard", group = G_TBL)
+i_tblPos    = input.string("Top right", "Dashboard position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = G_TBL)
+
+COL_RANGE = #6B7A4F
+COL_EDGE  = #C2A25A
+COL_CHOP  = #9aa0a6
+COL_LONG  = #2e7d63
+COL_SHORT = #c0433a
+COL_TEXT  = #d1d4dc
+COL_DIM   = #787b86
+
+atrVal = ta.atr(i_atrLen)
+tol    = i_tolAtr * atrVal
+
+
+// -----------------------------------------------------------------------------
+// TYPES
+// -----------------------------------------------------------------------------
+// One Edge per boundary. `phase` is how a break of that boundary has resolved:
+//   0 inside · 1 pending (wicked out, unclassified) · 2 sweep armed · 3 breakout armed
+type Edge
+    int   dir       = 0      // 1 = upper boundary, -1 = lower boundary
+    int   phase     = 0
+    int   breakBar  = na
+    int   phaseBar  = na
+    float sweepExt  = na     // furthest excursion beyond the boundary
+    int   outCloses = 0      // consecutive closes on the outside
+
+type Trade
+    int   dir    = 0
+    int   setup  = 0         // 1 = sweep & retest, 2 = break & retest
+    bool  active = false
+    int   bar    = na
+    float entry  = na
+    float stop   = na
+    float tp1    = na
+    float tp2    = na
+    int   hit    = 0
+
+type Draw
+    line lnEntry
+    line lnStop
+    line lnTp1
+    line lnTp2
+    label tag
+
+
+// -----------------------------------------------------------------------------
+// HELPERS
+// -----------------------------------------------------------------------------
+// Best agreeing cluster among recent pivots. Each of the last `scan` pivots is
+// tried as a reference; the reference whose level attracts the most touches wins,
+// most recent breaking ties. Returns [touches, extreme, earliest bar].
+// `dir` 1 draws the boundary through the highest touch, -1 through the lowest.
+f_cluster(array<float> vals, array<int> bars, int scan, float t, int dir) =>
+    int   bestCnt   = 0
+    float bestExt   = na
+    int   bestFirst = na
+    n = vals.size()
+    if n > 0 and t > 0
+        from = math.max(0, n - scan)
+        for i = from to n - 1
+            ref   = vals.get(i)
+            cnt   = 0
+            ext   = ref
+            first = bars.get(i)
+            for j = 0 to n - 1
+                v = vals.get(j)
+                if math.abs(v - ref) <= t
+                    cnt   += 1
+                    ext   := dir == 1 ? math.max(ext, v) : math.min(ext, v)
+                    first := math.min(first, bars.get(j))
+            if cnt >= bestCnt
+                bestCnt   := cnt
+                bestExt   := ext
+                bestFirst := first
+    [bestCnt, bestExt, bestFirst]
+
+f_push(array<float> vals, array<int> bars, float v, int b, int keep) =>
+    vals.push(v)
+    bars.push(b)
+    while vals.size() > keep
+        vals.shift()
+        bars.shift()
+    vals
+
+f_edgeReset(Edge e) =>
+    e.phase     := 0
+    e.breakBar  := na
+    e.phaseBar  := na
+    e.sweepExt  := na
+    e.outCloses := 0
+    e
+
+// Advance one boundary by one bar. All phase transitions are gated on a confirmed
+// bar: fields of a `var` object are not rolled back between realtime ticks, and
+// every transition here tests `close`, which fluctuates intrabar. The excursion
+// extreme is updated live because high/low only ever extend within a bar.
+f_edge(Edge e, float lvl, bool defined, bool confirmed,
+     int sweepMax, int holdBars, int s1Wait, int s2Wait) =>
+    if not defined or na(lvl)
+        f_edgeReset(e)
+    else
+        dir      = e.dir
+        wickOut  = dir == 1 ? high > lvl : low < lvl
+        closeOut = dir == 1 ? close > lvl : close < lvl
+        closeIn  = dir == 1 ? close < lvl : close > lvl
+
+        if e.phase == 1
+            e.sweepExt := dir == 1 ? math.max(nz(e.sweepExt, high), high)
+                 : math.min(nz(e.sweepExt, low), low)
+
+        if confirmed
+            if e.phase == 0
+                if wickOut
+                    e.phase     := 1
+                    e.breakBar  := bar_index
+                    e.phaseBar  := bar_index
+                    e.sweepExt  := dir == 1 ? high : low
+                    e.outCloses := closeOut ? 1 : 0
+            else if e.phase == 1
+                e.outCloses := closeOut ? e.outCloses + 1 : 0
+                withinSweep = bar_index - e.breakBar <= sweepMax
+                if e.outCloses >= holdBars
+                    e.phase    := 3            // sustained hold -> true break
+                    e.phaseBar := bar_index
+                else if closeIn and withinSweep
+                    e.phase    := 2            // rapid return -> sweep
+                    e.phaseBar := bar_index
+                else if closeIn and not withinSweep
+                    f_edgeReset(e)             // neither rapid nor sustained
+            else if e.phase == 2
+                if closeOut
+                    e.phase     := 1           // pushed back out: re-arm the trap
+                    e.breakBar  := bar_index
+                    e.outCloses := 1
+                else if bar_index - e.phaseBar > s1Wait
+                    f_edgeReset(e)
+            else if e.phase == 3
+                if closeIn
+                    f_edgeReset(e)             // breakout failed, back inside
+                else if bar_index - e.phaseBar > s2Wait
+                    f_edgeReset(e)
+    e
+
+// Resolve an open trade against the current bar.
+// 0 = still open, 1 = stopped, 2 = TP2 reached. Stop is tested before targets.
+f_track(Trade t) =>
+    int outcome = 0
+    if t.active and bar_index > t.bar
+        stopHit = t.dir == 1 ? low <= t.stop : high >= t.stop
+        if stopHit
+            t.active := false
+            outcome  := 1
+        else if (t.dir == 1 ? high >= t.tp2 : low <= t.tp2)
+            t.hit    := 2
+            t.active := false
+            outcome  := 2
+        else if (t.dir == 1 ? high >= t.tp1 : low <= t.tp1)
+            t.hit    := math.max(t.hit, 1)
+    outcome
+
+f_phaseName(int p) =>
+    switch p
+        0 => "inside"
+        1 => "pending break"
+        2 => "SWEEP armed"
+        3 => "BREAKOUT armed"
+        => "—"
+
+f_pct(int num, int den) =>
+    den > 0 ? str.tostring(num * 100.0 / den, "#") + "%" : "—"
+
+
+// -----------------------------------------------------------------------------
+// PIVOT MEMORY
+// -----------------------------------------------------------------------------
+pivHigh = ta.pivothigh(high, i_pivLeft, i_pivRight)
+pivLow  = ta.pivotlow(low, i_pivLeft, i_pivRight)
+pivBar  = bar_index - i_pivRight
+
+var array<float> phV = array.new<float>()
+var array<int>   phB = array.new<int>()
+var array<float> plV = array.new<float>()
+var array<int>   plB = array.new<int>()
+
+if not na(pivHigh)
+    f_push(phV, phB, pivHigh, pivBar, i_keepPiv)
+if not na(pivLow)
+    f_push(plV, plB, pivLow, pivBar, i_keepPiv)
+
+
+// -----------------------------------------------------------------------------
+// THE BOX
+// -----------------------------------------------------------------------------
+var float rHi     = na
+var float rLo     = na
+var int   rStart  = na
+var bool  rDef    = false
+var int   rHiTch  = 0
+var int   rLoTch  = 0
+
+var Edge  edgeUp  = Edge.new(dir =  1)
+var Edge  edgeDn  = Edge.new(dir = -1)
+var Trade trade   = Trade.new()
+
+// The box is frozen while a break is being classified or a trade is live, so the
+// levels a signal was measured from cannot move underneath it.
+busy = edgeUp.phase > 0 or edgeDn.phase > 0 or trade.active
+
+ctrHi  = ta.highest(high, i_ctrLen)
+ctrLo  = ta.lowest(low, i_ctrLen)
+ctrOk  = (ctrHi - ctrLo) <= i_ctrMax * atrVal and (ctrHi - ctrLo) >= i_minHgt * atrVal
+
+newPivot = not na(pivHigh) or not na(pivLow)
+
+if barstate.isconfirmed and not busy
+    if i_method == "Channel contraction"
+        if ctrOk
+            rHi    := ctrHi
+            rLo    := ctrLo
+            rStart := bar_index - i_ctrLen + 1
+            rHiTch := i_minTouch
+            rLoTch := i_minTouch
+            rDef   := true
+    else if newPivot or not rDef
+        [hiCnt, hiExt, hiFirst] = f_cluster(phV, phB, i_scanPiv, tol,  1)
+        [loCnt, loExt, loFirst] = f_cluster(plV, plB, i_scanPiv, tol, -1)
+        enough = hiCnt >= i_minTouch and loCnt >= i_minTouch and
+             not na(hiExt) and not na(loExt) and hiExt > loExt
+        hgt  = enough ? hiExt - loExt : na
+        span = enough ? bar_index - math.min(hiFirst, loFirst) : 0
+        if enough and hgt >= i_minHgt * atrVal and span >= i_minSpan
+            rHi    := hiExt
+            rLo    := loExt
+            rStart := math.min(hiFirst, loFirst)
+            rHiTch := hiCnt
+            rLoTch := loCnt
+            rDef   := true
+
+rHgt  = rDef ? rHi - rLo : na
+rMid  = rDef ? rLo + 0.5 * rHgt : na
+edgeH = rDef ? rHi - (i_edgePct / 100.0) * rHgt : na     // floor of the upper edge band
+edgeL = rDef ? rLo + (i_edgePct / 100.0) * rHgt : na     // ceiling of the lower edge band
+
+// Consolidation spent: price has expanded a full multiple of the height away.
+if rDef and barstate.isconfirmed and not busy
+    if close > rHi + i_expire * rHgt or close < rLo - i_expire * rHgt
+        rDef := false
+
+
+// -----------------------------------------------------------------------------
+// BOUNDARY STATE
+// -----------------------------------------------------------------------------
+confirmed = barstate.isconfirmed
+
+edgeUp := f_edge(edgeUp, rHi, rDef, confirmed, i_sweepMax, i_holdBars, i_s1Retest, i_s2Retest)
+edgeDn := f_edge(edgeDn, rLo, rDef, confirmed, i_sweepMax, i_holdBars, i_s1Retest, i_s2Retest)
+
+justSweepUp = edgeUp.phase == 2 and edgeUp.phaseBar == bar_index
+justSweepDn = edgeDn.phase == 2 and edgeDn.phaseBar == bar_index
+
+
+// -----------------------------------------------------------------------------
+// DAILY DISCIPLINE
+// -----------------------------------------------------------------------------
+var int sigToday = 0
+if timeframe.change("D")
+    sigToday := 0
+
+dayOk = i_maxDay == 0 or sigToday < i_maxDay
+
+
+// -----------------------------------------------------------------------------
+// TRADE RESOLUTION AND SCORECARD
+// -----------------------------------------------------------------------------
+outcome = f_track(trade)
+
+var int n1 = 0
+var int n1a = 0
+var int n1b = 0
+var int n2 = 0
+var int n2a = 0
+var int n2b = 0
+
+if outcome != 0
+    if trade.setup == 1
+        n1  := n1 + 1
+        n1a := n1a + (trade.hit >= 1 ? 1 : 0)
+        n1b := n1b + (trade.hit >= 2 ? 1 : 0)
+    else
+        n2  := n2 + 1
+        n2a := n2a + (trade.hit >= 1 ? 1 : 0)
+        n2b := n2b + (trade.hit >= 2 ? 1 : 0)
+
+
+// -----------------------------------------------------------------------------
+// TRIGGERS
+// -----------------------------------------------------------------------------
+// Setup 1 — sweep of a boundary, faded back into the range.
+//   Upper boundary swept -> SHORT.  Lower boundary swept -> LONG.
+// `bar_index > phaseBar` matters: the reclaim bar wicked beyond the boundary and
+// closed back inside, so it satisfies the retest test by construction. Without
+// this guard "Retest of the boundary" would collapse into "Reclaim close".
+s1RetestUp = edgeUp.phase == 2 and bar_index > edgeUp.phaseBar and
+     high >= rHi - tol and close < rHi and close < open
+s1RetestDn = edgeDn.phase == 2 and bar_index > edgeDn.phaseBar and
+     low <= rLo + tol and close > rLo and close > open
+
+s1RawShort = i_s1Entry == "Reclaim close" ? justSweepUp : s1RetestUp
+s1RawLong  = i_s1Entry == "Reclaim close" ? justSweepDn : s1RetestDn
+
+// Setup 2 — true break, then a retest that HOLDS outside. Price must come back
+// to the boundary (within tolerance) on a bar that still closes beyond it.
+s2RawLong  = edgeUp.phase == 3 and bar_index > edgeUp.phaseBar and
+     low <= rHi + tol and close > rHi
+s2RawShort = edgeDn.phase == 3 and bar_index > edgeDn.phaseBar and
+     high >= rLo - tol and close < rLo
+
+gate = rDef and confirmed and dayOk and not trade.active
+
+// --- candidate levels, evaluated every bar for both setups ---
+s1ShortStop = nz(edgeUp.sweepExt, high) + i_stopBuf * atrVal
+s1LongStop  = nz(edgeDn.sweepExt, low)  - i_stopBuf * atrVal
+s2LongStop  = (i_s2Stop == "Range boundary" ? rHi : math.min(low, rHi)) - i_stopBuf * atrVal
+s2ShortStop = (i_s2Stop == "Range boundary" ? rLo : math.max(high, rLo)) + i_stopBuf * atrVal
+
+minR = math.max(syminfo.mintick, i_minRAtr * atrVal)
+
+s1ShortOk = i_useS1 and s1RawShort and (s1ShortStop - close) > minR
+s1LongOk  = i_useS1 and s1RawLong  and (close - s1LongStop)  > minR
+s2LongOk  = i_useS2 and s2RawLong  and (close - s2LongStop)  > minR
+s2ShortOk = i_useS2 and s2RawShort and (s2ShortStop - close) > minR
+
+// "Never initiate a trade from the 50% line." Both setups sit at a boundary by
+// construction; this only catches pathological boxes.
+inNoEdge  = rDef and close > edgeL and close < edgeH
+midBlock  = i_blockMid and inNoEdge
+
+// Setup 1 is the deck's high-probability case, so it wins if both ever coincide.
+sigS1Short = gate and not midBlock and s1ShortOk
+sigS1Long  = gate and not midBlock and s1LongOk
+sigS2Long  = gate and not midBlock and s2LongOk  and not sigS1Short and not sigS1Long
+sigS2Short = gate and not midBlock and s2ShortOk and not sigS1Short and not sigS1Long
+
+anySig = sigS1Short or sigS1Long or sigS2Long or sigS2Short
+
+if anySig
+    dir  = (sigS1Long or sigS2Long) ? 1 : -1
+    setp = (sigS1Long or sigS1Short) ? 1 : 2
+    stp  = sigS1Short ? s1ShortStop : sigS1Long ? s1LongStop : sigS2Long ? s2LongStop : s2ShortStop
+
+    trade.dir    := dir
+    trade.setup  := setp
+    trade.active := true
+    trade.bar    := bar_index
+    trade.entry  := close
+    trade.stop   := stp
+    trade.hit    := 0
+    // Setup 1 targets are INTERNAL: the midpoint, then the opposing boundary.
+    // Setup 2 targets are EXTERNAL: one and two range heights from the boundary.
+    trade.tp1    := setp == 1 ? rMid : (dir == 1 ? rHi + rHgt       : rLo - rHgt)
+    trade.tp2    := setp == 1 ? (dir == 1 ? rHi : rLo) : (dir == 1 ? rHi + 2 * rHgt : rLo - 2 * rHgt)
+    sigToday     := sigToday + 1
+
+
+// -----------------------------------------------------------------------------
+// DRAWING
+// -----------------------------------------------------------------------------
+var box  bxRange = box.new(bar_index, close, bar_index, close,
+     border_color = color.new(COL_RANGE, 25), bgcolor = color.new(COL_RANGE, 94))
+var box  bxEdgeH = box.new(bar_index, close, bar_index, close,
+     border_color = color.new(COL_EDGE, 60), bgcolor = color.new(COL_EDGE, 82))
+var box  bxEdgeL = box.new(bar_index, close, bar_index, close,
+     border_color = color.new(COL_EDGE, 60), bgcolor = color.new(COL_EDGE, 82))
+var line lnMid   = line.new(bar_index, close, bar_index, close,
+     color = color.new(COL_EDGE, 30), style = line.style_dashed)
+var box  bxHtf   = box.new(bar_index, close, bar_index, close,
+     border_color = color.new(COL_CHOP, 55), bgcolor = color.new(COL_CHOP, 96))
+
+show = i_showBox and rDef
+rgt  = bar_index + i_extend
+
+if barstate.islast or confirmed
+    box.set_lefttop(bxRange, show ? nz(rStart, bar_index) : bar_index, show ? rHi : close)
+    box.set_rightbottom(bxRange, show ? rgt : bar_index, show ? rLo : close)
+    box.set_bgcolor(bxRange, show ? color.new(COL_RANGE, 94) : color.new(COL_RANGE, 100))
+    box.set_border_color(bxRange, show ? color.new(COL_RANGE, 25) : color.new(COL_RANGE, 100))
+
+    box.set_lefttop(bxEdgeH, show ? nz(rStart, bar_index) : bar_index, show ? rHi : close)
+    box.set_rightbottom(bxEdgeH, show ? rgt : bar_index, show ? edgeH : close)
+    box.set_bgcolor(bxEdgeH, show ? color.new(COL_EDGE, 82) : color.new(COL_EDGE, 100))
+    box.set_border_color(bxEdgeH, show ? color.new(COL_EDGE, 60) : color.new(COL_EDGE, 100))
+
+    box.set_lefttop(bxEdgeL, show ? nz(rStart, bar_index) : bar_index, show ? edgeL : close)
+    box.set_rightbottom(bxEdgeL, show ? rgt : bar_index, show ? rLo : close)
+    box.set_bgcolor(bxEdgeL, show ? color.new(COL_EDGE, 82) : color.new(COL_EDGE, 100))
+    box.set_border_color(bxEdgeL, show ? color.new(COL_EDGE, 60) : color.new(COL_EDGE, 100))
+
+    showMid = show and i_showMid
+    line.set_xy1(lnMid, showMid ? nz(rStart, bar_index) : bar_index, showMid ? rMid : close)
+    line.set_xy2(lnMid, showMid ? rgt : bar_index, showMid ? rMid : close)
+    line.set_color(lnMid, showMid ? color.new(COL_EDGE, 30) : color.new(COL_EDGE, 100))
+
+    showH = i_useHtf and not na(htfHi) and not na(htfLo)
+    box.set_lefttop(bxHtf, showH ? bar_index - 1 : bar_index, showH ? htfHi : close)
+    box.set_rightbottom(bxHtf, showH ? rgt : bar_index, showH ? htfLo : close)
+    box.set_bgcolor(bxHtf, showH ? color.new(COL_CHOP, 96) : color.new(COL_CHOP, 100))
+    box.set_border_color(bxHtf, showH ? color.new(COL_CHOP, 55) : color.new(COL_CHOP, 100))
+
+var array<Draw> drawn = array.new<Draw>()
+
+f_trim(array<Draw> arr, int keep) =>
+    while arr.size() > keep
+        d = arr.shift()
+        line.delete(d.lnEntry)
+        line.delete(d.lnStop)
+        line.delete(d.lnTp1)
+        line.delete(d.lnTp2)
+        label.delete(d.tag)
+    arr
+
+if anySig and i_showSig
+    col  = trade.dir == 1 ? COL_LONG : COL_SHORT
+    endX = bar_index + i_projBars
+    d = Draw.new()
+    d.lnEntry = line.new(bar_index, trade.entry, endX, trade.entry, color = col, width = 2)
+    d.lnStop  = line.new(bar_index, trade.stop, endX, trade.stop,
+         color = color.new(COL_SHORT, 15), style = line.style_dashed)
+    d.lnTp1   = line.new(bar_index, trade.tp1, endX, trade.tp1,
+         color = color.new(col, 35), style = line.style_dotted)
+    d.lnTp2   = line.new(bar_index, trade.tp2, endX, trade.tp2,
+         color = color.new(col, 60), style = line.style_dotted)
+    d.tag     = label.new(bar_index, trade.stop,
+         text = (trade.setup == 1 ? "S1 SWEEP " : "S2 BREAK ") +
+                (trade.dir == 1 ? "LONG" : "SHORT") +
+                "  1R " + str.tostring(math.abs(trade.entry - trade.stop), format.mintick),
+         style = trade.dir == 1 ? label.style_label_up : label.style_label_down,
+         color = color.new(col, 15), textcolor = color.white, size = size.small)
+    drawn.push(d)
+    f_trim(drawn, i_keepSig)
+
+
+// -----------------------------------------------------------------------------
+// PLOTS
+// -----------------------------------------------------------------------------
+plot(rDef ? rHi : na, "Range High", color = color.new(COL_RANGE, 0),
+     style = plot.style_linebr, linewidth = 2)
+plot(rDef ? rLo : na, "Range Low", color = color.new(COL_RANGE, 0),
+     style = plot.style_linebr, linewidth = 2)
+
+plotshape(sigS1Long, "S1 sweep long", shape.triangleup, location.belowbar,
+     color = color.new(COL_LONG, 0), size = size.small, text = "S1")
+plotshape(sigS1Short, "S1 sweep short", shape.triangledown, location.abovebar,
+     color = color.new(COL_SHORT, 0), size = size.small, text = "S1")
+plotshape(sigS2Long, "S2 breakout long", shape.labelup, location.belowbar,
+     color = color.new(COL_EDGE, 0), textcolor = color.white, size = size.small, text = "S2")
+plotshape(sigS2Short, "S2 breakout short", shape.labeldown, location.abovebar,
+     color = color.new(COL_EDGE, 0), textcolor = color.white, size = size.small, text = "S2")
+
+plotshape(justSweepUp and not sigS1Short, "Sweep of range high", shape.xcross,
+     location.abovebar, color = color.new(COL_SHORT, 45), size = size.tiny)
+plotshape(justSweepDn and not sigS1Long, "Sweep of range low", shape.xcross,
+     location.belowbar, color = color.new(COL_LONG, 45), size = size.tiny)
+
+
+// -----------------------------------------------------------------------------
+// DASHBOARD
+// -----------------------------------------------------------------------------
+tblPos = switch i_tblPos
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    =>                position.top_right
+
+var table dash = table.new(tblPos, 2, 27,
+     bgcolor = color.new(#131722, 10), border_width = 1,
+     border_color = color.new(COL_DIM, 70), frame_width = 1,
+     frame_color = color.new(COL_DIM, 55))
+
+f_row(table tb, int r, string k, string v, color vc) =>
+    table.cell(tb, 0, r, k, text_color = color.new(COL_TEXT, 30),
+         text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, r, v, text_color = vc,
+         text_size = size.small, text_halign = text.align_right)
+
+f_hdr(table tb, int r, string s) =>
+    table.merge_cells(tb, 0, r, 1, r)
+    table.cell(tb, 0, r, s, text_color = color.new(COL_TEXT, 35), text_size = size.tiny,
+         bgcolor = color.new(#2a2e39, 40))
+
+// Where price sits inside the box, as a percentage of its height.
+posPct  = rDef and rHgt > 0 ? (close - rLo) / rHgt * 100.0 : na
+zoneTxt = not rDef ? "no box" :
+     close >= edgeH ? "UPPER EDGE" :
+     close <= edgeL ? "LOWER EDGE" : "no-edge zone"
+zoneCol = not rDef ? COL_DIM :
+     close >= edgeH or close <= edgeL ? COL_EDGE : COL_CHOP
+
+htfPct = i_useHtf and not na(htfHi) and htfHi > htfLo ?
+     (close - htfLo) / (htfHi - htfLo) * 100.0 : na
+
+if i_showTable and barstate.islast
+    table.merge_cells(dash, 0, 0, 1, 0)
+    table.cell(dash, 0, 0, "STOIC RANGE BLUEPRINT", text_color = color.white,
+         text_size = size.small, bgcolor = color.new(#2a2e39, 15))
+
+    f_hdr(dash, 1, "THE BOX")
+    f_row(dash, 2, "Environment", rDef ? "DEFINED" : "not defined",
+         rDef ? COL_RANGE : COL_DIM)
+    f_row(dash, 3, "Range high", rDef ? str.tostring(rHi, format.mintick) : "—",
+         rDef ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 4, "Range low", rDef ? str.tostring(rLo, format.mintick) : "—",
+         rDef ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 5, "Height / mid", rDef ? str.tostring(rHgt, format.mintick) + "  ·  " +
+         str.tostring(rMid, format.mintick) : "—", rDef ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 6, "Touches H / L", rDef ? str.tostring(rHiTch) + " / " + str.tostring(rLoTch) : "—",
+         rDef ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 7, "Price position", na(posPct) ? "—" : str.tostring(posPct, "#") + "%  " + zoneTxt,
+         zoneCol)
+
+    f_hdr(dash, 8, "BOUNDARIES")
+    f_row(dash, 9, "Upper", f_phaseName(edgeUp.phase),
+         edgeUp.phase >= 2 ? COL_EDGE : edgeUp.phase == 1 ? COL_CHOP : COL_DIM)
+    f_row(dash, 10, "Lower", f_phaseName(edgeDn.phase),
+         edgeDn.phase >= 2 ? COL_EDGE : edgeDn.phase == 1 ? COL_CHOP : COL_DIM)
+
+    f_hdr(dash, 11, "ACTIVE SETUP")
+    if trade.active
+        tcol  = trade.dir == 1 ? COL_LONG : COL_SHORT
+        rUnit = math.abs(trade.entry - trade.stop)
+        f_row(dash, 12, "Setup",
+             (trade.setup == 1 ? "1 · Sweep & Retest" : "2 · Break & Retest") +
+             (trade.dir == 1 ? "  ▲" : "  ▼"), tcol)
+        f_row(dash, 13, "Entry", str.tostring(trade.entry, format.mintick),
+             color.new(COL_TEXT, 20))
+        f_row(dash, 14, "Invalidation (1R)", str.tostring(trade.stop, format.mintick) +
+             "  ·  " + str.tostring(rUnit, format.mintick), COL_SHORT)
+        f_row(dash, 15, trade.setup == 1 ? "TP1 · 50% mid" : "TP1 · 1x height",
+             str.tostring(trade.tp1, format.mintick) + "  (" +
+             str.tostring(math.abs(trade.tp1 - trade.entry) / rUnit, "#.#") + "R)",
+             trade.hit >= 1 ? COL_LONG : color.new(COL_TEXT, 40))
+        f_row(dash, 16, trade.setup == 1 ? "TP2 · opposing edge" : "TP2 · 2x height",
+             str.tostring(trade.tp2, format.mintick) + "  (" +
+             str.tostring(math.abs(trade.tp2 - trade.entry) / rUnit, "#.#") + "R)",
+             trade.hit >= 2 ? COL_LONG : color.new(COL_TEXT, 40))
+    else
+        f_row(dash, 12, "Setup", "flat", COL_DIM)
+        f_row(dash, 13, "Entry", "—", COL_DIM)
+        f_row(dash, 14, "Invalidation (1R)", "—", COL_DIM)
+        f_row(dash, 15, "TP1", "—", COL_DIM)
+        f_row(dash, 16, "TP2", "—", COL_DIM)
+
+    f_hdr(dash, 17, "PRE-TRADE CONTRACT")
+    f_row(dash, 18, "Range clearly defined", rDef ? "✓" : "✗", rDef ? COL_LONG : COL_SHORT)
+    atEdge = rDef and not inNoEdge
+    f_row(dash, 19, "At a boundary, not the 50%", atEdge ? "✓" : "✗",
+         atEdge ? COL_LONG : COL_SHORT)
+    f_row(dash, 20, "1R sized by you", trade.active ?
+         str.tostring(math.abs(trade.entry - trade.stop), format.mintick) + " / unit" : "—",
+         trade.active ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 21, "Exact invalidation price",
+         trade.active ? str.tostring(trade.stop, format.mintick) : "—",
+         trade.active ? COL_LONG : COL_DIM)
+    f_row(dash, 22, "Signals today",
+         str.tostring(sigToday) + (i_maxDay > 0 ? " / " + str.tostring(i_maxDay) : ""),
+         dayOk ? color.new(COL_TEXT, 20) : COL_SHORT)
+
+    f_hdr(dash, 23, "SCORECARD · bar resolution, stop-first")
+    f_row(dash, 24, "S1 sweep  n=" + str.tostring(n1),
+         f_pct(n1a, n1) + " TP1  ·  " + f_pct(n1b, n1) + " TP2",
+         n1 > 0 ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 25, "S2 break  n=" + str.tostring(n2),
+         f_pct(n2a, n2) + " TP1  ·  " + f_pct(n2b, n2) + " TP2",
+         n2 > 0 ? color.new(COL_TEXT, 20) : COL_DIM)
+    f_row(dash, 26, "HTF " + i_htfTf + " position",
+         na(htfPct) ? "—" : str.tostring(htfPct, "#") + "%", color.new(COL_TEXT, 30))
+
+
+// -----------------------------------------------------------------------------
+// ALERTS
+// -----------------------------------------------------------------------------
+alertcondition(sigS1Long, "Stoic Range · Setup 1 long",
+     "Stoic Range: range low swept and reclaimed. Long. TP1 = 50% mid, TP2 = range high.")
+alertcondition(sigS1Short, "Stoic Range · Setup 1 short",
+     "Stoic Range: range high swept and rejected. Short. TP1 = 50% mid, TP2 = range low.")
+alertcondition(sigS2Long, "Stoic Range · Setup 2 long",
+     "Stoic Range: break above the range held its retest. Long. TP1 = 1x height, TP2 = 2x height.")
+alertcondition(sigS2Short, "Stoic Range · Setup 2 short",
+     "Stoic Range: break below the range held its retest. Short. TP1 = 1x height, TP2 = 2x height.")
+alertcondition(justSweepUp or justSweepDn, "Stoic Range · boundary swept",
+     "Stoic Range: a boundary was swept and price returned inside. A Setup 1 is arming.")
+alertcondition(rDef and not rDef[1], "Stoic Range · new box",
+     "Stoic Range: a new consolidation has been defined.")
+
+if anySig
+    alert(str.format("STOIC RANGE {0} {1} {2} | entry {3} stop {4} | TP1 {5} TP2 {6}",
+         trade.setup == 1 ? "S1-SWEEP" : "S2-BREAK",
+         trade.dir == 1 ? "LONG" : "SHORT",
+         syminfo.ticker,
+         str.tostring(trade.entry, format.mintick),
+         str.tostring(trade.stop, format.mintick),
+         str.tostring(trade.tp1, format.mintick),
+         str.tostring(trade.tp2, format.mintick)), alert.freq_once_per_bar_close)
