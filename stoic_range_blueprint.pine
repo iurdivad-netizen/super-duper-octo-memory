@@ -179,6 +179,11 @@ i_holdBars  = input.int(2, "'Sustained hold' (consecutive closes outside)",
                "more breaks get classified as sweeps.")
 i_s2Retest  = input.int(20, "Abandon the breakout after (bars)", minval = 1, maxval = 200,
      group = G_S2)
+i_minBreak  = input.float(30.0, "Min break extension before a retest counts (% of range height)",
+     minval = 0.0, maxval = 200.0, step = 5.0, group = G_S2,
+     tooltip = "A true break goes somewhere. Without this, price loitering either side " +
+               "of the boundary satisfies 'came back to the boundary but closed outside' " +
+               "over and over, and Setup 2 fires on chop instead of on expansion.")
 i_s2Stop    = input.string("Retest extreme", "Invalidation",
      options = ["Retest extreme", "Range boundary"], group = G_S2,
      tooltip = "Retest extreme — beyond the low/high of the holding retest bar. Tighter.\n" +
@@ -198,6 +203,14 @@ i_maxDay   = input.int(2, "Max signals per day (0 = unlimited)", minval = 0, max
 i_minRAtr  = input.float(0.10, "Reject setups with 1R below (ATR multiple)",
      minval = 0.0, step = 0.05, group = G_RISK,
      tooltip = "Guards against a degenerate invalidation sitting on top of the entry.")
+i_useSess  = input.bool(true, "Restrict signals to a session", group = G_RISK,
+     tooltip = "The deck's '1 to 2 trades a day' means the trader's session, not the " +
+               "broker's rollover day. Without this the overnight session spends the " +
+               "day's budget before the cash open ever arrives.")
+i_sess     = input.session("0930-1600", "Session", group = G_RISK)
+i_sessTz   = input.string("America/New_York", "Session timezone", group = G_RISK,
+     options = ["America/New_York", "America/Chicago", "Europe/London",
+                "Europe/Berlin", "Asia/Tokyo", "Asia/Shanghai", "UTC"])
 
 
 // -----------------------------------------------------------------------------
@@ -333,7 +346,7 @@ f_edge(Edge e, float lvl, bool defined, bool confirmed,
         closeOut = dir == 1 ? close > lvl : close < lvl
         closeIn  = dir == 1 ? close < lvl : close > lvl
 
-        if e.phase == 1
+        if e.phase == 1 or e.phase == 3
             if dir == 1
                 e.sweepExt := math.max(nz(e.sweepExt, high), high)
             else
@@ -473,9 +486,14 @@ edgeH = rDef ? rHi - (i_edgePct / 100.0) * rHgt : na     // floor of the upper e
 edgeL = rDef ? rLo + (i_edgePct / 100.0) * rHgt : na     // ceiling of the lower edge band
 
 // Consolidation spent: price has expanded a full multiple of the height away.
-if rDef and barstate.isconfirmed and not busy
-    if close > rHi + i_expire * rHgt or close < rLo - i_expire * rHgt
-        rDef := false
+// This is deliberately NOT gated on `busy`. A boundary armed against a box price
+// has already left is arming against nothing, and while it stayed armed the box
+// could neither expire nor be redefined.
+expired = rDef and (close > rHi + i_expire * rHgt or close < rLo - i_expire * rHgt)
+if expired and barstate.isconfirmed
+    rDef := false
+    f_edgeReset(edgeUp)
+    f_edgeReset(edgeDn)
 
 
 // -----------------------------------------------------------------------------
@@ -493,11 +511,15 @@ justSweepDn = edgeDn.phase == 2 and edgeDn.phaseBar == bar_index
 // -----------------------------------------------------------------------------
 // DAILY DISCIPLINE
 // -----------------------------------------------------------------------------
+inSess    = not i_useSess or not na(time(timeframe.period, i_sess, i_sessTz))
+sessStart = inSess and not inSess[1]
+
 var int sigToday = 0
-if timeframe.change("D")
+// Reset on the session open when a session is set, otherwise on the broker day.
+if i_useSess ? sessStart : timeframe.change("D")
     sigToday := 0
 
-dayOk = i_maxDay == 0 or sigToday < i_maxDay
+dayOk = (i_maxDay == 0 or sigToday < i_maxDay) and inSess
 
 
 // -----------------------------------------------------------------------------
@@ -541,10 +563,15 @@ s1RawLong  = i_s1Entry == "Reclaim close" ? justSweepDn : s1RetestDn
 
 // Setup 2 — true break, then a retest that HOLDS outside. Price must come back
 // to the boundary (within tolerance) on a bar that still closes beyond it.
+// How far the break actually travelled beyond the boundary before coming back.
+upRun    = edgeUp.phase == 3 ? nz(edgeUp.sweepExt, rHi) - rHi : na
+dnRun    = edgeDn.phase == 3 ? rLo - nz(edgeDn.sweepExt, rLo) : na
+needRun  = rDef ? (i_minBreak / 100.0) * rHgt : na
+
 s2RawLong  = edgeUp.phase == 3 and bar_index > edgeUp.phaseBar and
-     low <= rHi + tol and close > rHi
+     nz(upRun) >= nz(needRun) and low <= rHi + tol and close > rHi
 s2RawShort = edgeDn.phase == 3 and bar_index > edgeDn.phaseBar and
-     high >= rLo - tol and close < rLo
+     nz(dnRun) >= nz(needRun) and high >= rLo - tol and close < rLo
 
 gate = rDef and confirmed and dayOk and not trade.active
 
@@ -791,9 +818,12 @@ if i_showTable and barstate.islast
     f_row(dash, 21, "Exact invalidation price",
          trade.active ? str.tostring(trade.stop, format.mintick) : "—",
          trade.active ? COL_LONG : COL_DIM)
-    f_row(dash, 22, "Signals today",
-         str.tostring(sigToday) + (i_maxDay > 0 ? " / " + str.tostring(i_maxDay) : ""),
-         dayOk ? color.new(COL_TEXT, 20) : COL_SHORT)
+    // Say WHY signals are blocked, not just that the count is spent — a red 2/2
+    // and a closed session look identical from the chart otherwise.
+    budgetTxt = str.tostring(sigToday) + (i_maxDay > 0 ? " / " + str.tostring(i_maxDay) : "")
+    blockTxt  = not inSess ? budgetTxt + "  · SESSION CLOSED" :
+         not dayOk ? budgetTxt + "  · BUDGET SPENT" : budgetTxt
+    f_row(dash, 22, "Signals today", blockTxt, dayOk ? color.new(COL_TEXT, 20) : COL_SHORT)
 
     f_hdr(dash, 23, "SCORECARD · bar resolution, stop-first")
     f_row(dash, 24, "S1 sweep  n=" + str.tostring(n1),
