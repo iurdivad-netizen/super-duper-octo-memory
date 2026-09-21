@@ -203,6 +203,12 @@ i_maxDay   = input.int(2, "Max signals per day (0 = unlimited)", minval = 0, max
 i_minRAtr  = input.float(0.10, "Reject setups with 1R below (ATR multiple)",
      minval = 0.0, step = 0.05, group = G_RISK,
      tooltip = "Guards against a degenerate invalidation sitting on top of the entry.")
+i_minTpR   = input.float(0.5, "Reject a setup whose first target is under (R)",
+     minval = 0.0, step = 0.1, group = G_RISK,
+     tooltip = "A target price has already passed is not a target. With 'Reclaim " +
+               "close', a violent reclaim bar can close beyond the 50% midpoint, which " +
+               "leaves Setup 1's TP1 BEHIND the entry — it then scores as hit on the " +
+               "next bar no matter what price does. This rejects those.")
 i_useSess  = input.bool(true, "Restrict signals to a session", group = G_RISK,
      tooltip = "The deck's '1 to 2 trades a day' means the trader's session, not the " +
                "broker's rollover day. Without this the overnight session spends the " +
@@ -275,6 +281,8 @@ type Trade
     float stop   = na
     float tp1    = na
     float tp2    = na
+    float r1     = na        // TP1 distance in R, measured at entry
+    float r2     = na        // TP2 distance in R
     int   hit    = 0
 
 type Draw
@@ -534,15 +542,33 @@ var int n2 = 0
 var int n2a = 0
 var int n2b = 0
 
+// Expectancy in R, which is the number a hit rate alone cannot tell you: these
+// targets are structural, so their R multiple differs on every trade. 59% of
+// trades reaching a 0.4R target loses money; 40% reaching a 3R target does not.
+//   e*a = plan "exit everything at TP1"   -> +r1 on a hit, -1 otherwise
+//   e*b = plan "hold for TP2"             -> +r2 on a hit, -1 otherwise
+var float e1a = 0.0
+var float e1b = 0.0
+var float e2a = 0.0
+var float e2b = 0.0
+var float s1r1 = 0.0
+var float s2r1 = 0.0
+
 if outcome != 0
     if trade.setup == 1
-        n1  := n1 + 1
-        n1a := n1a + (trade.hit >= 1 ? 1 : 0)
-        n1b := n1b + (trade.hit >= 2 ? 1 : 0)
+        n1   := n1 + 1
+        n1a  := n1a + (trade.hit >= 1 ? 1 : 0)
+        n1b  := n1b + (trade.hit >= 2 ? 1 : 0)
+        e1a  := e1a + (trade.hit >= 1 ? nz(trade.r1) : -1.0)
+        e1b  := e1b + (trade.hit >= 2 ? nz(trade.r2) : -1.0)
+        s1r1 := s1r1 + nz(trade.r1)
     else
-        n2  := n2 + 1
-        n2a := n2a + (trade.hit >= 1 ? 1 : 0)
-        n2b := n2b + (trade.hit >= 2 ? 1 : 0)
+        n2   := n2 + 1
+        n2a  := n2a + (trade.hit >= 1 ? 1 : 0)
+        n2b  := n2b + (trade.hit >= 2 ? 1 : 0)
+        e2a  := e2a + (trade.hit >= 1 ? nz(trade.r1) : -1.0)
+        e2b  := e2b + (trade.hit >= 2 ? nz(trade.r2) : -1.0)
+        s2r1 := s2r1 + nz(trade.r1)
 
 
 // -----------------------------------------------------------------------------
@@ -583,10 +609,33 @@ s2ShortStop = (i_s2Stop == "Range boundary" ? rLo : math.max(high, rLo)) + i_sto
 
 minR = math.max(syminfo.mintick, i_minRAtr * atrVal)
 
-s1ShortOk = i_useS1 and s1RawShort and (s1ShortStop - close) > minR
-s1LongOk  = i_useS1 and s1RawLong  and (close - s1LongStop)  > minR
-s2LongOk  = i_useS2 and s2RawLong  and (close - s2LongStop)  > minR
-s2ShortOk = i_useS2 and s2RawShort and (s2ShortStop - close) > minR
+// Setup 1 targets are INTERNAL: the midpoint, then the opposing boundary.
+// Setup 2 targets are EXTERNAL: one and two range heights from the boundary.
+tp1S1Long  = rMid
+tp2S1Long  = rHi
+tp1S1Short = rMid
+tp2S1Short = rLo
+tp1S2Long  = rDef ? rHi + rHgt : na
+tp2S2Long  = rDef ? rHi + 2 * rHgt : na
+tp1S2Short = rDef ? rLo - rHgt : na
+tp2S2Short = rDef ? rLo - 2 * rHgt : na
+
+rS1Short = s1ShortStop - close
+rS1Long  = close - s1LongStop
+rS2Long  = close - s2LongStop
+rS2Short = s2ShortStop - close
+
+// TP1 must actually lie ahead of the entry. Without this a reclaim bar that
+// closes past the midpoint hands Setup 1 a target it has already reached, which
+// the tracker then scores as a win on the following bar regardless of price.
+s1ShortOk = i_useS1 and s1RawShort and rS1Short > minR and
+     (close - tp1S1Short) >= i_minTpR * rS1Short
+s1LongOk  = i_useS1 and s1RawLong  and rS1Long  > minR and
+     (tp1S1Long - close)  >= i_minTpR * rS1Long
+s2LongOk  = i_useS2 and s2RawLong  and rS2Long  > minR and
+     (tp1S2Long - close)  >= i_minTpR * rS2Long
+s2ShortOk = i_useS2 and s2RawShort and rS2Short > minR and
+     (close - tp1S2Short) >= i_minTpR * rS2Short
 
 // "Never initiate a trade from the 50% line." Both setups sit at a boundary by
 // construction; this only catches pathological boxes.
@@ -613,10 +662,13 @@ if anySig
     trade.entry  := close
     trade.stop   := stp
     trade.hit    := 0
-    // Setup 1 targets are INTERNAL: the midpoint, then the opposing boundary.
-    // Setup 2 targets are EXTERNAL: one and two range heights from the boundary.
-    trade.tp1    := setp == 1 ? rMid : (dir == 1 ? rHi + rHgt       : rLo - rHgt)
-    trade.tp2    := setp == 1 ? (dir == 1 ? rHi : rLo) : (dir == 1 ? rHi + 2 * rHgt : rLo - 2 * rHgt)
+    tp1u = sigS1Short ? tp1S1Short : sigS1Long ? tp1S1Long : sigS2Long ? tp1S2Long : tp1S2Short
+    tp2u = sigS1Short ? tp2S1Short : sigS1Long ? tp2S1Long : sigS2Long ? tp2S2Long : tp2S2Short
+    rU   = math.abs(close - stp)
+    trade.tp1    := tp1u
+    trade.tp2    := tp2u
+    trade.r1     := rU > 0 ? math.abs(tp1u - close) / rU : na
+    trade.r2     := rU > 0 ? math.abs(tp2u - close) / rU : na
     sigToday     := sigToday + 1
 
 
@@ -729,7 +781,7 @@ tblPos = switch i_tblPos
     "Bottom left"  => position.bottom_left
     =>                position.top_right
 
-var table dash = table.new(tblPos, 2, 27,
+var table dash = table.new(tblPos, 2, 29,
      bgcolor = color.new(#131722, 10), border_width = 1,
      border_color = color.new(COL_DIM, 70), frame_width = 1,
      frame_color = color.new(COL_DIM, 55))
@@ -829,10 +881,18 @@ if i_showTable and barstate.islast
     f_row(dash, 24, "S1 sweep  n=" + str.tostring(n1),
          f_pct(n1a, n1) + " TP1  ·  " + f_pct(n1b, n1) + " TP2",
          n1 > 0 ? color.new(COL_TEXT, 20) : COL_DIM)
-    f_row(dash, 25, "S2 break  n=" + str.tostring(n2),
+    f_row(dash, 25, "S1 E[R]  TP1 / TP2",
+         n1 > 0 ? str.tostring(e1a / n1, "#.##") + " / " + str.tostring(e1b / n1, "#.##") +
+              "   (avg " + str.tostring(s1r1 / n1, "#.#") + "R)" : "—",
+         n1 == 0 ? COL_DIM : e1a > 0 ? COL_LONG : COL_SHORT)
+    f_row(dash, 26, "S2 break  n=" + str.tostring(n2),
          f_pct(n2a, n2) + " TP1  ·  " + f_pct(n2b, n2) + " TP2",
          n2 > 0 ? color.new(COL_TEXT, 20) : COL_DIM)
-    f_row(dash, 26, "HTF " + i_htfTf + " position",
+    f_row(dash, 27, "S2 E[R]  TP1 / TP2",
+         n2 > 0 ? str.tostring(e2a / n2, "#.##") + " / " + str.tostring(e2b / n2, "#.##") +
+              "   (avg " + str.tostring(s2r1 / n2, "#.#") + "R)" : "—",
+         n2 == 0 ? COL_DIM : e2a > 0 ? COL_LONG : COL_SHORT)
+    f_row(dash, 28, "HTF " + i_htfTf + " position",
          na(htfPct) ? "—" : str.tostring(htfPct, "#") + "%", color.new(COL_TEXT, 30))
 
 
