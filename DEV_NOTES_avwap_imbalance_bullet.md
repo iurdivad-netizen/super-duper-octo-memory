@@ -751,6 +751,57 @@ mechanical system, and the mechanical system is what fails.** Any edge living
 in discretion is precisely what the 12-week programme (slide 14) cannot
 transfer through a rules list.
 
+## Part 3i — TradingView connector: pre-registered OOS test confirms
+
+The TradingView MCP connector (`CME:MNQ1!`, `mcp-tv-get-ohlcv`) works and
+returns **full 24-hour futures coverage** — hours 00–16 and 18–23 ET, with
+17:00 the CME daily break — so the globex overnight session the VWAP anchors
+need is present.
+
+**Its limit matters:** `count` caps at 5000 bars and there is **no date-range
+parameter**, so a 1-minute request reaches back only ~3.5 days from now and
+cannot backfill. It can keep the dataset *current* (call every ~3 days); it
+cannot build the 1–2 years Part 3c says is needed. Sep 16–21 is permanently
+unrecoverable by this route.
+
+Dataset now **2026-07-12 → 2026-09-25, 69,619 bars, 50 trading days**
+(gap Sep 16–21).
+
+### Result: the new block confirms, it does not overturn
+
+Rules were locked in Part 3h before this data existed. Break-even 51.8%.
+
+| Config | period | n | win% | vs BE | avg R | 95% CI | P(≤0) |
+|---|---|---|---|---|---|---|---|
+| A close-thru 18:00 | Jul12–Sep15 | 770 | 43.9% | −7.9 | −0.130 | [−0.21, −0.05] | 100% |
+| | **NEW Sep22–25** | 68 | 44.1% | −7.7 | **−0.126** | [−0.38, +0.13] | 81% |
+| | **POOLED** | **838** | **43.9%** | **−7.9** | **−0.130** | **[−0.20, −0.06]** | **100%** |
+| B RETEST 01:00 | Jul12–Sep15 | 617 | 48.6% | −3.2 | −0.008 | [−0.09, +0.08] | 58% |
+| | **NEW Sep22–25** | 53 | 49.1% | −2.7 | **+0.002** | [−0.28, +0.28] | 45% |
+| | **POOLED** | **670** | **48.7%** | **−3.1** | **−0.007** | [−0.09, +0.08] | 57% |
+| C close-thru 01:00 | Jul12–Sep15 | 747 | 45.4% | −6.4 | −0.098 | [−0.18, −0.02] | 99% |
+| | **NEW Sep22–25** | 59 | 44.1% | −7.7 | **−0.127** | [−0.39, +0.17] | 82% |
+| | **POOLED** | **806** | **45.3%** | **−6.5** | **−0.100** | [−0.18, −0.02] | 100% |
+
+All three remain below break-even. B — the best configuration found anywhere
+in this exercise — is still **exactly zero at n=670**.
+
+### A useful demonstration of the noise scale
+
+Run on **Sep 23–25 only** (three complete days), config B showed **56.8% win,
+avg R +0.166** — apparently above break-even. Adding **one more day**
+(Sep 22) moved it to **49.1%, avg R +0.002**.
+
+One trading day flipped the verdict. The n=37 version was never significant
+anyway: 95% CI [40.9%, 71.3%] contains break-even, one-sided binomial
+P(≥21 of 37 | p=0.518) = **0.331**.
+
+Second illustration: A and C differ *only* by VWAP anchor (18:00 vs 01:00).
+On the identical three days they give avg R −0.041 and +0.054 — a 0.095 R
+swing from a seven-hour anchor shift, which is the same magnitude as the edge
+being argued about. At n≈40 this design cannot distinguish signal from noise,
+which is exactly why Part 3c set the bar at n≈200–400 per window.
+
 ## Part 4 — How to use the script
 
 1. NQ1!/MNQ1!, **1-minute** (slide 10), `i_fvgMode` = `Reclaim (slide 11)`,
