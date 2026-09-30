@@ -1,0 +1,204 @@
+//@version=6
+strategy("Multi-Horizon Momentum (Intraday / Swing Strategy)", shorttitle="MHM Intra/Swing", overlay=true,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=2,
+     process_orders_on_close=true, calc_on_every_tick=false, pyramiding=1000,
+     max_lines_count=100, max_labels_count=100)
+
+// ─────────────────────────────────────────────────────────────
+// Multi-Horizon Momentum Rubric adapted for INTRADAY and SWING (about a week) trading.
+//   Score  = sum of sign(close - close[N]) over 4 lookbacks (-4 ... +4), spaced ~1:2:4:8
+//   Weight = |score| / 4 ; Size = weight x target risk / annualised vol x equity (capped)
+//   Intraday mode: all measured on chart bars; optional flat at session end (no overnight).
+//   Swing mode: measured on completed daily bars; refresh daily or weekly.
+// Fills: process_orders_on_close=true, i.e. orders fill at the close of the signal bar
+// (needed so end-of-session flattening happens BEFORE the overnight gap). This is a mild
+// optimism versus next-open fills; the slippage setting is there to compensate.
+// Intraday costs matter far more than on the daily rubric: check net results after costs.
+// ─────────────────────────────────────────────────────────────
+
+GRP_H   = "Horizon"
+GRP_LB  = "Lookbacks"
+GRP_VOL = "Volatility"
+GRP_POS = "Position sizing"
+
+i_mode = input.string("Intraday (chart bars)", "Mode", options=["Intraday (chart bars)", "Swing (daily bars)"], group=GRP_H,
+     tooltip="Intraday: everything is measured on the chart's own bars (use a 1m-4h chart). Swing: measured on completed DAILY bars (multi-day to ~1 week holds); works on a daily chart or any lower one.")
+i_holdBars = input.int(6, "Intraday: re-evaluate every N bars", minval=1, group=GRP_H,
+     tooltip="Intraday mode holds score/vol/size for N chart bars between refreshes (the intraday analogue of the weekly rebalance). 1 = every bar (highest turnover). Rule of thumb: about half of the shortest lookback.")
+i_swingHold = input.string("Daily", "Swing: re-evaluate", options=["Every bar", "Daily", "Weekly"], group=GRP_H,
+     tooltip="Swing mode refresh schedule. Weekly = the original rubric rhythm.")
+i_dConfirmed = input.bool(true, "Swing: use last completed daily bar", group=GRP_H,
+     tooltip="On: swing signals use the previous finished daily bar (no repaint, one day of lag). Off: use today's developing daily close.")
+i_sessHours = input.float(0.0, "Trading hours per day (0 = auto)", minval=0.0, maxval=24.0, group=GRP_H,
+     tooltip="Used only to annualise intraday volatility. Auto: 24h for crypto/forex, 6.5h otherwise. Set ~23 for US index futures.")
+
+i_b1 = input.int(12, "Intraday lookback 1 (bars)", minval=1, group=GRP_LB, inline="b")
+i_b2 = input.int(24, "2", minval=1, group=GRP_LB, inline="b")
+i_b3 = input.int(48, "3", minval=1, group=GRP_LB, inline="b")
+i_b4 = input.int(96, "4", minval=1, group=GRP_LB, inline="b", tooltip="Default 1:2:4:8 spacing (the rubric's 1w/2w/1m/2m ratio). On a 5m chart: 1h / 2h / 4h / 8h.")
+i_d1 = input.int(2, "Swing lookback 1 (days)", minval=1, group=GRP_LB, inline="d")
+i_d2 = input.int(5, "2", minval=1, group=GRP_LB, inline="d")
+i_d3 = input.int(10, "3", minval=1, group=GRP_LB, inline="d")
+i_d4 = input.int(20, "4", minval=1, group=GRP_LB, inline="d", tooltip="Swing default 2/5/10/20 days: about 1 day to 1 month, for holds of a few days to a week or two. The original rubric was 5/10/21/42.")
+
+i_bVol = input.int(96, "Intraday vol window (bars)", minval=5, group=GRP_VOL)
+i_dVol = input.int(20, "Swing vol window (days)", minval=5, group=GRP_VOL)
+i_volMethod = input.string("Mean |move| (rubric)", "Volatility method", options=["Mean |move| (rubric)", "Std dev of returns"], group=GRP_VOL,
+     tooltip="Rubric: average absolute % move x sqrt(periods per year). Std dev reads ~25% higher.")
+
+GRP_RISK = "Risk / execution"
+GRP_FLT = "Trend filter"
+GRP_DSP = "Display"
+
+i_shorts = input.bool(true, "Allow shorts", group=GRP_RISK)
+i_flatEod = input.bool(true, "Intraday: flat at end of session (no overnight)", group=GRP_RISK,
+     tooltip="Closes everything on the last bar of the regular session and re-enters from the fresh score on the first bar of the next one. Ignored in Swing mode.")
+i_useDayLoss = input.bool(true, "Daily loss limit", group=GRP_RISK)
+i_maxDayLoss = input.float(2.0, "Max daily loss (% of equity)", minval=0.1, step=0.5, group=GRP_RISK,
+     tooltip="Uses strategy.risk.max_intraday_loss: closes positions and halts trading for the rest of the day.")
+i_targetRisk = input.float(10.0, "Target risk (% annual vol of equity)", minval=0.1, step=0.5, group=GRP_POS)
+i_scaling = input.string("|Score| / 4 (sheet)", "Score scaling", options=["|Score| / 4 (sheet)", "|Score| raw (guide)"], group=GRP_POS)
+i_maxLev = input.float(1.0, "Max position (x equity)", minval=0.1, step=0.1, group=GRP_POS)
+i_minTrade = input.float(2.0, "Min rebalance size (% of equity)", minval=0.0, step=0.5, group=GRP_POS)
+
+i_useEma = input.bool(false, "EMA trend filter", group=GRP_FLT,
+     tooltip="Longs only when price is above the EMA, shorts only below. Length is in the current mode's unit (chart bars in Intraday, days in Swing). Test on/off separately.")
+i_emaLen = input.int(100, "EMA length (bars intraday / days swing)", minval=2, group=GRP_FLT)
+i_reactFilter = input.bool(true, "Rebalance immediately when the filter flips", group=GRP_FLT)
+
+i_showTable = input.bool(true, "Show dashboard", group=GRP_DSP)
+i_colorBars = input.bool(true, "Color bars by score", group=GRP_DSP)
+
+// ── Mode-dependent constants ─────────────────────────────────
+isIntra = i_mode == "Intraday (chart bars)"
+LB1 = isIntra ? i_b1 : i_d1
+LB2 = isIntra ? i_b2 : i_d2
+LB3 = isIntra ? i_b3 : i_d3
+LB4 = isIntra ? i_b4 : i_d4
+VOL_LEN = isIntra ? i_bVol : i_dVol
+UNIT = isIntra ? "b" : "d"
+DAYS_PER_YEAR = syminfo.type == "crypto" ? 365.0 : 252.0
+HOURS_PER_DAY = i_sessHours > 0.0 ? i_sessHours : (syminfo.type == "crypto" or syminfo.type == "forex" ? 24.0 : 6.5)
+BARS_PER_DAY = HOURS_PER_DAY * 3600.0 / timeframe.in_seconds()
+ANN_FACTOR = isIntra ? math.sqrt(DAYS_PER_YEAR * BARS_PER_DAY) : math.sqrt(DAYS_PER_YEAR)
+OFFSET = i_dConfirmed ? 1 : 0
+
+if isIntra and not timeframe.isintraday
+    runtime.error("Intraday mode needs an intraday chart (1m-4h). Use Swing mode on a daily chart.")
+if not isIntra and timeframe.in_seconds() > 86400
+    runtime.error("Swing mode needs a daily or lower chart timeframe.")
+
+// ── Intraday series: measured on the chart's own bars ────────
+retI = close / close[1] - 1.0
+iMad = ta.sma(math.abs(retI), VOL_LEN)
+iSd = ta.stdev(retI, VOL_LEN)
+
+// ── Swing series: last completed daily bar (no lookahead) ────
+[dc0, dL1, dL2, dL3, dL4, dMad, dSd] = request.security(syminfo.tickerid, "D",
+     [close[OFFSET], close[OFFSET + LB1], close[OFFSET + LB2], close[OFFSET + LB3], close[OFFSET + LB4],
+      ta.sma(math.abs(close / close[1] - 1.0), VOL_LEN)[OFFSET],
+      ta.stdev(close / close[1] - 1.0, VOL_LEN)[OFFSET]],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+c0 = isIntra ? close : dc0
+cL1 = isIntra ? close[LB1] : dL1
+cL2 = isIntra ? close[LB2] : dL2
+cL3 = isIntra ? close[LB3] : dL3
+cL4 = isIntra ? close[LB4] : dL4
+madVol = isIntra ? iMad : dMad
+sdVol = isIntra ? iSd : dSd
+
+// ── Score and volatility ─────────────────────────────────────
+s1 = math.sign(c0 - cL1)
+s2 = math.sign(c0 - cL2)
+s3 = math.sign(c0 - cL3)
+s4 = math.sign(c0 - cL4)
+liveScore = s1 + s2 + s3 + s4
+liveVol = (i_volMethod == "Std dev of returns" ? sdVol : madVol) * ANN_FACTOR
+
+// ── Refresh schedule (hold score/vol/size between refreshes) ─
+newD = timeframe.change("D")
+newW = timeframe.change("W")
+idxRefresh = bar_index % i_holdBars == 0
+refreshBase = isIntra ? idxRefresh : (i_swingHold == "Every bar" ? true : i_swingHold == "Daily" ? newD : newW)
+
+// The EMA is computed on both bases every bar (ta.* must run unconditionally), then selected.
+emaChart = ta.ema(close, i_emaLen)
+emaDaily = request.security(syminfo.tickerid, "D", ta.ema(close, i_emaLen)[OFFSET], barmerge.gaps_off, barmerge.lookahead_off)
+emaV = isIntra ? emaChart : emaDaily
+
+// Fresh score on the first bar of each session when flattening nightly, so we re-enter promptly.
+newSession = session.isfirstbar_regular
+refresh = refreshBase or (isIntra and i_flatEod and newSession)
+
+var float heldScore = na
+var float heldVol = na
+if (refresh or na(heldScore)) and not na(liveScore) and not na(liveVol)
+    heldScore := liveScore
+    heldVol := liveVol
+
+baseScore = heldScore
+annVol = heldVol
+
+allowLong = not i_useEma or (not na(emaV) and c0 > emaV)
+allowShort = i_shorts and (not i_useEma or (not na(emaV) and c0 < emaV))
+score = na(baseScore) ? na : baseScore > 0 ? (allowLong ? baseScore : 0.0) : baseScore < 0 ? (allowShort ? baseScore : 0.0) : 0.0
+
+// ── Target position ──────────────────────────────────────────
+scoreWeight = i_scaling == "|Score| / 4 (sheet)" ? math.abs(score) / 4.0 : math.abs(score)
+rawPct = (not na(annVol) and annVol > 0 and not na(score)) ? scoreWeight * (i_targetRisk / 100.0) / annVol : na
+targetPct = na(rawPct) ? na : math.min(rawPct, i_maxLev) * math.sign(score)
+targetQty = (na(targetPct) or close <= 0) ? na : targetPct * strategy.equity / close
+
+// ── Execution ────────────────────────────────────────────────
+strategy.risk.max_intraday_loss(i_useDayLoss ? i_maxDayLoss : 100.0, strategy.percent_of_equity)
+
+eodFlat = isIntra and i_flatEod and session.islastbar_regular
+signChanged = math.sign(nz(score)) != math.sign(nz(score[1]))
+rebalanceNow = (refresh or (i_reactFilter and signChanged)) and not na(targetQty)
+delta = na(targetQty) ? 0.0 : targetQty - strategy.position_size
+bigEnough = math.abs(delta) * close >= i_minTrade / 100.0 * strategy.equity
+
+if eodFlat
+    if strategy.position_size != 0.0
+        strategy.close_all(comment="EOD flat")
+else if rebalanceNow
+    if targetQty == 0.0
+        if strategy.position_size != 0.0
+            strategy.close_all(comment="Flat")
+    else if bigEnough or math.sign(targetQty) != math.sign(strategy.position_size)
+        flip = math.sign(targetQty) != math.sign(strategy.position_size) and strategy.position_size != 0.0
+        if flip
+            strategy.close_all(comment="Flip")
+        newDelta = targetQty - (math.sign(targetQty) != math.sign(strategy.position_size) ? 0.0 : strategy.position_size)
+        strategy.order("MHM", newDelta > 0 ? strategy.long : strategy.short, math.abs(newDelta),
+             comment=str.format("Score {0}", str.tostring(score, "#")))
+
+// ── Visuals ──────────────────────────────────────────────────
+scoreColor = score >= 4 ? color.green : score >= 2 ? color.lime : score <= -4 ? color.red : score <= -2 ? color.orange : color.gray
+barcolor(i_colorBars and not na(score) ? scoreColor : na)
+plot(i_useEma ? emaV : na, "EMA filter", color=color.new(color.orange, 20), linewidth=2)
+plot(baseScore, "Base score", display=display.data_window)
+plot(score, "Effective score", display=display.data_window)
+plot(targetPct * 100.0, "Target % of equity", display=display.data_window)
+plot(annVol * 100.0, "Annualised vol %", display=display.data_window)
+
+var table tb = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islast and i_showTable
+    table.cell(tb, 0, 0, "Mode", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 0, isIntra ? "Intraday" : "Swing", text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 1, "Lookbacks", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 1, str.format("{0}/{1}/{2}/{3}{4}", LB1, LB2, LB3, LB4, UNIT), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 2, "Score (held)", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 2, na(score) ? "n/a" : (score > 0 ? "+" : "") + str.tostring(int(score)), text_color=scoreColor, text_size=size.normal)
+    table.cell(tb, 0, 3, "Ann. vol", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 3, na(annVol) ? "n/a" : str.tostring(annVol * 100.0, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 4, "Target position", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 4, na(targetPct) ? "n/a" : str.tostring(targetPct * 100.0, "#.#") + "% eq", text_color=scoreColor, text_size=size.small)
+    table.cell(tb, 0, 5, "Current position", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 5, str.tostring(strategy.position_size, "#.####"), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 6, "Equity", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 6, str.tostring(strategy.equity, "#,###"), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 7, "Educational, not advice.", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.merge_cells(tb, 0, 7, 1, 7)
