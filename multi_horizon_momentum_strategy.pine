@@ -1,0 +1,123 @@
+//@version=6
+strategy("Multi-Horizon Momentum Rubric (Strategy)", shorttitle="MHM Strat", overlay=true,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.1, slippage=2,
+     process_orders_on_close=false, calc_on_every_tick=false, pyramiding=1000,
+     max_lines_count=100, max_labels_count=100)
+
+// ─────────────────────────────────────────────────────────────
+// Backtest of the Multi-Horizon Momentum Rubric.
+//   Score  = sum of sign(close - close[N]) over 4 lookbacks   (-4 … +4)
+//   Weight = |score| / 4   (or raw |score|, see input)
+//   Size   = weight x target risk / annualised vol  x equity, capped at max leverage
+// The position is rebalanced to that target; orders fill at the next bar's open.
+// Defaults include 0.1% commission and 2 ticks slippage. Adjust to your market.
+// ─────────────────────────────────────────────────────────────
+
+GRP_LB  = "Lookbacks"
+GRP_VOL = "Volatility"
+GRP_POS = "Position sizing"
+GRP_DSP = "Display"
+
+i_basis = input.string("Auto", "Lookback basis", options=["Auto", "Calendar days (7/14/30/60)", "Trading days (5/10/21/42)"], group=GRP_LB,
+     tooltip="Auto = calendar days for crypto (24/7), trading-day equivalents otherwise.")
+i_weekly = input.bool(true, "Re-evaluate weekly (hold score/vol between weeks)", group=GRP_LB,
+     tooltip="Rubric: recompute every week. Off = recompute and rebalance every bar (more turnover, higher costs).")
+i_shorts = input.bool(true, "Allow shorts", group=GRP_LB,
+     tooltip="Off = negative scores go flat instead of short.")
+
+i_volMethod = input.string("Mean |daily move| (rubric)", "Volatility method", options=["Mean |daily move| (rubric)", "Std dev of daily returns"], group=GRP_VOL)
+
+i_targetRisk = input.float(10.0, "Target risk (% annual vol of equity)", minval=0.1, step=0.5, group=GRP_POS)
+i_scaling = input.string("|Score| / 4 (sheet)", "Score scaling", options=["|Score| / 4 (sheet)", "|Score| raw (guide)"], group=GRP_POS,
+     tooltip="Sheet: +4 = full weight (1.0). Guide's worked example uses the raw |score| (4x larger at +4).")
+i_maxLev = input.float(1.0, "Max position (x equity)", minval=0.1, step=0.1, group=GRP_POS,
+     tooltip="Cap on position value / equity. 1.0 = no leverage.")
+i_minTrade = input.float(2.0, "Min rebalance size (% of equity)", minval=0.0, step=0.5, group=GRP_POS,
+     tooltip="Skip rebalances smaller than this, to avoid paying costs on tiny adjustments. Closing to flat is always executed.")
+
+i_showTable = input.bool(true, "Show dashboard", group=GRP_DSP)
+i_colorBars = input.bool(true, "Color bars by market score", group=GRP_DSP)
+
+// ── Derived constants ────────────────────────────────────────
+useCalendar = i_basis == "Calendar days (7/14/30/60)" or (i_basis == "Auto" and syminfo.type == "crypto")
+LB1 = useCalendar ? 7 : 5
+LB2 = useCalendar ? 14 : 10
+LB3 = useCalendar ? 30 : 21
+LB4 = useCalendar ? 60 : 42
+VOL_LEN = useCalendar ? 30 : 21
+ANN_FACTOR = math.sqrt(useCalendar ? 365.0 : 252.0)
+
+if timeframe.in_seconds() > 86400
+    runtime.error("Use a daily or lower chart timeframe.")
+
+// Always the last COMPLETED daily close (offset 1): no repainting, no lookahead.
+[c0, cL1, cL2, cL3, cL4, madVol, sdVol] = request.security(syminfo.tickerid, "D",
+     [close[1], close[1 + LB1], close[1 + LB2], close[1 + LB3], close[1 + LB4],
+      ta.sma(math.abs(close / close[1] - 1.0), VOL_LEN)[1],
+      ta.stdev(close / close[1] - 1.0, VOL_LEN)[1]],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// ── Score and volatility ─────────────────────────────────────
+s1 = math.sign(c0 - cL1)
+s2 = math.sign(c0 - cL2)
+s3 = math.sign(c0 - cL3)
+s4 = math.sign(c0 - cL4)
+liveScore = s1 + s2 + s3 + s4
+liveVol = (i_volMethod == "Std dev of daily returns" ? sdVol : madVol) * ANN_FACTOR
+
+newWeek = timeframe.change("W")
+var float heldScore = na
+var float heldVol = na
+if (newWeek or na(heldScore)) and not na(liveScore) and not na(liveVol)
+    heldScore := liveScore
+    heldVol := liveVol
+
+rawScore = i_weekly ? heldScore : liveScore
+annVol = i_weekly ? heldVol : liveVol
+score = (not i_shorts and rawScore < 0) ? 0.0 : rawScore
+
+// ── Target position ──────────────────────────────────────────
+scoreWeight = i_scaling == "|Score| / 4 (sheet)" ? math.abs(score) / 4.0 : math.abs(score)
+rawPct = (not na(annVol) and annVol > 0) ? scoreWeight * (i_targetRisk / 100.0) / annVol : na
+targetPct = na(rawPct) ? na : math.min(rawPct, i_maxLev) * math.sign(score)
+targetQty = (na(targetPct) or close <= 0) ? na : targetPct * strategy.equity / close
+
+// ── Execution ────────────────────────────────────────────────
+// Rebalance only when the weekly signal refreshes (or every bar if weekly is off).
+rebalanceNow = (i_weekly ? newWeek : true) and not na(targetQty)
+delta = na(targetQty) ? 0.0 : targetQty - strategy.position_size
+bigEnough = math.abs(delta) * close >= i_minTrade / 100.0 * strategy.equity
+
+if rebalanceNow
+    if targetQty == 0.0
+        if strategy.position_size != 0.0
+            strategy.close_all(comment="Flat")
+    else if bigEnough or math.sign(targetQty) != math.sign(strategy.position_size)
+        if math.sign(targetQty) != math.sign(strategy.position_size) and strategy.position_size != 0.0
+            strategy.close_all(comment="Flip")
+        newDelta = targetQty - (math.sign(targetQty) != math.sign(strategy.position_size) ? 0.0 : strategy.position_size)
+        strategy.order("MHM", newDelta > 0 ? strategy.long : strategy.short, math.abs(newDelta),
+             comment=str.format("Score {0}", str.tostring(score, "#")))
+
+// ── Visuals ──────────────────────────────────────────────────
+scoreColor = score >= 4 ? color.green : score >= 2 ? color.lime : score <= -4 ? color.red : score <= -2 ? color.orange : color.gray
+barcolor(i_colorBars and not na(score) ? scoreColor : na)
+plot(score, "Market score", display=display.data_window)
+plot(targetPct * 100.0, "Target % of equity", display=display.data_window)
+plot(annVol * 100.0, "Annualised vol %", display=display.data_window)
+
+var table tb = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islast and i_showTable
+    table.cell(tb, 0, 0, "Score (held)", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 0, na(score) ? "n/a" : (score > 0 ? "+" : "") + str.tostring(int(score)), text_color=scoreColor, text_size=size.normal)
+    table.cell(tb, 0, 1, "Ann. vol", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 1, na(annVol) ? "n/a" : str.tostring(annVol * 100.0, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 2, "Target position", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 2, na(targetPct) ? "n/a" : str.tostring(targetPct * 100.0, "#.#") + "% eq", text_color=scoreColor, text_size=size.small)
+    table.cell(tb, 0, 3, "Current position", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 3, str.tostring(strategy.position_size, "#.####"), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 4, "Equity", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 4, str.tostring(strategy.equity, "#,###"), text_color=color.white, text_size=size.small)
+    table.cell(tb, 0, 5, "Educational, not advice.", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.merge_cells(tb, 0, 5, 1, 5)
