@@ -1,0 +1,181 @@
+//@version=6
+indicator("Multi-Horizon Momentum Rubric", shorttitle="MHM Rubric", overlay=false)
+
+// ─────────────────────────────────────────────────────────────
+// Multi-Horizon Momentum Rubric (time-series momentum, TSMOM)
+//   1. Score: sign(close - close[N]) over 4 lookbacks, summed  -> -4 … +4
+//   2. Rating: +4 full long | +2 half long | 0 flat | -2 half short | -4 full short
+//   3. Size:   weight x target risk / annualised volatility
+// Rules taken from the supplied rubric image + procedural guide.
+// ─────────────────────────────────────────────────────────────
+
+// ── Inputs ───────────────────────────────────────────────────
+GRP_LB  = "Lookbacks"
+GRP_VOL = "Volatility"
+GRP_POS = "Position sizing"
+GRP_DSP = "Display"
+
+i_basis = input.string("Auto", "Lookback basis", options=["Auto", "Calendar days (7/14/30/60)", "Trading days (5/10/21/42)"], group=GRP_LB,
+     tooltip="Rubric uses calendar days (1w/2w/1m/2m). Auto = calendar for crypto (24/7), trading-day equivalents for everything else, so a 'week' is not 7 bars on a 5-day market.")
+i_confirmed = input.bool(true, "Use last completed daily close", group=GRP_LB,
+     tooltip="On: score uses yesterday's finished daily close, so it cannot change intraday (no repaint). Off: uses today's developing close.")
+i_weekly = input.bool(true, "Re-evaluate weekly (hold score/vol between weeks)", group=GRP_LB,
+     tooltip="The guide says to recompute every week. Off = recompute every bar (more reactive, more turnover).")
+
+i_volMethod = input.string("Mean |daily move| (rubric)", "Volatility method", options=["Mean |daily move| (rubric)", "Std dev of daily returns"], group=GRP_VOL,
+     tooltip="Rubric: average absolute daily % move over 30 days x sqrt(365). Std dev is the textbook alternative and reads ~25% higher.")
+
+i_portfolio = input.float(100000.0, "Portfolio size ($)", minval=1.0, group=GRP_POS)
+i_targetRisk = input.float(10.0, "Target risk (% annual vol of portfolio)", minval=0.1, step=0.5, group=GRP_POS,
+     tooltip="Sheet example: 10%.")
+i_scaling = input.string("|Score| / 4 (sheet)", "Score scaling", options=["|Score| / 4 (sheet)", "|Score| raw (guide)"], group=GRP_POS,
+     tooltip="The rubric sheet normalises score to +/-1.0 (+4 = full). The guide's worked example multiplies by the raw |score|, which is 4x larger at +4. Sheet version is the default; it matches the $25,600 example.")
+i_maxLev = input.float(1.0, "Max position (x portfolio)", minval=0.1, step=0.1, group=GRP_POS,
+     tooltip="Cap on position / portfolio. Low-vol assets can otherwise produce >100% positions. Set high to disable.")
+
+i_showTable = input.bool(true, "Show dashboard", group=GRP_DSP)
+i_tablePos = input.string("Top right", "Dashboard position", options=["Top left", "Top right", "Bottom left", "Bottom right"], group=GRP_DSP)
+
+// ── Derived constants ────────────────────────────────────────
+useCalendar = i_basis == "Calendar days (7/14/30/60)" or (i_basis == "Auto" and syminfo.type == "crypto")
+LB1 = useCalendar ? 7 : 5
+LB2 = useCalendar ? 14 : 10
+LB3 = useCalendar ? 30 : 21
+LB4 = useCalendar ? 60 : 42
+VOL_LEN = useCalendar ? 30 : 21
+ANN_FACTOR = math.sqrt(useCalendar ? 365.0 : 252.0)   // 19.1 for 365-day markets
+OFFSET = i_confirmed ? 1 : 0
+
+if timeframe.in_seconds() > 86400
+    runtime.error("Use a daily or lower chart timeframe.")
+
+// ── Daily data (no lookahead; OFFSET=1 reads the last completed day) ──
+[c0, cL1, cL2, cL3, cL4, madVol, sdVol] = request.security(syminfo.tickerid, "D",
+     [close[OFFSET],
+      close[OFFSET + LB1], close[OFFSET + LB2], close[OFFSET + LB3], close[OFFSET + LB4],
+      ta.sma(math.abs(close / close[1] - 1.0), VOL_LEN)[OFFSET],
+      ta.stdev(close / close[1] - 1.0, VOL_LEN)[OFFSET]],
+     barmerge.gaps_off, barmerge.lookahead_off)
+
+// ── Step 1: score ────────────────────────────────────────────
+s1 = math.sign(c0 - cL1)
+s2 = math.sign(c0 - cL2)
+s3 = math.sign(c0 - cL3)
+s4 = math.sign(c0 - cL4)
+liveScore = s1 + s2 + s3 + s4
+
+liveVol = (i_volMethod == "Std dev of daily returns" ? sdVol : madVol) * ANN_FACTOR
+
+// ── Weekly re-evaluation ─────────────────────────────────────
+newWeek = timeframe.change("W")
+var float heldScore = na
+var float heldVol = na
+if (newWeek or na(heldScore)) and not na(liveScore) and not na(liveVol)
+    heldScore := liveScore
+    heldVol := liveVol
+
+score = i_weekly ? heldScore : liveScore
+annVol = i_weekly ? heldVol : liveVol
+
+// ── Step 3: sizing ───────────────────────────────────────────
+scoreWeight = i_scaling == "|Score| / 4 (sheet)" ? math.abs(score) / 4.0 : math.abs(score)
+rawPct = (not na(annVol) and annVol > 0) ? scoreWeight * (i_targetRisk / 100.0) / annVol : na
+posPct = na(rawPct) ? na : math.min(rawPct, i_maxLev)
+signedPct = na(posPct) ? na : posPct * math.sign(score)
+posValue = signedPct * i_portfolio
+posUnits = (na(posValue) or close <= 0) ? na : posValue / close
+
+// ── Plots ────────────────────────────────────────────────────
+scoreColor = score >= 4 ? color.new(color.green, 0) :
+     score >= 2 ? color.new(color.lime, 30) :
+     score <= -4 ? color.new(color.red, 0) :
+     score <= -2 ? color.new(color.orange, 30) :
+     color.new(color.gray, 40)
+
+plot(score, "Market score", color=scoreColor, style=plot.style_columns)
+plot(liveScore, "Live score (unheld)", color=color.new(color.white, 60), style=plot.style_stepline, display=i_weekly ? display.pane : display.none)
+plot(signedPct * 100.0, "Position % of portfolio", display=display.data_window)
+plot(annVol * 100.0, "Annualised vol %", display=display.data_window)
+
+hline(4, "+4 Full long", color=color.new(color.green, 70), linestyle=hline.style_dotted)
+hline(2, "+2 Half long", color=color.new(color.lime, 70), linestyle=hline.style_dotted)
+hline(0, "0 Flat", color=color.new(color.gray, 50))
+hline(-2, "-2 Half short", color=color.new(color.orange, 70), linestyle=hline.style_dotted)
+hline(-4, "-4 Full short", color=color.new(color.red, 70), linestyle=hline.style_dotted)
+
+// ── Dashboard ────────────────────────────────────────────────
+tblPos = switch i_tablePos
+    "Top left" => position.top_left
+    "Bottom left" => position.bottom_left
+    "Bottom right" => position.bottom_right
+    => position.top_right
+
+var table tb = table.new(tblPos, 3, 12, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
+
+arrowOf(float s) =>
+    na(s) ? "–" : s > 0 ? "▲ +1" : s < 0 ? "▼ -1" : "■ 0"
+
+arrowColor(float s) =>
+    na(s) ? color.gray : s > 0 ? color.lime : s < 0 ? color.red : color.gray
+
+ratingOf(float s) =>
+    na(s) ? "n/a" : s >= 4 ? "FULL LONG" : s >= 2 ? "HALF LONG" : s <= -4 ? "FULL SHORT" : s <= -2 ? "HALF SHORT" : "FLAT"
+
+fmtScore(float s) =>
+    na(s) ? "n/a" : (s > 0 ? "+" : "") + str.tostring(int(s))
+
+retOf(float now, float then) =>
+    (na(now) or na(then) or then == 0) ? "n/a" : str.tostring((now / then - 1.0) * 100.0, "#.##") + "%"
+
+hdr(int r, string a, string b, string c) =>
+    table.cell(tb, 0, r, a, text_color=color.silver, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, r, b, text_color=color.silver, text_size=size.small)
+    table.cell(tb, 2, r, c, text_color=color.silver, text_size=size.small)
+
+if barstate.islast and i_showTable
+    table.cell(tb, 0, 0, "Horizon", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 0, "Change", text_color=color.gray, text_size=size.small)
+    table.cell(tb, 2, 0, "Score", text_color=color.gray, text_size=size.small)
+    hdr(1, str.tostring(LB1) + "d", retOf(c0, cL1), "")
+    hdr(2, str.tostring(LB2) + "d", retOf(c0, cL2), "")
+    hdr(3, str.tostring(LB3) + "d", retOf(c0, cL3), "")
+    hdr(4, str.tostring(LB4) + "d", retOf(c0, cL4), "")
+    table.cell(tb, 2, 1, arrowOf(s1), text_color=arrowColor(s1), text_size=size.small)
+    table.cell(tb, 2, 2, arrowOf(s2), text_color=arrowColor(s2), text_size=size.small)
+    table.cell(tb, 2, 3, arrowOf(s3), text_color=arrowColor(s3), text_size=size.small)
+    table.cell(tb, 2, 4, arrowOf(s4), text_color=arrowColor(s4), text_size=size.small)
+
+    table.cell(tb, 0, 5, "Market score", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 5, fmtScore(score), text_color=scoreColor, text_size=size.normal)
+    table.cell(tb, 2, 5, ratingOf(score), text_color=scoreColor, text_size=size.small)
+
+    table.cell(tb, 0, 6, "Live score", text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 6, fmtScore(liveScore), text_color=color.gray, text_size=size.small)
+    table.cell(tb, 2, 6, i_weekly ? "weekly hold" : "live", text_color=color.gray, text_size=size.small)
+
+    table.cell(tb, 0, 7, "Annualised vol", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 7, na(annVol) ? "n/a" : str.tostring(annVol * 100.0, "#.#") + "%", text_color=color.white, text_size=size.small)
+    table.cell(tb, 2, 7, "", text_size=size.small)
+
+    table.cell(tb, 0, 8, "Position (% port.)", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 8, na(signedPct) ? "n/a" : str.tostring(signedPct * 100.0, "#.#") + "%", text_color=scoreColor, text_size=size.small)
+    table.cell(tb, 2, 8, (not na(rawPct) and not na(posPct) and rawPct > posPct) ? "capped" : "", text_color=color.orange, text_size=size.small)
+
+    table.cell(tb, 0, 9, "Position ($)", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 9, na(posValue) ? "n/a" : str.tostring(posValue, "#,###"), text_color=scoreColor, text_size=size.small)
+    table.cell(tb, 2, 9, "", text_size=size.small)
+
+    table.cell(tb, 0, 10, "Units", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(tb, 1, 10, na(posUnits) ? "n/a" : str.tostring(posUnits, "#,###.##"), text_color=scoreColor, text_size=size.small)
+    table.cell(tb, 2, 10, "", text_size=size.small)
+
+    table.cell(tb, 0, 11, "Educational, not advice. Backtest before use.", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.merge_cells(tb, 0, 11, 2, 11)
+
+// ── Alerts ───────────────────────────────────────────────────
+alertcondition(score >= 4 and score[1] < 4, "Full long (+4)", "Momentum score reached +4 (full long)")
+alertcondition(score >= 2 and score[1] < 2, "Long bias (>= +2)", "Momentum score reached +2 or higher")
+alertcondition(score <= -4 and score[1] > -4, "Full short (-4)", "Momentum score reached -4 (full short)")
+alertcondition(score <= -2 and score[1] > -2, "Short bias (<= -2)", "Momentum score reached -2 or lower")
+alertcondition(score == 0 and score[1] != 0, "Flat (0)", "Momentum score returned to 0 (stay flat)")
+alertcondition(score != score[1] and not na(score[1]), "Score changed", "Momentum score changed")
